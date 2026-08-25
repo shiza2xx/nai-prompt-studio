@@ -22,6 +22,16 @@
   ${EndIf}
 !macroend
 
+!macro customUnInit
+  # The launcher computes the authoritative install directory before moving
+  # itself into app-local temp. This avoids relying only on NSIS' special _?=
+  # parsing when the original path contains spaces.
+  ReadEnvStr $7 "NAI_INSTALL_DIR"
+  ${If} $7 != ""
+    StrCpy $INSTDIR "$7"
+  ${EndIf}
+!macroend
+
 !macro customUnInstall
   IfSilent keepData
   ${ifNot} ${isUpdated}

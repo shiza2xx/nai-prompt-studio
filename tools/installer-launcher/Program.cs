@@ -32,6 +32,14 @@ internal static class Program
             sessionCache = Path.Combine(cacheBase, "session-" + Process.GetCurrentProcess().Id + "-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sessionCache);
             ProbeWritable(sessionCache);
+            // Set only this launcher's process environment. Accessing
+            // ProcessStartInfo.EnvironmentVariables rebuilds the complete
+            // block as a case-insensitive dictionary and crashes when a host
+            // provides both Path and PATH.
+            Environment.SetEnvironmentVariable("TEMP", sessionCache);
+            Environment.SetEnvironmentVariable("TMP", sessionCache);
+            Environment.SetEnvironmentVariable("TMPDIR", sessionCache);
+            Environment.SetEnvironmentVariable("NAI_INSTALLER_CACHE", sessionCache);
             string legacyPayload = Path.ChangeExtension(executable, ".payload");
             if (File.Exists(legacyPayload))
             {
@@ -69,10 +77,6 @@ internal static class Program
             var start = new ProcessStartInfo(payload);
             start.UseShellExecute = false;
             start.WorkingDirectory = Path.GetDirectoryName(payload);
-            start.EnvironmentVariables["TEMP"] = sessionCache;
-            start.EnvironmentVariables["TMP"] = sessionCache;
-            start.EnvironmentVariables["TMPDIR"] = sessionCache;
-            start.EnvironmentVariables["NAI_INSTALLER_CACHE"] = sessionCache;
             string[] childArguments = Environment.GetCommandLineArgs().Skip(1).ToArray();
             int originalDirectoryArgument = Array.FindIndex(childArguments, argument => argument.StartsWith("_?=", StringComparison.OrdinalIgnoreCase));
             string originalDirectoryArgumentValue = null;
@@ -94,11 +98,23 @@ internal static class Program
             string installDirectoryArgumentValue = null;
             if (installParentArgument >= 0)
             {
-                string installParent = childArguments[installParentArgument].Substring("/INSTALL_PARENT=".Length).Trim('"');
+                var installParentParts = new System.Collections.Generic.List<string>
+                {
+                    childArguments[installParentArgument].Substring("/INSTALL_PARENT=".Length).Trim('"')
+                };
+                int installParentEnd = installParentArgument + 1;
+                while (installParentEnd < childArguments.Length &&
+                       !childArguments[installParentEnd].StartsWith("/", StringComparison.Ordinal) &&
+                       !childArguments[installParentEnd].StartsWith("--", StringComparison.Ordinal))
+                {
+                    installParentParts.Add(childArguments[installParentEnd].Trim('"'));
+                    installParentEnd++;
+                }
+                string installParent = string.Join(" ", installParentParts);
                 if (string.IsNullOrWhiteSpace(installParent))
                     throw new InvalidOperationException("The requested installation parent is empty.");
                 installDirectoryArgumentValue = Path.Combine(Path.GetFullPath(installParent), Product);
-                childArguments = childArguments.Where((argument, index) => index != installParentArgument).ToArray();
+                childArguments = childArguments.Take(installParentArgument).Concat(childArguments.Skip(installParentEnd)).ToArray();
             }
             foreach (string argument in childArguments)
             {
@@ -115,7 +131,10 @@ internal static class Program
             // update flow may split an installation path containing spaces,
             // so rebuild it once and append it last.
             if (!string.IsNullOrWhiteSpace(originalDirectoryArgumentValue))
+            {
+                Environment.SetEnvironmentVariable("NAI_INSTALL_DIR", originalDirectoryArgumentValue);
                 start.Arguments += " _?=" + originalDirectoryArgumentValue;
+            }
 
             using (Process child = Process.Start(start))
             {

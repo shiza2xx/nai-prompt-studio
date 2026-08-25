@@ -38,7 +38,7 @@ const compiled = join(proofDir, 'D-temp-proof-launcher.exe');
 copyFileSync(launcher, compiled);
 await buildSelfExtractingSetup(compiled, payload, launcher);
 const proofParent = join(proofDir, 'parent path with spaces');
-run(launcher, ['/UPDATE', `/INSTALL_PARENT=${proofParent}`], proofDir);
+run(launcher, ['/UPDATE', `/INSTALL_PARENT=${join(proofDir, 'parent')}`, 'path', 'with', 'spaces'], proofDir);
 
 const proof = readFileSync(resultFile, 'utf8');
 if (!/^TEMP=D:\\/mi.test(proof) || !/^PLUGINSDIR=D:\\/mi.test(proof) || !/^NAI_INSTALLER_CACHE=D:\\/mi.test(proof)) {
@@ -63,6 +63,7 @@ rmSync(installedPayload, { force: true });
 const launcherSource = readFileSync(join(projectRoot, 'tools', 'installer-launcher', 'Program.cs'), 'utf8');
 if (!/start\.Arguments \+= " _\?=" \+ originalDirectoryArgumentValue/.test(launcherSource)) throw new Error('Launcher no longer appends _?= raw and last.');
 if (!/start\.Arguments \+= " \/D=" \+ installDirectoryArgumentValue/.test(launcherSource)) throw new Error('Launcher no longer appends the native NSIS install path raw.');
+if (/start\.EnvironmentVariables/.test(launcherSource)) throw new Error('Launcher must not rebuild a host environment that may contain both Path and PATH.');
 if (existsSync(`${launcher}.payload`)) throw new Error('Proof unexpectedly produced a setup sidecar.');
 if (statSync(launcher).size >= 10 * 1024 * 1024) throw new Error('Proof setup exceeds 10 MiB.');
 console.log(proof.trim());
