@@ -1,6 +1,7 @@
 export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 
 export type AnimationMode = 'auto' | 'on' | 'off';
+export type StudioTheme = 'arcane-gold' | 'midnight-blue';
 
 export interface WeightedTag {
   id: string;
@@ -45,11 +46,16 @@ export interface PromptDraft {
 export interface AppSettings {
   animationMode: AnimationMode;
   preloadCharacterPreviews: boolean;
+  theme: StudioTheme;
+  updateCatalogOnStartup: boolean;
+  checkAppUpdatesOnStartup: boolean;
+  seenGuideIds: string[];
+  lastSeenVersion: string;
 }
 
 export interface ArtistMixDraft {
-  version: 1;
-  primary: WeightedTag | null;
+  version: 2;
+  anchors: WeightedTag[];
   companions: WeightedTag[];
   randomRange: { min: number; max: number };
   favoritesOnly: boolean;

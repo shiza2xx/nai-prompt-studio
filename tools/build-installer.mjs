@@ -1,16 +1,18 @@
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createLocalEnvironment, localPaths, projectRoot } from './local-env.mjs';
 import { patchInstallerStoreCopy, restoreInstallerStoreCopy } from './electron-builder-nsis-store.mjs';
+import { buildSelfExtractingSetup } from './self-extract.mjs';
 
 const packageJson = (await import('../package.json', { with: { type: 'json' } })).default;
 const version = packageJson.version;
 const releaseDir = join(projectRoot, 'release-v5');
 const rawName = `NAI-Prompt-Studio-V5-Payload-${version}.exe`;
-const payloadName = `NAI-Prompt-Studio-V5-Setup-${version}.payload`;
+const payloadName = `NAI-Prompt-Studio-V5-Setup-${version}.payload.exe`;
 const launcherName = `NAI-Prompt-Studio-V5-Setup-${version}.exe`;
 const rawPath = join(releaseDir, rawName);
+const rawBlockmapPath = `${rawPath}.blockmap`;
 const payloadPath = join(releaseDir, payloadName);
 const launcherPath = join(releaseDir, launcherName);
 const compiledLauncherDir = join(localPaths.root, 'installer-launcher');
@@ -25,7 +27,7 @@ function run(command, args) {
 
 mkdirSync(releaseDir, { recursive: true });
 mkdirSync(compiledLauncherDir, { recursive: true });
-for (const output of [rawPath, payloadPath, launcherPath]) {
+for (const output of [rawPath, rawBlockmapPath, payloadPath, launcherPath]) {
   if (existsSync(output)) rmSync(output, { force: true });
 }
 
@@ -41,9 +43,10 @@ try {
   restoreInstallerStoreCopy();
 }
 if (!existsSync(rawPath)) throw new Error(`electron-builder did not create ${rawPath}.`);
-renameSync(rawPath, payloadPath);
-copyFileSync(compiledLauncher, launcherPath);
+await import('node:fs/promises').then(({ rename }) => rename(rawPath, payloadPath));
+await buildSelfExtractingSetup(compiledLauncher, payloadPath, launcherPath);
+rmSync(payloadPath, { force: true });
+rmSync(rawBlockmapPath, { force: true });
 
-console.log(`Installer launcher: ${launcherPath}`);
-console.log(`Installer payload: ${payloadPath}`);
+console.log(`Single-file setup: ${launcherPath}`);
 console.log(`Mutable build roots: ${localPaths.root}`);

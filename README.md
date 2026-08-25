@@ -15,6 +15,16 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
 
+## Source-only clones and catalog hydration
+
+The Git repository contains application code, tests and build tooling only. Download the V5 artists, characters and constructor-guide packs from the matching GitHub Release, then hydrate a development checkout:
+
+```powershell
+npm run catalog:hydrate -- D:\Downloads\nai-v5-artists.zip D:\Downloads\nai-characters.zip D:\Downloads\nai-constructor-guide.zip
+```
+
+The command extracts only into `public/catalog` in the current checkout. Release maintainers can create the three assets with `npm run release:catalog-packs`; every pack is checked against GitHub's 2 GiB asset limit.
+
 ## Development
 
 Requirements:
@@ -44,6 +54,8 @@ npm run desktop:build
 ```
 
 All project commands route temporary files and package caches into project-local folders on the current drive. Development state lives in `.app-data`. An installed copy stores mutable data in its own `data` folder beside the application files.
+
+The Windows setup is currently unsigned, so Microsoft SmartScreen may show an unknown-publisher warning. Download releases only from this repository and compare the setup SHA-512 with `update-manifest.json`. The in-app updater validates the release host, size and SHA-512 before it launches the installer. Updates preserve the app-local `data` folder.
 
 ## Catalog sources
 

@@ -1,5 +1,5 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
-import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, WeightedTag } from './types';
+import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, StudioTheme, WeightedTag } from './types';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -42,6 +42,16 @@ const desktopSnapshot: DesktopSnapshot = (() => {
   try { return bridge()?.load() as DesktopSnapshot ?? {}; } catch { return {}; }
 })();
 let cachedCustomTagPresets: CustomTagPreset[] | null = null;
+
+/** True only when a profile existed before this renderer initialized. */
+export function hasExistingProfile(): boolean {
+  if (desktopSnapshot.exists) return true;
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    return [KEY, ARTIST_FAVORITES_KEY, CHARACTER_FAVORITES_KEY, DRAFT_KEY, SETTINGS_KEY, ARTIST_MIX_KEY]
+      .some(key => localStorage.getItem(key) !== null);
+  } catch { return false; }
+}
 
 export function loadSets(): PromptSet[] {
   const local = localArray<PromptSet>(KEY);
@@ -101,12 +111,18 @@ export function normalizeRandomRange(value: unknown): { min: number; max: number
 export function normalizeAnimationMode(value: unknown): AnimationMode {
   return value === 'on' || value === 'off' ? value : 'auto';
 }
+export function normalizeTheme(value: unknown): StudioTheme { return value === 'midnight-blue' ? 'midnight-blue' : 'arcane-gold'; }
 
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {
   const source = value && typeof value === 'object' ? value as Partial<AppSettings> : {};
   return {
     animationMode: normalizeAnimationMode(source.animationMode ?? legacyAnimationMode),
-    preloadCharacterPreviews: source.preloadCharacterPreviews === true
+    preloadCharacterPreviews: source.preloadCharacterPreviews === true,
+    theme: normalizeTheme(source.theme),
+    updateCatalogOnStartup: source.updateCatalogOnStartup !== false,
+    checkAppUpdatesOnStartup: source.checkAppUpdatesOnStartup !== false,
+    seenGuideIds: Array.isArray(source.seenGuideIds) ? source.seenGuideIds.filter((item): item is string => typeof item === 'string').slice(0, 100) : [],
+    lastSeenVersion: typeof source.lastSeenVersion === 'string' ? source.lastSeenVersion : ''
   };
 }
 
@@ -134,17 +150,23 @@ function normalizeMixTag(value: unknown): WeightedTag | null {
 }
 
 export function normalizeArtistMix(value: unknown): ArtistMixDraft {
-  const source = value && typeof value === 'object' ? value as Partial<ArtistMixDraft> : {};
+  const source = value && typeof value === 'object' ? value as Partial<ArtistMixDraft> & { primary?: unknown } : {};
   const range = normalizeRandomRange(source.randomRange);
-  const primary = normalizeMixTag(source.primary);
+  const rawAnchors = Array.isArray(source.anchors) ? source.anchors : source.primary ? [source.primary] : [];
+  const anchors: WeightedTag[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawAnchors) {
+    const item = normalizeMixTag(raw); const key = item?.catalogId;
+    if (item && key && !seen.has(key) && anchors.length < 4) { seen.add(key); anchors.push(item); }
+  }
   const companions: WeightedTag[] = [];
-  const seen = new Set<string>(primary?.catalogId ? [primary.catalogId] : []);
   if (Array.isArray(source.companions)) for (const raw of source.companions) {
     const item = normalizeMixTag(raw);
     const key = item?.catalogId;
-    if (item && key && !seen.has(key)) { seen.add(key); companions.push(item); }
+    if (item && key && !seen.has(key) && anchors.length + companions.length < 12) { seen.add(key); companions.push(item); }
   }
-  return { version: 1, primary, companions, randomRange: range, favoritesOnly: source.favoritesOnly === true };
+  if (!anchors.length && companions.length) anchors.push(companions.shift()!);
+  return { version: 2, anchors, companions, randomRange: { min: Math.min(12, range.min), max: Math.min(12, range.max) }, favoritesOnly: source.favoritesOnly === true };
 }
 
 export function loadArtistMix(): ArtistMixDraft {

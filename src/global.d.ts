@@ -27,7 +27,15 @@ declare global {
   interface Window {
   naiStorage?: NAIStorageBridge;
     naiCatalog?: NAICatalogBridge;
+    naiUpdater?: NAIUpdaterBridge;
   }
+}
+
+export interface UpdateManifest { available: boolean; schemaVersion?: 1; version: string; asset?: string; url?: string; size?: number; sha512?: string; releaseNotes?: string; }
+export interface NAIUpdaterBridge {
+  check(): Promise<UpdateManifest>;
+  downloadAndInstall(manifest: UpdateManifest): Promise<{ started: boolean; downloaded?: boolean }>;
+  version(): Promise<string>;
 }
 
 export interface NAICatalogBridge {

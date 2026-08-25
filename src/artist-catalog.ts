@@ -75,9 +75,9 @@ export function migrateArtistAliases(items: readonly WeightedTag[], aliases: Rea
 }
 
 export function migrateArtistMixAliases(value: ArtistMixDraft, aliases: ReadonlyMap<string, string>): ArtistMixDraft {
-  const primary = value.primary ? migrateArtistAliases([value.primary], aliases)[0] : null;
+  const anchors = migrateArtistAliases(value.anchors, aliases);
   const companions = migrateArtistAliases(value.companions, aliases);
-  return { ...value, primary, companions };
+  return { ...value, anchors, companions };
 }
 
 export function migrateFavoriteAliases(favorites: ReadonlySet<string>, aliases: ReadonlyMap<string, string>): Set<string> {

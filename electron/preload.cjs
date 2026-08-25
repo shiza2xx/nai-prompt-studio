@@ -18,3 +18,9 @@ contextBridge.exposeInMainWorld('naiCatalog', {
     return () => ipcRenderer.removeListener('catalog:progress', handler);
   }
 });
+
+contextBridge.exposeInMainWorld('naiUpdater', {
+  check: () => ipcRenderer.invoke('app-update:check'),
+  downloadAndInstall: manifest => ipcRenderer.invoke('app-update:download-install', manifest),
+  version: () => ipcRenderer.invoke('app-update:version')
+});

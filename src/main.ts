@@ -9,7 +9,7 @@ import { decodePreviews } from './preview-loader';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
 import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
 import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorZone } from './prompt-constructor';
-import { loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSettings, saveSets } from './storage';
+import { hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSettings, saveSets } from './storage';
 import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, WeightedTag } from './types';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
@@ -17,7 +17,9 @@ type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | nu
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
+const APP_VERSION = '0.4.0';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
+const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
 let base: BasePrompt = restored?.base ?? emptyBase();
 let characters: Character[] = restored?.characters ?? [];
@@ -70,6 +72,11 @@ let catalogUpdateUnsubscribe: (() => void) | null = null;
 let catalogUpdateBusy = false;
 let catalogUpdateStatus = '';
 let catalogUpdateError = '';
+let appUpdateStatus = '';
+let onboardingOpen = false;
+let onboardingSteps: Array<{ id: string; title: string; copy: string }> = [];
+let onboardingIndex = 0;
+let mixThreadFrame: number | undefined;
 let mixPickerMode: 'primary' | 'companion' = 'primary';
 let constructorZone: ConstructorZone | null = null;
 let constructorTrigger: HTMLElement | null = null;
@@ -160,6 +167,27 @@ function prompt(): string { return buildBasePrompt(base); }
 function applyAnimationMode(mode: AnimationMode): void {
   if (typeof document !== 'undefined') document.documentElement.dataset.animationMode = mode;
 }
+function applyTheme(): void { document.documentElement.dataset.theme = settings.theme; }
+function onboardingMarkup(): string {
+  if (!onboardingOpen || !onboardingSteps.length) return '';
+  const step = onboardingSteps[onboardingIndex];
+  return `<div class="modal-backdrop onboarding-backdrop"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="guide-title"><p class="eyebrow">STUDIO GUIDE ${onboardingIndex + 1} / ${onboardingSteps.length}</p><h2 id="guide-title">${escapeHtml(step.title)}</h2><p>${escapeHtml(step.copy)}</p><div class="onboarding-actions"><button class="secondary" id="guide-skip" type="button">Skip guide</button><button class="primary" id="guide-next" type="button">${onboardingIndex + 1 === onboardingSteps.length ? 'Open studio' : 'Next'}</button></div></section></div>`;
+}
+function startGuide(replay = false): void {
+  const overview = [
+    { id: 'overview-prompt', title: 'Prompt Builder', copy: 'Build frame, scene, render, artist and character prompt blocks in one workspace.' },
+    { id: 'overview-mix', title: 'Artist Mix', copy: 'Pin up to four anchor artists, then remix companions without changing your anchors.' },
+    { id: 'overview-custom', title: 'Custom Tags', copy: 'Create personal prompt cards and artist cards with images and notes.' },
+    { id: 'overview-metadata', title: 'Image Metadata', copy: 'Drop a PNG or WebP image to inspect and copy its NovelAI generation data.' },
+    { id: 'overview-settings', title: 'Settings', copy: 'Choose a theme, control motion and manage catalog or application updates.' }
+  ];
+  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings now includes Midnight Blue, catalog refresh controls and secure GitHub update checks.' }];
+  const candidates = replay || !existingProfileAtStartup ? overview : update;
+  onboardingSteps = replay ? candidates : candidates.filter(step => !settings.seenGuideIds.includes(step.id));
+  onboardingIndex = 0; onboardingOpen = onboardingSteps.length > 0;
+  if (!replay && !onboardingOpen) { settings = { ...settings, lastSeenVersion: APP_VERSION }; saveSettings(settings); }
+}
+function finishGuide(): void { settings = { ...settings, seenGuideIds: [...new Set([...settings.seenGuideIds, ...onboardingSteps.map(step => step.id)])], lastSeenVersion: APP_VERSION }; saveSettings(settings); onboardingOpen = false; render(); }
 
 function commitArtistMix(nextMix: ArtistMixDraft, notice: string): void {
   artistMix = nextMix;
@@ -258,53 +286,94 @@ function artistZone(): string {
   return `<section class="zone zone-center" aria-label="V5 artist selection"><div class="zone-heading"><div><p class="eyebrow">V5 ARTISTS</p><h2>Artist cards</h2><p>Open the picker from the plus card, then adjust each selected artist.</p></div><div class="range-control"><label>Random replacement</label>${rangeMarkup}<div class="random-actions"><button class="secondary" id="random-artists">Replace cards</button><button class="chip ${artistRandomFavoritesOnly ? 'on' : ''}" id="random-favorites-only" type="button" aria-pressed="${artistRandomFavoritesOnly}">★ ${escapeHtml(favoritePoolLabel)}</button></div></div></div>${catalogStatusMarkup()}${rangeNotice}<p class="random-notice" id="random-notice" role="status" aria-live="polite" ${randomNotice ? '' : 'hidden'}>${escapeHtml(randomNotice)}</p><div class="live-prompt"><div><span>LIVE PROMPT</span><small>selected V5 artist weights</small></div><code id="artist-prompt-output">${escapeHtml(buildArtistsPrompt(base.artists))}</code></div><div class="selected-artists"><div class="subheading"><h3>Selected artists <span>${base.artists.length}</span></h3><div><button class="secondary" id="open-artist-picker">＋ Add artist</button><button class="secondary" id="copy-artists">Copy artists</button><button class="secondary reroll-action" id="reroll-all-weights" type="button">Reroll all weights</button></div></div><div class="selected-artist-grid">${base.artists.map(selectedArtistMarkup).join('')}<button class="empty-artist-card" id="open-artist-picker-empty" aria-label="Open artist picker"><img src="./plus.png" alt=""><b>Add V5 artist</b><small>Open searchable picker</small></button></div></div></section>`;
 }
 
-function mixArtists(): WeightedTag[] { return artistMix.primary ? [artistMix.primary, ...artistMix.companions] : [...artistMix.companions]; }
+function mixArtists(): WeightedTag[] { return [...artistMix.anchors, ...artistMix.companions]; }
 function mixPool(): CatalogCard[] {
-  const primaryId = artistMix.primary?.catalogId;
+  const anchorIds = new Set(artistMix.anchors.map(item => item.catalogId ?? item.id));
   return catalog.artists.filter(card => {
     const stableId = card.catalogId ?? card.id;
-    return stableId !== primaryId && (!artistMix.favoritesOnly || artistFavorites.has(stableId));
+    return !anchorIds.has(stableId) && (!artistMix.favoritesOnly || artistFavorites.has(stableId));
   });
 }
 function reconcileArtistMix(value: ArtistMixDraft): ArtistMixDraft {
   const byId = new Map(catalog.artists.map(card => [card.catalogId ?? card.id, card]));
-  const refresh = (item: WeightedTag | null): WeightedTag | null => {
-    if (!item) return null;
+  const refresh = (item: WeightedTag): WeightedTag => {
     const card = byId.get(item.catalogId ?? item.id);
     return card ? { ...item, catalogId: card.catalogId ?? card.id, image: card.image, tag: `artist: ${card.tag}` } : item;
   };
-  const primary = refresh(value.primary);
-  const seen = new Set(primary?.catalogId ? [primary.catalogId] : []);
+  const anchors = value.anchors.map(refresh).slice(0, 4);
+  const seen = new Set(anchors.map(item => item.catalogId ?? item.id));
   const companions = value.companions.map(refresh).filter((item): item is WeightedTag => Boolean(item && item.catalogId && !seen.has(item.catalogId) && seen.add(item.catalogId)));
-  return { ...value, primary, companions, randomRange: normalizeRange(value.randomRange, Math.max(2, catalog.artists.length)) };
+  if (!anchors.length && companions.length) anchors.push(companions.shift()!);
+  return { ...value, anchors, companions: companions.slice(0, 12 - anchors.length), randomRange: normalizeRange(value.randomRange, 12) };
 }
-function mixArtistCardMarkup(item: WeightedTag, primary: boolean): string {
+function mixArtistCardMarkup(item: WeightedTag, anchor: boolean): string {
   const value = normalizeArtistWeight(item.weight);
   const image = artistImage(item);
   const label = item.tag.replace(/^artist:\s*/i, '');
-  return `<article class="selected-artist mix-artist-card ${primary ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>${primary ? 'PRIMARY ARTIST' : 'COMPANION ARTIST'}</small><b>${escapeHtml(label)}</b><code>${escapeHtml(serializeTag(item) ?? item.tag)}</code><div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(label)}"><input class="mix-weight-number" type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(label)}"><button class="tiny-copy reroll-weight" type="button" data-mix-reroll="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(label)}">Reroll</button></div></div><button class="icon-button" type="button" data-mix-remove="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(label)}">×</button></article>`;
+  return `<article class="selected-artist mix-artist-card ${anchor ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>${anchor ? 'ANCHOR ARTIST' : 'COMPANION ARTIST'}</small><b>${escapeHtml(label)}</b><code>${escapeHtml(serializeTag(item) ?? item.tag)}</code><div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(label)}"><input class="mix-weight-number" type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(label)}"><button class="tiny-copy reroll-weight" type="button" data-mix-reroll="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(label)}">Reroll</button></div></div>${!anchor || artistMix.anchors.length > 1 ? `<button class="mix-pin ${anchor ? 'is-pinned' : ''}" type="button" data-mix-pin="${escapeHtml(item.id)}" aria-pressed="${anchor}" aria-label="${anchor ? 'Unpin' : 'Pin'} ${escapeHtml(label)}">${anchor ? '◆' : '◇'}</button>` : ''}<button class="icon-button" type="button" data-mix-remove="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(label)}">×</button></article>`;
 }
 function mixOrbitMarkup(): string {
-  const primary = artistMix.primary;
+  const anchors = artistMix.anchors;
   const companions = artistMix.companions;
   const layout = mixOrbitLayout(companions.length);
   const satellites = companions.map((item, index) => {
     const placement = layout.placements[index];
     const scale = mixCompanionScale(item.weight);
-    return `<div class="mix-orbit-slot" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-ring="${placement.ring + 1}" data-orbit-angle="${placement.angle}" data-orbit-radius="${placement.radius}" data-orbit-radius-cap="${placement.radiusCap}" style="--orbit-angle:${placement.angle}deg;--orbit-radius:${placement.radius}%;--orbit-radius-cap:${placement.radiusCap}px;--mix-weight-scale:${scale}"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
+    return `<div class="mix-orbit-slot" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-row="${placement.row}" data-orbit-x="${placement.x}" data-orbit-y="${placement.y}" style="--orbit-x:${placement.x}%;--orbit-y:${placement.y}%;--mix-weight-scale:${scale}"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
   }).join('');
-  const center = primary
-    ? `<div class="mix-orbit-primary" role="listitem">${mixArtistCardMarkup(primary, true)}</div>`
-    : '<div class="mix-orbit-primary" role="listitem"><button class="empty-artist-card mix-orbit-empty" id="open-mix-primary-picker-empty" type="button"><img src="./plus.png" alt=""><b>Choose primary artist</b><small>Your fixed anchor for this mix</small></button></div>';
+  const center = anchors.length
+    ? `<div class="mix-orbit-primary mix-anchor-group" role="group" aria-label="Pinned anchor artists">${anchors.map(item => mixArtistCardMarkup(item, true)).join('')}</div>`
+    : '<div class="mix-orbit-primary" role="listitem"><button class="empty-artist-card mix-orbit-empty" id="open-mix-primary-picker-empty" type="button"><img src="./plus.png" alt=""><b>Choose anchor artist</b><small>Your fixed center for this mix</small></button></div>';
   return `<div class="mix-orbit" role="list" aria-label="Primary artist surrounded by companion artists" style="--mix-orbit-height:${layout.height}px;--mix-orbit-rings:${layout.ringCount}"><div class="mix-orbit-ring mix-orbit-ring-inner" aria-hidden="true"></div><div class="mix-orbit-ring mix-orbit-ring-outer" aria-hidden="true"></div>${center}${satellites}</div>`;
 }
+
+function rectangleEdge(rect: DOMRect, targetX: number, targetY: number): { x: number; y: number } {
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const dx = targetX - x;
+  const dy = targetY - y;
+  const factor = 1 / Math.max(Math.abs(dx) / Math.max(1, rect.width / 2), Math.abs(dy) / Math.max(1, rect.height / 2));
+  return { x: x + dx * factor, y: y + dy * factor };
+}
+
+function layoutMixOrbitThreads(): void {
+  mixThreadFrame = undefined;
+  const orbit = document.querySelector<HTMLElement>('.mix-orbit');
+  const anchor = orbit?.querySelector<HTMLElement>(':scope > .mix-orbit-primary');
+  if (!orbit || !anchor) return;
+  const orbitRect = orbit.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  orbit.querySelectorAll<HTMLElement>('.mix-orbit-slot').forEach(slot => {
+    const card = slot.querySelector<HTMLElement>('.mix-artist-card');
+    const connector = slot.querySelector<HTMLElement>('.mix-orbit-connector');
+    if (!card || !connector) return;
+    const cardRect = card.getBoundingClientRect();
+    const cardCenter = { x: cardRect.left + cardRect.width / 2, y: cardRect.top + cardRect.height / 2 };
+    const anchorCenter = { x: anchorRect.left + anchorRect.width / 2, y: anchorRect.top + anchorRect.height / 2 };
+    const start = rectangleEdge(anchorRect, cardCenter.x, cardCenter.y);
+    const end = rectangleEdge(cardRect, anchorCenter.x, anchorCenter.y);
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    connector.style.left = `${start.x - orbitRect.left}px`;
+    connector.style.top = `${start.y - orbitRect.top}px`;
+    connector.style.width = `${Math.hypot(dx, dy)}px`;
+    connector.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
+  });
+}
+
+function scheduleMixOrbitThreads(): void {
+  if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame);
+  mixThreadFrame = window.requestAnimationFrame(layoutMixOrbitThreads);
+}
 function artistMixWorkspace(): string {
-  const range = normalizeRange(artistMix.randomRange, Math.max(2, catalog.artists.length));
+  const requiredMin = Math.min(12, Math.max(2, artistMix.anchors.length + (artistMix.anchors.length > 1 ? 1 : 0)));
+  const normalizedRange = normalizeRange(artistMix.randomRange, 12);
+  const range = { min: Math.max(requiredMin, normalizedRange.min), max: Math.max(requiredMin, normalizedRange.max) };
   const total = mixArtists();
   const poolSize = mixPool().length;
   const status = mixNotice ? `<p class="random-notice" role="status">${escapeHtml(mixNotice)}</p>` : '';
   const panelLabel = focusMode ? 'aria-label="Artist Mix"' : 'aria-labelledby="artist-mix-tab"';
-  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><header class="workspace-intro mix-intro"><div><p class="eyebrow">ARTIST MIX</p><h2>Compose a constellation of artists.</h2><p>Keep one primary voice, then place controlled random companions around it.</p></div><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus mode'}</button></header><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">MIX SETTINGS</p><h3>Random companions</h3><small>Total artists, including the primary</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${Math.max(2, catalog.artists.length)}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${Math.max(2, catalog.artists.length)}" value="${range.max}"></label><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites pool (${poolSize})</button><div class="mix-actions"><button class="primary" id="mix-artists" type="button">Mix artists</button><button class="secondary" id="mix-reroll-companion-weights" type="button">Reroll companion weights</button></div></section>${status}<section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>Selected artists <span>${total.length}</span></h3><small>Primary stays anchored while companions change.</small></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">${artistMix.primary ? 'Replace primary' : 'Choose primary'}</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button></section></section>`;
+  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="12" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="12" value="${range.max}"></label><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><div class="mix-actions"><button class="primary" id="mix-artists" type="button">Mix artists</button><button class="secondary" id="mix-reroll-companion-weights" type="button">Reroll companions</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div></section>${status}<section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button></section></section>`;
 }
 
 function mixPickerMarkup(): string {
@@ -313,7 +382,7 @@ function mixPickerMarkup(): string {
 
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
-  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Shape the studio to your rhythm.</h2><p>These preferences stay in the local profile on D: and never leave this app.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">MOTION</p><h3>Interface animations</h3><p>Choose how transitions, hover previews, and focus mode move.</p>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP PREVIEWS</p><h3>Character preview preload</h3><p>Artist cards always warm up at launch. Character previews are optional and can add startup time.</p><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload all character previews</span></label><small>${settings.preloadCharacterPreviews ? 'Enabled for the next launch.' : 'Off by default. Character cards load when Browse Cards opens.'}</small></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">V5 ARTIST CATALOG</p><h3>Update missing cards</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Fetch only new cards from the exact NAX V5 gallery. Existing cards and favorites stay intact.</p>${browserOnly ? '<p class="settings-disabled" role="status">Catalog updates are available in the desktop app. Browser mode can use the embedded catalog only.</p>' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready for a manual update.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Download missing V5 artists'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`}</section></div></section>`;
+  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme"><option value="arcane-gold"${settings.theme === 'arcane-gold' ? ' selected' : ''}>Arcane Gold</option><option value="midnight-blue"${settings.theme === 'midnight-blue' ? ' selected' : ''}>Midnight Blue</option></select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">V5 ARTIST CATALOG</p><h3>Catalog and app updates</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Catalog checks use only the exact NAX V5 gallery. App updates use the official GitHub release manifest and verified SHA-512.</p>${browserOnly ? '<p class="settings-disabled" role="status">Updates are available in the desktop app.</p>' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || appUpdateStatus || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="check-app-update" type="button">Check for updates now</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -517,6 +586,7 @@ function render(): void {
   // Legacy test marker for the former topbar shape: <div class="top-actions">${animationModeMarkup()}${activeWorkspace === 'prompt'
   const app = document.querySelector<HTMLDivElement>('#app');
   if (!app) return;
+  document.documentElement.dataset.workspace = activeWorkspace;
   clearArtistCardPreview();
   const tabs = focusMode ? '' : `<div class="workspace-tabs" role="tablist" aria-label="Studio workspaces"><button id="prompt-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'prompt'}" aria-controls="prompt-panel" class="${activeWorkspace === 'prompt' ? 'on' : ''}">Prompt Builder</button><button id="artist-mix-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'artist-mix'}" aria-controls="artist-mix-panel" class="${activeWorkspace === 'artist-mix' ? 'on' : ''}">Artist Mix</button><button id="custom-tags-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'custom-tags'}" aria-controls="custom-tags-panel" class="${activeWorkspace === 'custom-tags' ? 'on' : ''}">Custom Tags</button><button id="metadata-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'metadata'}" aria-controls="metadata-panel" class="${activeWorkspace === 'metadata' ? 'on' : ''}">Image Metadata</button><button id="settings-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'settings'}" aria-controls="settings-panel" class="${activeWorkspace === 'settings' ? 'on' : ''}">Settings</button></div>`;
   snapshotAccordionState();
@@ -525,12 +595,15 @@ function render(): void {
   const customTagsMarkup = `<section id="custom-tags-panel" class="${workspacePanelClass('custom-tags')}" role="tabpanel" aria-labelledby="custom-tags-tab">${customTagsWorkspace()}</section>`;
   const activeMarkup = activeWorkspace === 'prompt' ? promptMarkup : activeWorkspace === 'artist-mix' ? artistMixWorkspace() : activeWorkspace === 'custom-tags' ? customTagsMarkup : activeWorkspace === 'metadata' ? metadataMarkup : settingsWorkspace();
   const shellClass = `${focusMode ? 'app-shell focus-shell' : 'app-shell'}${startupEntryPending ? ' startup-entry' : ''}`;
-  app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><span class="brand-mark">N</span><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? `${savedMenu()}<button class="reset-prompt" id="reset" type="button">Reset prompt</button>` : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}`;
+  app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><span class="brand-mark">N</span><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? `${savedMenu()}<button class="reset-prompt" id="reset" type="button">Reset prompt</button>` : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${onboardingMarkup()}`;
   pendingWorkspaceTransition = null;
   bindEvents();
+  document.querySelector('#guide-skip')?.addEventListener('click', finishGuide);
+  document.querySelector('#guide-next')?.addEventListener('click', () => { if (onboardingIndex + 1 < onboardingSteps.length) { onboardingIndex += 1; render(); } else finishGuide(); });
   if (activeWorkspace === 'metadata') metadataWorkspace.bind(app, render);
   if (activeWorkspace === 'settings') bindSettingsEvents();
   if (activeWorkspace === 'artist-mix') bindArtistMixEvents();
+  if (activeWorkspace === 'artist-mix') scheduleMixOrbitThreads();
   if (startupEntryPending) { startupEntryPending = false; window.setTimeout(() => document.querySelector('.startup-entry')?.classList.remove('startup-entry'), 240); }
 }
 
@@ -922,7 +995,7 @@ async function deleteCustomTag(tagId: string): Promise<void> {
     artistFavorites.delete(customArtistId);
     artistMix = {
       ...artistMix,
-      primary: (artistMix.primary?.catalogId ?? artistMix.primary?.id) === customArtistId ? null : artistMix.primary,
+      anchors: artistMix.anchors.filter(item => (item.catalogId ?? item.id) !== customArtistId),
       companions: artistMix.companions.filter(item => (item.catalogId ?? item.id) !== customArtistId)
     };
     saveFavorites(artistFavorites, 'artists');
@@ -1101,17 +1174,18 @@ function addArtist(cardId: string): void {
 function saveArtistMixSoon(): void { saveArtistMix(artistMix); }
 function setMixPrimary(card: CatalogCard): void {
   const stableId = card.catalogId ?? card.id;
-  const samePrimary = (artistMix.primary?.catalogId ?? artistMix.primary?.id) === stableId;
-  const previous = samePrimary ? artistMix.primary : weighted(card);
-  artistMix = { ...artistMix, primary: previous, companions: samePrimary ? artistMix.companions : [] };
-  mixNotice = samePrimary ? '' : 'Primary artist replaced. Choose new companions or start a fresh mix.';
+  if (artistMix.anchors.some(item => (item.catalogId ?? item.id) === stableId)) { closeMixPicker(); return; }
+  if (artistMix.anchors.length >= 4) { mixNotice = 'Artist Mix supports up to 4 anchors.'; closeMixPicker(); render(); return; }
+  const existing = artistMix.companions.find(item => (item.catalogId ?? item.id) === stableId);
+  artistMix = { ...artistMix, anchors: [...artistMix.anchors, existing ?? weighted(card)], companions: artistMix.companions.filter(item => (item.catalogId ?? item.id) !== stableId) };
+  mixNotice = 'Anchor added. It will stay fixed during Mix and companion rerolls.';
   saveArtistMixSoon();
   closeMixPicker();
   render();
 }
 function addMixCompanion(card: CatalogCard): void {
   const stableId = card.catalogId ?? card.id;
-  if (stableId === artistMix.primary?.catalogId || artistMix.companions.some(item => item.catalogId === stableId)) return;
+  if (artistMix.anchors.some(item => (item.catalogId ?? item.id) === stableId) || artistMix.companions.some(item => item.catalogId === stableId) || mixArtists().length >= 12) return;
   artistMix = { ...artistMix, companions: [...artistMix.companions, weighted(card)] };
   saveArtistMixSoon();
   closeMixPicker();
@@ -1119,20 +1193,23 @@ function addMixCompanion(card: CatalogCard): void {
 }
 function randomizeMix(): void {
   if (!catalog.artists.length) { mixNotice = 'The V5 catalog is still loading.'; render(); return; }
-  const primary = artistMix.primary;
-  if (!primary) { mixNotice = 'Choose a primary artist first.'; render(); return; }
-  const availablePool = catalog.artists.filter(card => (card.catalogId ?? card.id) !== primary.catalogId && (!artistMix.favoritesOnly || artistFavorites.has(card.catalogId ?? card.id)));
-  const range = resolveRandomPoolRange(artistMix.randomRange, availablePool.length + 1);
+  const anchors = artistMix.anchors;
+  if (!anchors.length) { mixNotice = 'Choose an anchor artist first.'; render(); return; }
+  const anchorIds = new Set(anchors.map(item => item.catalogId ?? item.id));
+  const availablePool = catalog.artists.filter(card => !anchorIds.has(card.catalogId ?? card.id) && (!artistMix.favoritesOnly || artistFavorites.has(card.catalogId ?? card.id)));
+  const minimum = Math.min(12, Math.max(2, anchors.length + (anchors.length > 1 ? 1 : 0)));
+  const requested = { min: Math.max(minimum, artistMix.randomRange.min), max: Math.max(minimum, artistMix.randomRange.max) };
+  const range = resolveRandomPoolRange(requested, Math.min(12, availablePool.length + anchors.length), minimum);
   if (!range.feasible) { mixNotice = artistMix.favoritesOnly ? 'Favorites-only Mix needs at least 1 companion card.' : 'Artist Mix needs at least 2 V5 artist cards. Your current mix was kept.'; render(); return; }
   const total = randomCount(range.min, range.max);
-  const companions = randomArtistSelection(availablePool, Math.max(0, total - 1)).map(({ card, weight }) => weighted(card, weight));
-  const nextMix: ArtistMixDraft = { ...artistMix, primary, companions, randomRange: { min: range.min, max: range.max } };
-  const notice = `Mixed ${total} artists. The primary artist stayed anchored.`;
+  const companions = randomArtistSelection(availablePool, Math.max(0, total - anchors.length)).map(({ card, weight }) => weighted(card, weight));
+  const nextMix: ArtistMixDraft = { ...artistMix, anchors, companions, randomRange: { min: range.min, max: range.max } };
+  const notice = `Mixed ${total} artists. ${anchors.length} anchor${anchors.length === 1 ? '' : 's'} stayed fixed.`;
   commitArtistMix(nextMix, notice);
 }
 function rerollMixCompanionWeights(): void {
   artistMix = { ...artistMix, companions: rerollArtistWeights(artistMix.companions) };
-  mixNotice = artistMix.companions.length ? 'Rerolled companion weights. The primary stayed unchanged.' : 'Add a companion before rerolling companion weights.';
+  mixNotice = artistMix.companions.length ? 'Rerolled companion weights. Anchors stayed unchanged.' : 'Add a companion before rerolling companion weights.';
   saveArtistMixSoon();
   render();
 }
@@ -1160,7 +1237,7 @@ function refreshMixPicker(): void {
   const grid = document.querySelector<HTMLElement>('#mix-artist-grid');
   if (!grid) return;
   const page = currentMixArtistPickerPage();
-  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = stable === artistMix.primary?.catalogId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"><span class="card-image"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
+  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"><span class="card-image"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
   grid.scrollTop = 0;
   document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
   const pageStatus = document.querySelector<HTMLElement>('#mix-artist-page-status');
@@ -1192,24 +1269,44 @@ function bindArtistMixEvents(): void {
   document.querySelector('#mix-artist-next')?.addEventListener('click', () => { mixArtistPage += 1; refreshMixPicker(); });
   document.querySelector('#mix-favorites-only')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; saveArtistMixSoon(); render(); });
   document.querySelectorAll<HTMLInputElement>('#mix-random-min,#mix-random-max').forEach(input => input.addEventListener('input', () => {
-    const min = Number(document.querySelector<HTMLInputElement>('#mix-random-min')?.value) || 2;
+    const requiredMin = Math.min(12, Math.max(2, artistMix.anchors.length + (artistMix.anchors.length > 1 ? 1 : 0)));
+    const min = Math.max(requiredMin, Number(document.querySelector<HTMLInputElement>('#mix-random-min')?.value) || 2);
     const max = Number(document.querySelector<HTMLInputElement>('#mix-random-max')?.value) || min;
-    artistMix = { ...artistMix, randomRange: normalizeRange({ min, max }, catalog.artists.length) };
+    artistMix = { ...artistMix, randomRange: normalizeRange({ min, max }, 12) };
     saveArtistMixSoon();
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-mix-remove]').forEach(button => button.addEventListener('click', () => {
     const target = button.dataset.mixRemove;
-    if (target === artistMix.primary?.id) artistMix = { ...artistMix, primary: null, companions: [] };
-    else artistMix = { ...artistMix, companions: artistMix.companions.filter(item => item.id !== target) };
+    const isAnchor = artistMix.anchors.some(item => item.id === target);
+    if (isAnchor && artistMix.anchors.length === 1 && !artistMix.companions.length) { mixNotice = 'Artist Mix always keeps one anchor. Add another artist first.'; render(); return; }
+    let anchors = artistMix.anchors.filter(item => item.id !== target);
+    let companions = artistMix.companions.filter(item => item.id !== target);
+    if (!anchors.length && companions.length) { anchors = [companions[0]]; companions = companions.slice(1); mixNotice = 'The first companion became the anchor.'; }
+    artistMix = { ...artistMix, anchors, companions };
+    saveArtistMixSoon(); render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-mix-pin]').forEach(button => button.addEventListener('click', () => {
+    const target = button.dataset.mixPin;
+    const anchor = artistMix.anchors.find(item => item.id === target);
+    if (anchor) {
+      if (artistMix.anchors.length === 1) { mixNotice = 'At least one anchor must stay pinned.'; render(); return; }
+      artistMix = { ...artistMix, anchors: artistMix.anchors.filter(item => item.id !== target), companions: [...artistMix.companions, anchor].slice(0, 11) };
+      mixNotice = 'Artist unpinned and returned to the companion ring.';
+    } else {
+      const companion = artistMix.companions.find(item => item.id === target);
+      if (!companion) return;
+      if (artistMix.anchors.length >= 4) { mixNotice = 'Artist Mix supports up to 4 anchors.'; render(); return; }
+      artistMix = { ...artistMix, anchors: [...artistMix.anchors, companion], companions: artistMix.companions.filter(item => item.id !== target) };
+      mixNotice = 'Artist pinned as an anchor.';
+    }
     saveArtistMixSoon(); render();
   }));
   document.querySelectorAll<HTMLInputElement>('[data-mix-weight],[data-mix-weight-range]').forEach(input => input.addEventListener('input', () => {
     const target = input.dataset.mixWeight ?? input.dataset.mixWeightRange;
     const update = (item: WeightedTag): WeightedTag => item.id === target ? { ...item, weight: normalizeArtistWeight(input.value) } : item;
-    if (artistMix.primary) artistMix = { ...artistMix, primary: update(artistMix.primary), companions: artistMix.companions.map(update) };
-    else artistMix = { ...artistMix, companions: artistMix.companions.map(update) };
-    const currentPrimary = artistMix.primary;
-    document.querySelectorAll<HTMLInputElement>(`[data-mix-weight="${target}"],[data-mix-weight-range="${target}"]`).forEach(control => { control.value = String((currentPrimary && currentPrimary.id === target ? currentPrimary.weight : artistMix.companions.find(item => item.id === target)?.weight) ?? 1); });
+    artistMix = { ...artistMix, anchors: artistMix.anchors.map(update), companions: artistMix.companions.map(update) };
+    const current = mixArtists().find(item => item.id === target);
+    document.querySelectorAll<HTMLInputElement>(`[data-mix-weight="${target}"],[data-mix-weight-range="${target}"]`).forEach(control => { control.value = String(current?.weight ?? 1); });
     const companion = artistMix.companions.find(item => item.id === target);
     const orbitSlot = input.closest<HTMLElement>('.mix-orbit-slot');
     if (companion && orbitSlot) orbitSlot.style.setProperty('--mix-weight-scale', String(mixCompanionScale(companion.weight)));
@@ -1218,9 +1315,7 @@ function bindArtistMixEvents(): void {
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-mix-reroll]').forEach(button => button.addEventListener('click', () => {
     const target = button.dataset.mixReroll;
-    const primary = artistMix.primary;
-    if (primary && primary.id === target) artistMix = { ...artistMix, primary: rerollArtistWeight(primary) };
-    else artistMix = { ...artistMix, companions: artistMix.companions.map(item => item.id === target ? rerollArtistWeight(item) : item) };
+    artistMix = { ...artistMix, anchors: artistMix.anchors.map(item => item.id === target ? rerollArtistWeight(item) : item), companions: artistMix.companions.map(item => item.id === target ? rerollArtistWeight(item) : item) };
     saveArtistMixSoon(); render();
   }));
 }
@@ -1239,6 +1334,14 @@ function bindSettingsEvents(): void {
     saveSettings(settings);
     render();
   });
+  document.querySelector<HTMLSelectElement>('#studio-theme')?.addEventListener('change', event => {
+    settings = { ...settings, theme: (event.target as HTMLSelectElement).value === 'midnight-blue' ? 'midnight-blue' : 'arcane-gold' };
+    applyTheme(); saveSettings(settings);
+  });
+  document.querySelector<HTMLInputElement>('#startup-catalog-update')?.addEventListener('change', event => { settings = { ...settings, updateCatalogOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
+  document.querySelector<HTMLInputElement>('#startup-app-update')?.addEventListener('change', event => { settings = { ...settings, checkAppUpdatesOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
+  document.querySelector('#replay-guide')?.addEventListener('click', () => { startGuide(true); render(); });
+  document.querySelector('#check-app-update')?.addEventListener('click', () => void checkAppUpdate(true));
   document.querySelector('#download-missing-v5')?.addEventListener('click', () => void startCatalogUpdate());
   document.querySelector('#cancel-v5-update')?.addEventListener('click', () => void window.naiCatalog?.cancel());
   if (!catalogUpdateUnsubscribe && window.naiCatalog) {
@@ -1252,6 +1355,19 @@ function bindSettingsEvents(): void {
       if (event.phase === 'complete') catalogUpdateStatus = event.message || 'Catalog updated.';
     });
   }
+}
+async function checkAppUpdate(interactive = false): Promise<void> {
+  if (!window.naiUpdater) return;
+  appUpdateStatus = 'Checking GitHub releases...'; if (interactive) render();
+  try {
+    const result = await window.naiUpdater.check();
+    if (!result.available) appUpdateStatus = 'NAI Prompt Studio is up to date.';
+    else {
+      appUpdateStatus = `Version ${result.version} is available.`;
+      await window.naiUpdater.downloadAndInstall(result);
+    }
+  } catch (error) { appUpdateStatus = error instanceof Error ? error.message : 'The update check failed.'; }
+  if (activeWorkspace === 'settings') render();
 }
 async function startCatalogUpdate(): Promise<void> {
   if (!window.naiCatalog || catalogUpdateBusy) return;
@@ -1281,7 +1397,7 @@ async function startCatalogUpdate(): Promise<void> {
       if (status) status.textContent = `Warming changed previews · ${completed.toLocaleString()} / ${total.toLocaleString()}`;
     });
     randomRange = normalizeRange(randomRange, catalog.artists.length);
-    catalogUpdateStatus = `+${result.added} artists added.${previewResult.failed.length ? ` ${previewResult.failed.length} preview${previewResult.failed.length === 1 ? '' : 's'} failed.` : ''}`;
+    catalogUpdateStatus = `${result.added ? `+${result.added} artists` : '0 new artists'}${previewResult.failed.length ? `. ${previewResult.failed.length} preview${previewResult.failed.length === 1 ? '' : 's'} failed.` : ''}`;
     randomNotice = result.added ? `Catalog refreshed with +${result.added} artists.` : 'Catalog is already up to date.';
     saveSoon(); saveArtistMixSoon();
   } catch (error) {
@@ -1433,9 +1549,15 @@ function renderStartup(): void {
   }
   app.innerHTML = startupMarkup();
   document.querySelector('#startup-retry')?.addEventListener('click', () => void bootApp());
-  document.querySelector('#startup-continue')?.addEventListener('click', () => { startupVisible = false; render(); });
-  document.querySelector('#startup-continue-failed')?.addEventListener('click', () => { startupVisible = false; render(); });
+  document.querySelector('#startup-continue')?.addEventListener('click', openStudioAfterStartup);
+  document.querySelector('#startup-continue-failed')?.addEventListener('click', openStudioAfterStartup);
   document.querySelector('#startup-retry-failed')?.addEventListener('click', () => void retryStartupFailures());
+}
+function openStudioAfterStartup(): void {
+  startupVisible = false; startupEntryPending = animationMode !== 'off';
+  if (settings.lastSeenVersion !== APP_VERSION) startGuide(false);
+  render();
+  window.setTimeout(() => { if (settings.updateCatalogOnStartup) void startCatalogUpdate(); if (settings.checkAppUpdatesOnStartup) void checkAppUpdate(false); }, 500);
 }
 async function decodePreview(card: CatalogCard): Promise<boolean> {
   if (typeof Image === 'undefined') return true;
@@ -1470,9 +1592,7 @@ async function retryStartupFailures(): Promise<void> {
   startupBusy = false;
   if (!startupFailedCards.length) {
     startupPhase = 'Opening studio';
-    startupVisible = false;
-    startupEntryPending = animationMode !== 'off';
-    render();
+    openStudioAfterStartup();
   } else {
     startupPhase = 'Preview loading paused';
     startupFailures = startupFailedCards.map(card => card.tag);
@@ -1496,14 +1616,14 @@ async function bootApp(): Promise<void> {
   startupBusy = false;
   if (startupFailedCards.length) { startupPhase = 'Preview loading paused'; startupFailures = startupFailedCards.map(card => card.tag); renderStartup(); return; }
   startupPhase = 'Opening studio';
-  startupVisible = false;
-  startupEntryPending = animationMode !== 'off';
-  render();
+  openStudioAfterStartup();
 }
 
 applyAnimationMode(animationMode);
+applyTheme();
 renderStartup();
 void bootApp();
+window.addEventListener('resize', scheduleMixOrbitThreads);
 window.addEventListener('beforeunload', () => { metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); });
 
 export { normalizeRange, randomizeArtists, prompt };

@@ -5,6 +5,7 @@
 /release-v5/
 /release-*/
 /.installer-smoke/
+/.installer-smoke*/
 /.qa-artifacts/
 /.build-artifacts/
 *.log
@@ -47,6 +48,7 @@
 /tags*.jpeg
 /tags*.webp
 /Start NAI Prompt Studio.cmd
+/DISCORD_POST.md
 
 # Local update fixtures and previous installer experiments
 /update-test-manifest*.json

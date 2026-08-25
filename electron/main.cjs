@@ -1,10 +1,12 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, protocol, net } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, protocol, net, shell } = require('electron');
+const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
-const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('./app-paths.cjs');
+const { resolveAppPaths, ensureWritable } = require('./app-paths.cjs');
 const { containedAsset, validateImagePayload, writeAsset } = require('./custom-tag-assets.cjs');
 const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
+const { checkForUpdate, downloadInstaller, validateManifest } = require('./app-updater.cjs');
 
 app.setName('NAI Prompt Studio');
 protocol.registerSchemesAsPrivileged([
@@ -15,9 +17,6 @@ protocol.registerSchemesAsPrivileged([
 let appPaths;
 let profileError = '';
 try {
-  const legacyUserData = (() => {
-    try { return app.getPath('userData'); } catch { return null; }
-  })();
   appPaths = ensureWritable(resolveAppPaths({
     isPackaged: app.isPackaged,
     workspaceDir: path.resolve(__dirname, '..'),
@@ -25,9 +24,10 @@ try {
   }));
   app.setPath('userData', appPaths.dataDir);
   app.setPath('sessionData', appPaths.dataDir);
+  app.setPath('temp', appPaths.tempDir);
+  app.commandLine.appendSwitch('disk-cache-dir', appPaths.cacheDir);
   try { app.setPath('logs', appPaths.logsDir); } catch { /* unavailable on older Electron */ }
   try { app.setPath('crashDumps', appPaths.crashDumpsDir); } catch { /* unavailable on older Electron */ }
-  migrateLegacyWorkspace(legacyUserData && path.join(legacyUserData, 'workspace.json'), appPaths.workspaceFile);
 } catch (error) {
   profileError = error instanceof Error ? error.message : String(error);
 }
@@ -120,6 +120,32 @@ ipcMain.handle('catalog:update', async () => {
   return catalogUpdatePromise;
 });
 ipcMain.handle('catalog:cancel', async () => { if (catalogUpdateController) catalogUpdateController.abort(); return Boolean(catalogUpdateController); });
+ipcMain.handle('app-update:version', async () => app.getVersion());
+ipcMain.handle('app-update:check', async () => app.isPackaged ? checkForUpdate(app.getVersion()) : { available: false, version: app.getVersion(), development: true });
+ipcMain.handle('app-update:download-install', async (_event, rawManifest) => {
+  if (!app.isPackaged) throw new Error('Application updates are disabled in development mode.');
+  const manifest = validateManifest(rawManifest, app.getVersion());
+  if (!manifest.available) return { started: false };
+  const owner = BrowserWindow.getFocusedWindow();
+  const consent = await dialog.showMessageBox(owner, { type: 'info', title: 'NAI Prompt Studio update', message: `Download NAI Prompt Studio ${manifest.version}?`, detail: manifest.releaseNotes || 'The installer is verified with SHA-512 and stored inside this installation.', buttons: ['Download', 'Cancel'], defaultId: 0, cancelId: 1 });
+  if (consent.response !== 0) return { started: false };
+  const installer = await downloadInstaller(manifest, appPaths.updatesDir);
+  const installParent = path.dirname(path.dirname(process.execPath));
+  const launch = await dialog.showMessageBox(owner, { type: 'question', title: 'Update ready', message: 'The verified update is ready to install.', detail: 'NAI Prompt Studio will close. Your data folder will be preserved.', buttons: ['Install now', 'Later'], defaultId: 0, cancelId: 1 });
+  if (launch.response !== 0) return { started: false, downloaded: true };
+  const launcher = path.join(__dirname, 'update-launcher.cjs');
+  const child = spawn(process.execPath, [launcher, String(process.pid), installer, installParent], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    cwd: path.dirname(installer),
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+  });
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  child.unref();
+  setTimeout(() => app.quit(), 40);
+  return { started: true };
+});
 
 function createWindow() {
   Menu.setApplicationMenu(null);
@@ -139,6 +165,10 @@ function createWindow() {
   window.setMenuBarVisibility(false);
   window.removeMenu();
   window.webContents.on('will-navigate', event => event.preventDefault());
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
 
   const devServer = process.env.VITE_DEV_SERVER_URL;
   window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
