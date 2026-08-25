@@ -6,14 +6,19 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 
 - Prompt Builder with visual tag constructors for frame, scene, and render choices
 - V5 artist browser with favorites, weighted tags, card previews, and random selection
-- Artist Mix workspace for keeping primary artists fixed while shuffling companions
+- Artist Mix workspace for keeping one or more primary artists fixed while shuffling companions
 - Character prompt workspace with searchable card browser
 - Custom Tags presets with personal preview images and descriptions
+- Saved Library for editable Prompt Builder and Artist Mix snapshots, optional cover images, search and restore
 - Local NovelAI image metadata inspection for PNG and WebP files
-- App-local settings, cache, catalog data, logs, and updates
-- Arcane Gold and Midnight Blue interface themes
+- App-local settings, cache, catalog data, logs, and verified GitHub updates
+- Four interface themes: Arcane Gold, Midnight Blue, Raspberry Rose and Noir
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
+
+## Saved Library and updates
+
+Saved Library keeps prompt snapshots, Artist Mix snapshots and optional cover images in the local application profile. Nothing is uploaded automatically. The Settings workspace can check for a newer public release, verify its size and SHA-512 digest, and launch the new installer in the same installation folder while preserving the existing `data` directory.
 
 ## Source-only clones and catalog hydration
 
@@ -52,6 +57,8 @@ Create the Windows installer:
 ```powershell
 npm run desktop:build
 ```
+
+The generated setup is a single-file Windows installer. It lets the user choose an installation directory, creates the application folder there, and keeps the installed profile and update cache beside the executable.
 
 All project commands route temporary files and package caches into project-local folders on the current drive. Development state lives in `.app-data`. An installed copy stores mutable data in its own `data` folder beside the application files.
 

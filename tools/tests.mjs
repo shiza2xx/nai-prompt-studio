@@ -6,13 +6,13 @@ import { createRequire } from 'node:module';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { buildArtistsPrompt, buildBasePrompt, serializeTag } from '../src/prompt.ts';
 import { MetadataArtistHighlighter, decodeCatalogEntities, escapeMetadataHtml } from '../src/metadata-artist-highlight.ts';
-import { normalizeAnimationMode, normalizeArtistMix, normalizeCustomTag, normalizeCustomTagPresetId, normalizeCustomTagPresets, normalizeDraft, normalizeRandomRange, normalizeSettings } from '../src/storage.ts';
+import { normalizeAnimationMode, normalizeArtistMix, normalizeCustomTag, normalizeCustomTagPresetId, normalizeCustomTagPresets, normalizeDraft, normalizeRandomRange, normalizeSavedLibrary, normalizeSavedLibraryItem, normalizeTheme, normalizeSettings } from '../src/storage.ts';
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from '../src/custom-tag-presets.ts';
 import { commitSnapshot, discoverCards, GALLERY_URL, isWebp, makeCatalog, parseGalleryPage, seedStageFromLive, stableAssetFilename, stableCatalogId } from './update-v5-catalog.mjs';
 import { normalizeArtistWeight, pickUniqueCards, randomArtistSelection, randomCount, randomWeight, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from '../src/random.ts';
 import { decodePreviews } from '../src/preview-loader.ts';
 import { ARTIST_PAGE_SIZE, CHARACTER_PAGE_SIZE, filterCharacters, paginateArtists, paginateCharacters } from '../src/catalog-browser.ts';
-import { mixCompanionScale, mixOrbitLayout } from '../src/artist-mix-layout.ts';
+import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from '../src/artist-mix-layout.ts';
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from '../src/artist-catalog.ts';
 import { decodeStealthPayload, extractImageMetadata, normalizeMetadata, parseMetadataJson, parsePngTextChunks, parseWebpExifUserComment } from '../src/image-metadata.ts';
 import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, guideVisualCount, hasPromptTag, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTag, togglePromptTagGroup } from '../src/prompt-constructor.ts';
@@ -22,6 +22,35 @@ const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../
 const { containedAsset, hasValidMagic, validateImagePayload } = require('../electron/custom-tag-assets.cjs');
 const { loadCatalog: loadRuntimeCatalog, parseGalleryPage: parseRuntimeGalleryPage, normalizeImageUrl: normalizeRuntimeImageUrl, runUpdate: runRuntimeCatalogUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('../electron/catalog-updater.cjs');
 const { compareVersions, validateManifest } = require('../electron/app-updater.cjs');
+
+const legacySaved = normalizeSavedLibraryItem({ id: 'legacy-one', name: 'Legacy one', prompt: '1girl, soft light', createdAt: '2024-01-01T00:00:00.000Z' });
+assert.equal(legacySaved?.kind, 'prompt');
+assert.equal(legacySaved?.legacy, true);
+assert.equal(legacySaved && Object.prototype.hasOwnProperty.call(legacySaved, 'snapshot'), false);
+const normalizedSavedPrompt = normalizeSavedLibraryItem({ id: 'prompt-one', kind: 'prompt', name: 'Prompt one', prompt: 'base', snapshot: { base: { frame: '1girl', artists: [], setting: 'indoors', render: 'highres', undesired: '' }, characters: [{ id: 'char-one', label: 'A', prompt: 'girl', undesired: '' }], randomRange: { min: 3, max: 7 }, animationMode: 'off' } });
+assert.equal(normalizedSavedPrompt?.kind, 'prompt');
+assert.equal(normalizedSavedPrompt?.kind === 'prompt' ? normalizedSavedPrompt.snapshot?.base.frame : undefined, '1girl');
+assert.equal(normalizedSavedPrompt?.kind === 'prompt' ? normalizedSavedPrompt.snapshot?.characters.length : undefined, 1);
+assert.deepEqual(normalizedSavedPrompt?.kind === 'prompt' ? normalizedSavedPrompt.snapshot?.randomRange : undefined, { min: 3, max: 7 });
+assert.equal(normalizedSavedPrompt?.kind === 'prompt' ? Object.prototype.hasOwnProperty.call(normalizedSavedPrompt.snapshot, 'animationMode') : false, false);
+const normalizedSavedMix = normalizeSavedLibraryItem({ id: 'mix-one', kind: 'artist-mix', name: 'Mix one', prompt: 'artist: alpha', snapshot: { anchors: [{ id: 'a', catalogId: 'artist-v5-a', tag: 'artist: alpha', weight: 1 }], companions: [], randomRange: { min: 2, max: 4 }, favoritesOnly: true } });
+assert.equal(normalizedSavedMix?.kind, 'artist-mix');
+assert.equal(normalizedSavedMix?.kind === 'artist-mix' ? normalizedSavedMix.snapshot.anchors.length : undefined, 1);
+const cappedMix = normalizeArtistMix({ anchors: Array.from({ length: 3 }, (_, index) => ({ id: `anchor-${index}`, catalogId: `artist-v5-anchor-${index}`, tag: `artist: anchor ${index}`, weight: 1 })), companions: Array.from({ length: 9 }, (_, index) => ({ id: `companion-${index}`, catalogId: `artist-v5-companion-${index}`, tag: `artist: companion ${index}`, weight: 1 })) });
+assert.equal(cappedMix.anchors.length, 3);
+assert.equal(cappedMix.companions.length, 9);
+for (const anchorCount of [1, 2, 3, 4]) {
+  const retainedMix = normalizeArtistMix({
+    anchors: Array.from({ length: anchorCount }, (_, index) => ({ id: `retained-anchor-${index}`, catalogId: `artist-v5-retained-anchor-${index}`, tag: `artist: retained anchor ${index}`, weight: 1 })),
+    companions: Array.from({ length: 12 - anchorCount }, (_, index) => ({ id: `retained-companion-${index}`, catalogId: `artist-v5-retained-companion-${index}`, tag: `artist: retained companion ${index}`, weight: 1 }))
+  });
+  assert.equal(retainedMix.anchors.length + retainedMix.companions.length, 12);
+  assert.equal(retainedMix.companions.length, mixCompanionCapacity(anchorCount));
+}
+assert.deepEqual(normalizeSavedLibrary([legacySaved, normalizedSavedPrompt, normalizedSavedPrompt]), [legacySaved, normalizedSavedPrompt]);
+assert.equal(normalizeTheme('raspberry-rose'), 'raspberry-rose');
+assert.equal(normalizeTheme('noir'), 'noir');
+assert.equal(normalizeTheme('unsupported'), 'arcane-gold');
 
 assert.equal(compareVersions('0.4.0', '0.3.9'), 1);
 assert.equal(compareVersions('0.4.0', '0.4.0'), 0);
@@ -471,11 +500,15 @@ assert.equal(mixCompanionScale(0.1), 0.856);
 assert.equal(mixCompanionScale(0.9), 0.984);
 assert.equal(mixCompanionScale(1), 1);
 assert.equal(mixCompanionScale(2), 1);
+assert.equal(mixCompanionCapacity(1), 11);
+assert.equal(mixCompanionCapacity(2), 10);
+assert.equal(mixCompanionCapacity(3), 9);
+assert.equal(mixCompanionCapacity(4), 8);
 const singleOrbit = mixOrbitLayout(5);
 assert.equal(singleOrbit.ringCount, 2);
 assert.equal(singleOrbit.placements.length, 5);
 assert.equal(new Set(singleOrbit.placements.map(item => `${item.x}:${item.y}`)).size, 5);
-assert.equal(singleOrbit.placements.every(item => item.x >= 6 && item.x <= 94 && (item.y === 25 || item.y === 75)), true);
+assert.equal(singleOrbit.placements.every(item => item.x >= 5 && item.x <= 95 && (item.y === 24 || item.y === 76)), true);
 const multiOrbit = mixOrbitLayout(13);
 assert.equal(multiOrbit.ringCount, 2);
 assert.equal(multiOrbit.placements.length, 11);
@@ -486,6 +519,22 @@ assert.equal(twoRingOrbit.ringCount, 2);
 assert.equal(twoRingOrbit.placements.every(item => item.row === (item.y < 50 ? 'top' : 'bottom')), true);
 assert.equal(multiOrbit.placements.every(item => !('duration' in item) && !('direction' in item) && !('delay' in item)), true);
 assert.equal(new Set(multiOrbit.placements.map(item => `${item.x}:${item.y}`)).size, 11);
+for (const anchorCount of [1, 2, 3, 4]) {
+  for (const companionCount of [2, 5, 8, 12]) {
+    const layout = mixOrbitLayout(companionCount, anchorCount);
+    assert.equal(layout.placements.every(item => item.y === 24 || item.y === 76), true);
+    assert.equal(new Set(layout.placements.map(item => `${item.x}:${item.y}`)).size, layout.placements.length);
+    for (const row of ['top', 'bottom']) {
+      const xs = layout.placements.filter(item => item.row === row).map(item => item.x).sort((a, b) => a - b);
+      for (let index = 1; index < xs.length; index += 1) assert.ok(xs[index] - xs[index - 1] >= 11.25);
+    }
+    for (const orbitWidth of [896, 1320]) {
+      const companionWidth = Math.min(108, Math.max(88, orbitWidth === 896 ? 980 * 0.09 : 1404 * 0.09));
+      const anchorWidth = anchorCount === 1 ? (orbitWidth === 896 ? 150 : 160) : anchorCount * (orbitWidth === 896 ? 100 : 120) + (anchorCount - 1) * 4;
+      for (const placement of layout.placements) assert.ok(Math.abs(placement.x - 50) / 100 * orbitWidth > anchorWidth / 2 + companionWidth / 2);
+    }
+  }
+}
 
 assert.equal(artistDisplayName(' artist: Aogisa&nbsp;88 '), 'Aogisa 88');
 assert.equal(canonicalArtistIdentity('Artist: Aogisa_88'), canonicalArtistIdentity('aogisa 88'));
@@ -638,10 +687,13 @@ assert.equal(paginateArtists(artistBrowserFixture, { query: 'beyond first page' 
 
 const uiSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 const styleSource = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
 const previewSource = readFileSync(new URL('../src/artist-card-preview.ts', import.meta.url), 'utf8');
 const storageSource = readFileSync(new URL('../src/storage.ts', import.meta.url), 'utf8');
 const metadataWorkspaceSource = readFileSync(new URL('../src/metadata-workspace.ts', import.meta.url), 'utf8');
 const electronSource = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+const preloadSource = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
+const appPathsSource = readFileSync(new URL('../electron/app-paths.cjs', import.meta.url), 'utf8');
 const indexSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const packageSource = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const lockSource = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
@@ -651,6 +703,8 @@ const localEnvSource = readFileSync(new URL('./local-env.mjs', import.meta.url),
 const localRunnerSource = readFileSync(new URL('./run-local.mjs', import.meta.url), 'utf8');
 const desktopBuildSource = readFileSync(new URL('./build-desktop.mjs', import.meta.url), 'utf8');
 const installerBuildSource = readFileSync(new URL('./build-installer.mjs', import.meta.url), 'utf8');
+const iconPreparationSource = readFileSync(new URL('./prepare-icon.mjs', import.meta.url), 'utf8');
+const iconResizeSource = readFileSync(new URL('./prepare-icon.ps1', import.meta.url), 'utf8');
 const installerLauncherSource = readFileSync(new URL('./installer-launcher/Program.cs', import.meta.url), 'utf8');
 const installerProofSource = readFileSync(new URL('./installer-proof/proof.nsi', import.meta.url), 'utf8');
 const installerStorePatchSource = readFileSync(new URL('./electron-builder-nsis-store.mjs', import.meta.url), 'utf8');
@@ -692,9 +746,50 @@ assert.match(storageSource, /item\.imageAsset\.startsWith\('memory-'\)/);
 assert.match(storageSource, /export function normalizeCustomTagPresets\(values: unknown\): CustomTagPreset\[\] \{/);
 assert.match(storageSource, /DEFAULT_CUSTOM_TAG_PRESET_ID/);
 assert.match(storageSource, /from '\.\/custom-tag-presets\.ts'/);
+const savedPromptNormalizerSource = storageSource.match(/export function normalizeSavedPromptSnapshot\(value: unknown\): SavedPromptSnapshot \| undefined \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(savedPromptNormalizerSource, /version: 2[\s\S]*?base: draft\.base[\s\S]*?characters: draft\.characters[\s\S]*?randomRange/);
+assert.doesNotMatch(savedPromptNormalizerSource, /animationMode/);
+const savedPromptTypeSource = typesSource.match(/export interface SavedPromptSnapshot \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.doesNotMatch(savedPromptTypeSource, /animationMode/);
+const savedPromptCaptureSource = uiSource.match(/function currentSavedPromptSnapshot\(\): SavedPromptSnapshot \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(savedPromptCaptureSource, /JSON\.stringify\(base\)[\s\S]*?characters[\s\S]*?randomRange/);
+assert.doesNotMatch(savedPromptCaptureSource, /currentDraft|animationMode/);
 assert.equal(tsconfigSource.compilerOptions.allowImportingTsExtensions, true);
 assert.match(electronSource, /customTagPresets: \[\]/);
 assert.match(electronSource, /\['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets'\]/);
+assert.match(electronSource, /version: 3/);
+assert.match(electronSource, /savedLibrary/);
+assert.match(electronSource, /nai-library/);
+assert.match(electronSource, /library:image-save/);
+assert.match(electronSource, /library:image-delete/);
+assert.match(preloadSource, /saveLibraryImage/);
+assert.match(preloadSource, /deleteLibraryImage/);
+assert.match(appPathsSource, /savedLibraryDir/);
+assert.match(indexSource, /raspberry-rose/);
+assert.match(indexSource, /noir/);
+assert.match(indexSource, /app-icon\.png/);
+assert.match(iconPreparationSource, /build\/icon\.ico|icon\.ico/);
+assert.match(iconPreparationSource, /prepare-icon\.ps1/);
+assert.match(iconResizeSource, /HighQualityBicubic/);
+assert.match(installerBuildSource, /win32icon/);
+assert.match(packageSource.build.win.icon, /build\/icon\.ico/);
+assert.equal(mixOrbitLayout(13, 4).placements.length, 8);
+const threeAnchorNine = mixOrbitLayout(9, 3);
+assert.equal(threeAnchorNine.placements.length, 9);
+assert.equal(new Set(threeAnchorNine.placements.map(item => `${item.x}:${item.y}`)).size, 9);
+assert.equal(mixOrbitLayout(13, 4).placements.every(item => item.x >= 5 && item.x <= 95 && (item.y === 24 || item.y === 76)), true);
+assert.equal(mixOrbitLayout(13, 4).placements.every(item => !('duration' in item) && !('direction' in item) && !('delay' in item)), true);
+const mixCardSource = uiSource.match(/function mixArtistCardMarkup\([\s\S]*?\n\}/)?.[0] ?? '';
+assert.doesNotMatch(mixCardSource, /<code/);
+assert.match(styleSource, /R3 artist mix geometry/);
+assert.match(styleSource, /@media \(min-width: 901px\)[\s\S]*?\.mix-orbit \{ min-height: 0; \}/);
+assert.match(styleSource, /\.mix-orbit-primary \{ max-width: min\(52%, 560px\); \}/);
+assert.match(styleSource, /@media \(max-width: 900px\)[\s\S]*?\.mix-orbit-primary \{ width: 100%; max-width: none; \}/);
+assert.match(styleSource, /\.mix-anchor-group \{ flex-wrap: wrap; gap: 4px; max-width: 100%;/);
+assert.match(uiSource, /requestAnimationFrame\(\(\) => \{[\s\S]*?requestAnimationFrame\(\(\) => \{/);
+assert.match(uiSource, /new ResizeObserver\(\(\) => scheduleMixOrbitThreads\(\)\)/);
+assert.match(uiSource, /setTimeout\(settle, 40\)/);
+assert.match(styleSource, /\.workspace-tabs \{[^}]*max-width: 100%;[^}]*overflow-x: auto;/);
 assert.match(uiSource, /saveCustomTagPresets\(customTagPresets\)/);
 assert.match(previewSource, /data-artist-preview-message/);
 assert.match(previewSource, /previewImage\.removeAttribute\('src'\);[\s\S]*?previewImage\.alt = '';/);
@@ -881,6 +976,11 @@ assert.doesNotMatch(uiSource, /[—–]/);
 assert.doesNotMatch(indexSource, /[—–]/);
 assert.match(uiSource, /const existingProfileAtStartup = hasExistingProfile\(\);/);
 assert.match(uiSource, /const candidates = replay \|\| !existingProfileAtStartup \? overview : update;/);
+assert.match(uiSource, /overview-mix[\s\S]*?overview-saved-library[\s\S]*?overview-custom/);
+assert.match(uiSource, /function openStudioAfterStartup\(\): void \{[\s\S]*?startGuide\(false\);/);
+assert.doesNotMatch(uiSource.match(/function openStudioAfterStartup\(\): void \{[\s\S]*?\n\}/)?.[0] ?? '', /lastSeenVersion !== APP_VERSION/);
+const restorePromptSource = uiSource.match(/if \(item\.kind === 'prompt' && item\.snapshot\) \{[\s\S]*?\n  \} else if \(item\.kind === 'artist-mix'/)?.[0] ?? '';
+assert.doesNotMatch(restorePromptSource, /animationMode|applyAnimationMode|settings =/);
 assert.match(storageSource, /export function hasExistingProfile\(\): boolean/);
 assert.doesNotMatch(styleSource, /rgb\((?:201 168 106|229 201 141|113 75 38|98 72 130)\s*\//);
 assert.doesNotMatch(uiSource, /quick\s*start|prewarm/i);
@@ -908,7 +1008,7 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.4.0');
+assert.equal(packageSource.version, '0.5.0');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
 assert.match(packageSource.scripts['desktop:build'], /run-local\.mjs node tools\/build-desktop\.mjs/);

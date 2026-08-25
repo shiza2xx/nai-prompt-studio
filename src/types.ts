@@ -1,7 +1,7 @@
 export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 
 export type AnimationMode = 'auto' | 'on' | 'off';
-export type StudioTheme = 'arcane-gold' | 'midnight-blue';
+export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir';
 
 export interface WeightedTag {
   id: string;
@@ -26,6 +26,40 @@ export interface PromptSet {
   prompt: string;
   createdAt: string;
 }
+
+/** Structured Prompt Builder state captured by a Saved Library prompt item. */
+export interface SavedPromptSnapshot {
+  version: 2;
+  base: BasePrompt;
+  characters: Character[];
+  randomRange: { min: number; max: number };
+}
+
+export interface SavedLibraryCommon {
+  id: string;
+  name: string;
+  /** Flattened base or artist prompt retained for quick copy and migration. */
+  prompt: string;
+  imageAsset?: string;
+  mime?: 'image/png' | 'image/jpeg' | 'image/webp';
+  originalName?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SavedPromptItem extends SavedLibraryCommon {
+  kind: 'prompt';
+  /** Missing only for migrated legacy PromptSet records, which are copy-only. */
+  snapshot?: SavedPromptSnapshot;
+  legacy?: boolean;
+}
+
+export interface SavedArtistMixItem extends SavedLibraryCommon {
+  kind: 'artist-mix';
+  snapshot: ArtistMixDraft;
+}
+
+export type SavedLibraryItem = SavedPromptItem | SavedArtistMixItem;
 
 export interface BasePrompt {
   frame: string;

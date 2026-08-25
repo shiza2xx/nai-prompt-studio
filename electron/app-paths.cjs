@@ -11,6 +11,7 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
   const logsDir = path.join(dataDir, 'logs');
   const crashDumpsDir = path.join(dataDir, 'crash-dumps');
   const customTagsDir = path.join(dataDir, 'custom-tags');
+  const savedLibraryDir = path.join(dataDir, 'saved-library');
   const catalogDir = path.join(dataDir, 'catalog');
   const tempDir = path.join(dataDir, 'temp');
   const cacheDir = path.join(dataDir, 'cache');
@@ -21,7 +22,7 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
     dataDir,
     logsDir,
     crashDumpsDir,
-    customTagsDir,
+    customTagsDir, savedLibraryDir,
     catalogDir, tempDir, cacheDir, updatesDir,
     workspaceFile: path.join(dataDir, 'workspace.json')
   };
@@ -34,6 +35,7 @@ function ensureWritable(paths) {
     fs.mkdirSync(paths.logsDir, { recursive: true });
     fs.mkdirSync(paths.crashDumpsDir, { recursive: true });
     fs.mkdirSync(paths.customTagsDir, { recursive: true });
+    fs.mkdirSync(paths.savedLibraryDir, { recursive: true });
     fs.mkdirSync(paths.catalogDir, { recursive: true });
     fs.mkdirSync(paths.tempDir, { recursive: true });
     fs.mkdirSync(paths.cacheDir, { recursive: true });

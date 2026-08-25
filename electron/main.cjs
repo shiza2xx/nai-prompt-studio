@@ -11,7 +11,8 @@ const { checkForUpdate, downloadInstaller, validateManifest } = require('./app-u
 app.setName('NAI Prompt Studio');
 protocol.registerSchemesAsPrivileged([
   { scheme: 'nai-custom', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
-  { scheme: 'nai-catalog', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }
+  { scheme: 'nai-catalog', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
+  { scheme: 'nai-library', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }
 ]);
 
 let appPaths;
@@ -47,24 +48,27 @@ function storageFile() {
 
 function readStorage() {
   const file = storageFile();
-  if (!fs.existsSync(file)) return { exists: false, data: { version: 2, sets: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
+  if (!fs.existsSync(file)) return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const merged = { version: 2, sets: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null, ...data };
+    const merged = { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null, ...data };
     if (Number(data.version) < 2) {
       merged.characterFavorites = Array.isArray(data.favorites) ? data.favorites.filter(value => String(value).startsWith('character-')) : [];
       merged.favorites = [];
       merged.version = 2;
     }
+    if (!Array.isArray(merged.savedLibrary)) merged.savedLibrary = [];
+    if (!Object.prototype.hasOwnProperty.call(data, 'savedLibrary')) merged.savedLibrary = undefined;
+    merged.version = Math.max(3, Number(merged.version) || 3);
     return { exists: true, data: merged };
   } catch {
-    return { exists: false, data: { version: 2, sets: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
+    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
   }
 }
 
 function saveStorageSection(section, value) {
-  // Legacy section contract: ['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets']
-  if (!['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets', 'settings', 'artistMix'].includes(section)) return;
+  // Legacy section contract: ['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets']; new saves use savedLibrary.
+  if (!['sets', 'savedLibrary', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets', 'settings', 'artistMix'].includes(section)) return;
   const file = storageFile();
   const current = readStorage().data;
   current[section] = value;
@@ -99,6 +103,19 @@ ipcMain.handle('custom-tag:save', async (_event, metadata, payload) => {
 });
 ipcMain.handle('custom-tag:delete', async (_event, asset) => {
   try { fs.rmSync(containedAsset(appPaths.customTagsDir, asset), { force: true }); return true; } catch { return false; }
+});
+ipcMain.handle('library:image-save', async (_event, metadata, payload) => {
+  if (!metadata || typeof metadata !== 'object') throw new Error('Saved Library cover metadata is required');
+  const mime = metadata.mime;
+  const bytes = validateImagePayload(payload, mime);
+  const extension = mime === 'image/jpeg' ? 'jpg' : mime.slice('image/'.length);
+  const safeId = String(metadata.id || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '') || String(Date.now());
+  const asset = `${safeId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${extension}`;
+  writeAsset(appPaths.savedLibraryDir, asset, bytes, mime);
+  return { imageAsset: asset, mime, originalName: typeof metadata.originalName === 'string' ? metadata.originalName.slice(0, 255) : '' };
+});
+ipcMain.handle('library:image-delete', async (_event, asset) => {
+  try { fs.rmSync(containedAsset(appPaths.savedLibraryDir, asset), { force: true }); return true; } catch { return false; }
 });
 
 let catalogUpdateController = null;
@@ -156,6 +173,7 @@ function createWindow() {
     minHeight: 700,
     backgroundColor: '#100b13',
     title: 'NAI Prompt Studio',
+    icon: path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'app-icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -193,6 +211,13 @@ app.whenReady().then(() => {
     try {
       const asset = catalogAssetFromProtocolUrl(request.url);
       const target = resolveActiveCatalogAsset(appPaths.catalogDir, asset);
+      return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
+    } catch { return new Response('Not found', { status: 404 }); }
+  });
+  protocol.handle('nai-library', request => {
+    try {
+      const asset = decodeURIComponent(new URL(request.url).pathname.replace(/^\//, ''));
+      const target = containedAsset(appPaths.savedLibraryDir, asset);
       return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
     } catch { return new Response('Not found', { status: 404 }); }
   });

@@ -5,7 +5,9 @@ contextBridge.exposeInMainWorld('naiStorage', {
   save: (section, value) => ipcRenderer.send('storage:save', section, value),
   saveSync: (section, value) => ipcRenderer.sendSync('storage:save-sync', section, value),
   saveCustomTag: (metadata, bytes) => ipcRenderer.invoke('custom-tag:save', metadata, bytes),
-  deleteCustomTag: asset => ipcRenderer.invoke('custom-tag:delete', asset)
+  deleteCustomTag: asset => ipcRenderer.invoke('custom-tag:delete', asset),
+  saveLibraryImage: (metadata, bytes) => ipcRenderer.invoke('library:image-save', metadata, bytes),
+  deleteLibraryImage: asset => ipcRenderer.invoke('library:image-delete', asset)
 });
 
 contextBridge.exposeInMainWorld('naiCatalog', {

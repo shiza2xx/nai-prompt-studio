@@ -1,5 +1,6 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
-import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, StudioTheme, WeightedTag } from './types';
+import { mixCompanionCapacity } from './artist-mix-layout.ts';
+import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, SavedLibraryItem, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -12,6 +13,7 @@ const DRAFT_KEY = 'nai-prompt-studio:draft';
 const RANDOM_RANGE_KEY = 'nai-prompt-studio:random-range';
 const SETTINGS_KEY = 'nai-prompt-studio:settings';
 const ARTIST_MIX_KEY = 'nai-prompt-studio:artist-mix';
+export const SAVED_LIBRARY_KEY = 'nai-prompt-studio:saved-library';
 
 function normalizeArtistWeight(value: unknown): number {
   const parsed = Number(value);
@@ -19,7 +21,7 @@ function normalizeArtistWeight(value: unknown): number {
   return Number(Math.max(0.1, Math.min(2, Math.round(source * 10) / 10)).toFixed(1));
 }
 
-type DesktopSnapshot = { exists?: boolean; data?: { version?: number; sets?: PromptSet[]; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[] } };
+type DesktopSnapshot = { exists?: boolean; data?: { version?: number; sets?: PromptSet[]; savedLibrary?: unknown; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[] } };
 
 function bridge(): typeof window.naiStorage | undefined {
   try { return typeof window === 'undefined' ? undefined : window.naiStorage; } catch { return undefined; }
@@ -48,7 +50,7 @@ export function hasExistingProfile(): boolean {
   if (desktopSnapshot.exists) return true;
   if (typeof localStorage === 'undefined') return false;
   try {
-    return [KEY, ARTIST_FAVORITES_KEY, CHARACTER_FAVORITES_KEY, DRAFT_KEY, SETTINGS_KEY, ARTIST_MIX_KEY]
+    return [KEY, SAVED_LIBRARY_KEY, ARTIST_FAVORITES_KEY, CHARACTER_FAVORITES_KEY, DRAFT_KEY, SETTINGS_KEY, ARTIST_MIX_KEY]
       .some(key => localStorage.getItem(key) !== null);
   } catch { return false; }
 }
@@ -64,6 +66,125 @@ export function loadSets(): PromptSet[] {
 export function saveSets(sets: PromptSet[]): void {
   try { localStorage.setItem(KEY, JSON.stringify(sets)); } catch { /* private browsing */ }
   bridge()?.save('sets', sets);
+}
+
+function cloneValue<T>(value: T): T {
+  try {
+    if (typeof structuredClone === 'function') return structuredClone(value);
+  } catch { /* fall through to the JSON-safe clone */ }
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function normalizeSavedName(value: unknown, fallback: string): string {
+  const name = String(value ?? '').trim().replace(/\s+/g, ' ').slice(0, 120);
+  return name || fallback;
+}
+
+function normalizeSavedTimestamp(value: unknown, fallback: string): string {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
+}
+
+function normalizeSavedMime(value: unknown): SavedLibraryItem['mime'] | undefined {
+  return value === 'image/png' || value === 'image/jpeg' || value === 'image/webp' ? value : undefined;
+}
+
+export function normalizeSavedPromptSnapshot(value: unknown): SavedPromptSnapshot | undefined {
+  const draft = normalizeDraft(value);
+  return draft ? cloneValue({ version: 2, base: draft.base, characters: draft.characters, randomRange: draft.randomRange ?? { min: 2, max: 5 } }) : undefined;
+}
+
+export function normalizeSavedLibraryItem(value: unknown, fallbackNow = new Date().toISOString()): SavedLibraryItem | null {
+  if (!value || typeof value !== 'object') return null;
+  const source = value as Partial<SavedLibraryItem> & { snapshot?: unknown; draft?: unknown };
+  const kind = source.kind === 'artist-mix' ? 'artist-mix' : 'prompt';
+  const idValue = typeof source.id === 'string' ? source.id.trim() : '';
+  if (!idValue || !/^[a-zA-Z0-9_-]+$/.test(idValue)) return null;
+  const createdAt = normalizeSavedTimestamp(source.createdAt, fallbackNow);
+  const updatedAt = normalizeSavedTimestamp(source.updatedAt, createdAt);
+  const prompt = typeof source.prompt === 'string' ? source.prompt : '';
+  const common = {
+    id: idValue,
+    name: normalizeSavedName(source.name, kind === 'artist-mix' ? 'Artist Mix' : 'Saved prompt'),
+    prompt,
+    ...(typeof source.imageAsset === 'string' && /^[a-zA-Z0-9._-]+$/.test(source.imageAsset) && !source.imageAsset.includes('..') ? { imageAsset: source.imageAsset } : {}),
+    ...(normalizeSavedMime(source.mime) ? { mime: normalizeSavedMime(source.mime) } : {}),
+    ...(typeof source.originalName === 'string' ? { originalName: source.originalName.slice(0, 255) } : {}),
+    createdAt,
+    updatedAt
+  };
+  if (kind === 'artist-mix') {
+    const snapshot = normalizeArtistMix(source.snapshot);
+    if (!snapshot.anchors.length && !snapshot.companions.length) return null;
+    return cloneValue({ ...common, kind, snapshot });
+  }
+  const snapshot = normalizeSavedPromptSnapshot(source.snapshot ?? source.draft);
+  const legacy = (source as { legacy?: unknown }).legacy === true || !snapshot;
+  return cloneValue({ ...common, kind, ...(snapshot ? { snapshot } : {}), ...(legacy ? { legacy: true } : {}) } satisfies SavedPromptItem);
+}
+
+export function normalizeSavedLibrary(values: unknown): SavedLibraryItem[] {
+  if (!Array.isArray(values)) return [];
+  const result: SavedLibraryItem[] = [];
+  const ids = new Set<string>();
+  for (const value of values) {
+    const item = normalizeSavedLibraryItem(value);
+    if (item && !ids.has(item.id)) { ids.add(item.id); result.push(item); }
+  }
+  return result;
+}
+
+function migrateLegacySets(values: unknown): SavedLibraryItem[] {
+  if (!Array.isArray(values)) return [];
+  const result: SavedLibraryItem[] = [];
+  for (const value of values) {
+    if (!value || typeof value !== 'object') continue;
+    const source = value as Partial<PromptSet>;
+    const item = normalizeSavedLibraryItem({
+      id: source.id,
+      kind: 'prompt',
+      name: source.name,
+      prompt: source.prompt,
+      createdAt: source.createdAt,
+      updatedAt: source.createdAt,
+      legacy: true
+    });
+    if (item) result.push(item);
+  }
+  return result;
+}
+
+/** Load v3 Saved Library data, migrating legacy PromptSet records once. */
+export function loadSavedLibrary(): SavedLibraryItem[] {
+  const remote = desktopSnapshot.exists ? desktopSnapshot.data?.savedLibrary : undefined;
+  const local = localArray<unknown>(SAVED_LIBRARY_KEY);
+  let localHasSavedLibrary = false;
+  try { localHasSavedLibrary = typeof localStorage !== 'undefined' && localStorage.getItem(SAVED_LIBRARY_KEY) !== null; } catch { /* private browsing */ }
+  let values: SavedLibraryItem[];
+  if (Array.isArray(remote)) values = normalizeSavedLibrary(remote);
+  else if (localHasSavedLibrary) values = normalizeSavedLibrary(local);
+  else values = migrateLegacySets(desktopSnapshot.exists ? desktopSnapshot.data?.sets : localArray<PromptSet>(KEY));
+  if (!Array.isArray(remote) && (!localHasSavedLibrary || values.length)) saveSavedLibrary(values);
+  return cloneValue(values);
+}
+
+export function saveSavedLibrary(values: SavedLibraryItem[]): void {
+  const normalized = normalizeSavedLibrary(values);
+  try { localStorage.setItem(SAVED_LIBRARY_KEY, JSON.stringify(normalized)); } catch { /* private browsing */ }
+  bridge()?.save('savedLibrary', cloneValue(normalized));
+}
+
+export async function saveLibraryImage(metadata: { id: string; mime: SavedLibraryItem['mime']; originalName?: string }, bytes: Uint8Array): Promise<{ imageAsset: string; mime?: SavedLibraryItem['mime']; originalName?: string }> {
+  const saver = bridge()?.saveLibraryImage;
+  if (!saver) throw new Error('Cover images require the desktop app and cannot persist in a browser tab.');
+  return saver(metadata, bytes);
+}
+
+export async function deleteLibraryImage(asset: string): Promise<boolean> {
+  const deleter = bridge()?.deleteLibraryImage;
+  if (!deleter) return false;
+  return deleter(asset);
 }
 
 function favoriteKey(kind: FavoriteKind): string { return kind === 'artists' ? ARTIST_FAVORITES_KEY : CHARACTER_FAVORITES_KEY; }
@@ -111,7 +232,9 @@ export function normalizeRandomRange(value: unknown): { min: number; max: number
 export function normalizeAnimationMode(value: unknown): AnimationMode {
   return value === 'on' || value === 'off' ? value : 'auto';
 }
-export function normalizeTheme(value: unknown): StudioTheme { return value === 'midnight-blue' ? 'midnight-blue' : 'arcane-gold'; }
+export function normalizeTheme(value: unknown): StudioTheme {
+  return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' ? value : 'arcane-gold';
+}
 
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {
   const source = value && typeof value === 'object' ? value as Partial<AppSettings> : {};
@@ -160,10 +283,11 @@ export function normalizeArtistMix(value: unknown): ArtistMixDraft {
     if (item && key && !seen.has(key) && anchors.length < 4) { seen.add(key); anchors.push(item); }
   }
   const companions: WeightedTag[] = [];
+  const companionLimit = anchors.length ? mixCompanionCapacity(anchors.length) : 12;
   if (Array.isArray(source.companions)) for (const raw of source.companions) {
     const item = normalizeMixTag(raw);
     const key = item?.catalogId;
-    if (item && key && !seen.has(key) && anchors.length + companions.length < 12) { seen.add(key); companions.push(item); }
+    if (item && key && !seen.has(key) && companions.length < companionLimit) { seen.add(key); companions.push(item); }
   }
   if (!anchors.length && companions.length) anchors.push(companions.shift()!);
   return { version: 2, anchors, companions, randomRange: { min: Math.min(12, range.min), max: Math.min(12, range.max) }, favoritesOnly: source.favoritesOnly === true };

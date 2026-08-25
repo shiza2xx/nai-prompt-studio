@@ -27,6 +27,7 @@ function run(command, args) {
 
 mkdirSync(releaseDir, { recursive: true });
 mkdirSync(compiledLauncherDir, { recursive: true });
+run(process.execPath, [join(projectRoot, 'tools', 'prepare-icon.mjs')]);
 for (const output of [rawPath, rawBlockmapPath, payloadPath, launcherPath]) {
   if (existsSync(output)) rmSync(output, { force: true });
 }
@@ -34,7 +35,7 @@ for (const output of [rawPath, rawBlockmapPath, payloadPath, launcherPath]) {
 const csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
 if (!existsSync(csc)) throw new Error(`Required Windows C# compiler is missing: ${csc}`);
 if (existsSync(compiledLauncher)) rmSync(compiledLauncher, { force: true });
-run(csc, ['/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', `/out:${compiledLauncher}`, join(projectRoot, 'tools', 'installer-launcher', 'Program.cs')]);
+run(csc, ['/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', `/win32icon:${join(projectRoot, 'build', 'icon.ico')}`, `/out:${compiledLauncher}`, join(projectRoot, 'tools', 'installer-launcher', 'Program.cs')]);
 
 patchInstallerStoreCopy();
 try {

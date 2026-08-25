@@ -1,6 +1,6 @@
 {
   "name": "nai-prompt-studio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
@@ -14,7 +14,7 @@
     "dev": "node tools/start-desktop-dev.mjs",
     "web:dev": "node tools/run-local.mjs node node_modules/vite/bin/vite.js",
     "desktop:dev": "node tools/start-desktop-dev.mjs",
-    "build": "node tools/run-local.mjs node node_modules/typescript/bin/tsc --noEmit && node tools/run-local.mjs node node_modules/vite/bin/vite.js build",
+    "build": "node tools/run-local.mjs node tools/prepare-icon.mjs && node tools/run-local.mjs node node_modules/typescript/bin/tsc --noEmit && node tools/run-local.mjs node node_modules/vite/bin/vite.js build",
     "desktop:build": "node tools/run-local.mjs node tools/build-desktop.mjs",
     "preview": "node tools/run-local.mjs node node_modules/vite/bin/vite.js preview",
     "catalog:update:v5": "node tools/run-local.mjs node tools/update-v5-catalog.mjs",
@@ -37,7 +37,8 @@
       "package.json"
     ],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.ico"
     },
     "artifactName": "NAI-Prompt-Studio-V5-Payload-${version}.${ext}",
     "nsis": {
@@ -48,7 +49,9 @@
       "createDesktopShortcut": false,
       "createStartMenuShortcut": false,
       "shortcutName": "NAI Prompt Studio",
-      "uninstallDisplayName": "NAI Prompt Studio"
+      "uninstallDisplayName": "NAI Prompt Studio",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
     }
   },
   "devDependencies": {

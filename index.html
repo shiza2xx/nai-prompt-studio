@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0c1020" />
-    <script>try{const s=JSON.parse(localStorage.getItem('nai-prompt-studio:settings')||'{}');document.documentElement.dataset.theme=s.theme==='midnight-blue'?'midnight-blue':'arcane-gold'}catch{document.documentElement.dataset.theme='arcane-gold'}</script>
+    <link rel="icon" type="image/png" href="/app-icon.png" />
+    <script>try{const s=JSON.parse(localStorage.getItem('nai-prompt-studio:settings')||'{}');const t=['arcane-gold','midnight-blue','raspberry-rose','noir'];document.documentElement.dataset.theme=t.includes(s.theme)?s.theme:'arcane-gold'}catch{document.documentElement.dataset.theme='arcane-gold'}</script>
     <title>NAI Prompt Studio - V5 Artist Workflow</title>
   </head>
   <body>

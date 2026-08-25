@@ -10,6 +10,9 @@
 /.build-artifacts/
 *.log
 /build-check.log
+/icons.jpg
+/build/icon-*.png
+/build/icon.ico
 
 # Local application state, caches, and credentials
 /.app-data/

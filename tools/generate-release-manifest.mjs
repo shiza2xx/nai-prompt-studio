@@ -8,6 +8,14 @@ const file = join(projectRoot, 'release-v5', asset);
 if (!existsSync(file)) throw new Error(`Build the single-file setup first: ${file}`);
 const sha = createHash('sha512'); for await (const chunk of createReadStream(file)) sha.update(chunk);
 const stat = await fs.stat(file);
-const manifest = { schemaVersion: 1, version: pkg.version, asset, url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`, size: stat.size, sha512: sha.digest('hex'), releaseNotes: `NAI Prompt Studio ${pkg.version}` };
+const manifest = {
+  schemaVersion: 1,
+  version: pkg.version,
+  asset,
+  url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
+  size: stat.size,
+  sha512: sha.digest('hex'),
+  releaseNotes: 'Saved Library, multi-anchor Artist Mix, four studio themes, and verified in-app updates.'
+};
 await fs.writeFile(join(projectRoot, 'release-v5', 'update-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(JSON.stringify(manifest, null, 2));
