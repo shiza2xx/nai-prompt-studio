@@ -1,0 +1,56 @@
+{
+  "name": "novelai-prompts",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "node tools/start-desktop-dev.mjs",
+    "web:dev": "node tools/run-local.mjs node node_modules/vite/bin/vite.js",
+    "desktop:dev": "node tools/start-desktop-dev.mjs",
+    "build": "node tools/run-local.mjs node node_modules/typescript/bin/tsc --noEmit && node tools/run-local.mjs node node_modules/vite/bin/vite.js build",
+    "desktop:build": "node tools/run-local.mjs node tools/build-desktop.mjs",
+    "preview": "node tools/run-local.mjs node node_modules/vite/bin/vite.js preview",
+    "catalog:update:v5": "node tools/run-local.mjs node tools/update-v5-catalog.mjs",
+    "test": "node tools/run-local.mjs node --experimental-strip-types tools/tests.mjs",
+    "installer:proof": "node tools/run-local.mjs node tools/installer-proof/build-and-run-proof.mjs",
+    "import:guide-examples": "node tools/run-local.mjs node tools/import-hothottuk-guide.mjs"
+  },
+  "build": {
+    "appId": "com.novelai.promptstudio",
+    "productName": "NAI Prompt Studio",
+    "directories": {
+      "output": "release-v5"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "artifactName": "NAI-Prompt-Studio-V5-Payload-${version}.${ext}",
+    "nsis": {
+      "include": "build/installer.nsh",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NAI Prompt Studio",
+      "uninstallDisplayName": "NAI Prompt Studio"
+    }
+  },
+  "devDependencies": {
+    "electron": "^40.2.1",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  },
+  "allowScripts": {
+    "electron@40.10.6": true,
+    "esbuild@0.28.1": true,
+    "electron-winstaller@5.4.0": true
+  }
+}

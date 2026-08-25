@@ -1,0 +1,1005 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { buildArtistsPrompt, buildBasePrompt, serializeTag } from '../src/prompt.ts';
+import { MetadataArtistHighlighter, decodeCatalogEntities, escapeMetadataHtml } from '../src/metadata-artist-highlight.ts';
+import { normalizeAnimationMode, normalizeArtistMix, normalizeCustomTag, normalizeCustomTagPresetId, normalizeCustomTagPresets, normalizeDraft, normalizeRandomRange, normalizeSettings } from '../src/storage.ts';
+import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from '../src/custom-tag-presets.ts';
+import { commitSnapshot, discoverCards, GALLERY_URL, isWebp, makeCatalog, parseGalleryPage, seedStageFromLive, stableAssetFilename, stableCatalogId } from './update-v5-catalog.mjs';
+import { normalizeArtistWeight, pickUniqueCards, randomArtistSelection, randomCount, randomWeight, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from '../src/random.ts';
+import { decodePreviews } from '../src/preview-loader.ts';
+import { ARTIST_PAGE_SIZE, CHARACTER_PAGE_SIZE, filterCharacters, paginateArtists, paginateCharacters } from '../src/catalog-browser.ts';
+import { mixCompanionScale, mixOrbitLayout } from '../src/artist-mix-layout.ts';
+import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from '../src/artist-catalog.ts';
+import { decodeStealthPayload, extractImageMetadata, normalizeMetadata, parseMetadataJson, parsePngTextChunks, parseWebpExifUserComment } from '../src/image-metadata.ts';
+import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, guideVisualCount, hasPromptTag, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTag, togglePromptTagGroup } from '../src/prompt-constructor.ts';
+
+const require = createRequire(import.meta.url);
+const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../electron/app-paths.cjs');
+const { containedAsset, hasValidMagic, validateImagePayload } = require('../electron/custom-tag-assets.cjs');
+const { loadCatalog: loadRuntimeCatalog, parseGalleryPage: parseRuntimeGalleryPage, normalizeImageUrl: normalizeRuntimeImageUrl, runUpdate: runRuntimeCatalogUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('../electron/catalog-updater.cjs');
+
+let loaderActive = 0;
+let loaderPeak = 0;
+const loaderProgress = [];
+const loaderResult = await decodePreviews([1, 2, 3, 4, 5], async item => {
+  loaderActive += 1;
+  loaderPeak = Math.max(loaderPeak, loaderActive);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  loaderActive -= 1;
+  return item !== 3;
+}, 2, (completed, total) => loaderProgress.push([completed, total]));
+assert.equal(loaderPeak, 2);
+assert.deepEqual(loaderResult.failed, [3]);
+assert.equal(loaderResult.completed, 5);
+assert.deepEqual(loaderProgress.at(-1), [5, 5]);
+
+const guideFixture = [
+  { tag: 'upper_body', section: '5.1. Shot Types', image: 'frame.png', description: 'A framing guide' },
+  { tag: 'gothic', section: '4.5. Genre Mood', image: 'scene.png', description: 'A mood guide' },
+  { tag: 'anime coloring', section: '4.3. Coloring Shading', image: 'render.png', description: 'A rendering guide' },
+  { tag: 'Euler', section: '2.3. Style Reference (style yoinker)', image: 'excluded.png' }
+];
+assert.deepEqual(guideVisualCount(guideFixture), { frame: 1, scene: 1, render: 1 });
+const constructorFixture = classifyGuideEntries(guideFixture);
+assert.equal(constructorFixture.filter(card => card.kind === 'preset').length, 1);
+assert.equal(constructorFixture.find(card => card.tag === 'upper_body')?.description, 'A framing guide');
+assert.deepEqual(qualityPresetTags(), ['solo artist', '-5.3::artist collaboration::', 'year 2024', 'year 2023', 'year 2022', 'year 2021', '-1::clean text::', '-1::flat color::', 'natural', 'incredibly absurdres', 'very aesthetic', 'highres', 'masterpiece', 'best quality', 'amazing quality', '-3::simple illustration::', 'best illustration', 'novel illustration']);
+assert.equal(togglePromptTag('1girl, 1.2::upper_body::, upper_body88', 'upper_body'), '1girl, upper_body88');
+assert.equal(togglePromptTag('alpha, upper_body, Upper Body, 1.2::upper_body::, omega', 'upper body'), 'alpha, omega');
+assert.equal(togglePromptTag('alpha, upper_body, Upper Body, 1.2::upper_body::, omega', 'upper_body'), 'alpha, omega');
+assert.equal(hasPromptTag('1girl, upper_body', 'upper_body'), true);
+assert.equal(hasPromptTag('1girl, -5.3::artist collaboration::', '-5.3::artist collaboration::'), true);
+assert.equal(togglePromptTag('-5.3::artist collaboration::', '-5.3::artist collaboration::'), '');
+assert.equal(togglePromptTag('', '-5.3::artist collaboration::'), '-5.3::artist collaboration::');
+const commaGroup = 'tag1, tag2, tag1, , tag2';
+assert.deepEqual(splitTagGroup(commaGroup), ['tag1', 'tag2']);
+assert.equal(canonicalGroupIdentity('Tag_One, 2::tag two::'), canonicalGroupIdentity('TAG TWO, tag one'));
+assert.equal(canonicalCustomTagIdentity('scene', 'Tag_One, 2::tag two::'), 'scene:tag one|tag two');
+const partialGroupPrompt = togglePromptTagGroup('neighbor, 1.2::Tag_One::, tag_one_extra, tail', 'tag one, tag_two');
+assert.equal(partialGroupPrompt, 'neighbor, 1.2::Tag_One::, tag_one_extra, tail, tag_two');
+assert.equal(hasPromptTagGroup(partialGroupPrompt, 'TAG_ONE, 3::tag two::'), true);
+assert.equal(togglePromptTagGroup(partialGroupPrompt, 'tag_one, TAG_TWO'), 'neighbor, tag_one_extra, tail');
+const commaRecord = { id: 'one-card', tag: 'tag1, tag2, tag3', tags: splitTagGroup('tag1, tag2, tag3'), zone: 'frame', section: 'Custom', image: 'custom.png', kind: 'tag' };
+assert.equal([commaRecord].length, 1);
+assert.equal(commaRecord.tag, 'tag1, tag2, tag3');
+assert.deepEqual(constructorCardTags(commaRecord), ['tag1', 'tag2', 'tag3']);
+const presetPrompt = qualityPresetTags().map((tag, index) => index === 1 ? tag : tag.replace(/::$/, '')).join(', ');
+assert.equal(qualityPresetTags().every(tag => hasPromptTag(presetPrompt, tag)), true);
+assert.equal(qualityPresetTags().reduce((value, tag) => togglePromptTag(value, tag), presetPrompt), '');
+const customOverride = { id: 'custom', tag: 'gothic', section: 'Custom', image: 'custom.png', zone: 'scene', kind: 'tag' };
+assert.equal(mergeConstructorCards(constructorFixture, [customOverride]).filter(card => card.tag === 'gothic').length, 1);
+assert.equal(hasValidMagic(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 'image/png'), true);
+assert.equal(hasValidMagic(Buffer.from('RIFFxxxxWEBP'), 'image/webp'), true);
+assert.throws(() => validateImagePayload(Buffer.from('not an image'), 'image/png'), /signature/i);
+assert.throws(() => containedAsset('D:/profile/custom-tags', '../outside.png'), /invalid|outside/i);
+const assetTemp = mkdtempSync(join(tmpdir(), 'nai-custom-assets-'));
+const assetRoot = join(assetTemp, 'custom-tags');
+mkdirSync(assetRoot);
+const outsideAsset = join(assetTemp, 'outside.png');
+writeFileSync(outsideAsset, 'outside');
+let symlinkChecksSkipped = false;
+try {
+  symlinkSync(outsideAsset, join(assetRoot, 'asset-link.png'), 'file');
+  assert.throws(() => containedAsset(assetRoot, 'asset-link.png'), /symbolic|redirect/i);
+  const redirectedRoot = join(assetTemp, 'redirected-root');
+  symlinkSync(assetRoot, redirectedRoot, 'junction');
+  assert.throws(() => containedAsset(redirectedRoot, 'outside.png'), /directory|redirect/i);
+} catch (error) {
+  if (error?.code === 'EPERM' || error?.code === 'EACCES' || error?.code === 'UNKNOWN') symlinkChecksSkipped = true;
+  else throw error;
+} finally { rmSync(assetTemp, { recursive: true, force: true }); }
+assert.equal(typeof symlinkChecksSkipped, 'boolean');
+
+const fixture = readFileSync(new URL('./fixtures/nax-v5-gallery.html', import.meta.url), 'utf8');
+const runtimeCardAsset = 'cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-card.webp';
+assert.equal(catalogAssetFromProtocolUrl(`nai-catalog://asset/${runtimeCardAsset}`), runtimeCardAsset);
+assert.equal(catalogAssetFromProtocolUrl(`nai-catalog://cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-card.webp`), runtimeCardAsset);
+assert.throws(() => catalogAssetFromProtocolUrl('nai-catalog://outside/cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-card.webp'), /Invalid runtime catalog card asset/);
+const guideManifest = JSON.parse(readFileSync(new URL('../public/catalog/guide/manifest.json', import.meta.url), 'utf8'));
+assert.equal(guideManifest.length, 281);
+assert.equal(guideManifest.some(entry => /^2\.[34]\./.test(entry.section)), false);
+assert.equal(guideManifest.filter(entry => /^5\.[1-4]\./.test(entry.section)).length, 33);
+assert.equal(guideManifest.filter(entry => /^4\.[1-8]\./.test(entry.section)).length, 248);
+const parsed = parseGalleryPage(fixture);
+assert.deepEqual(parsed.pages, [1, 2]);
+assert.equal(parsed.cards.length, 2);
+assert.equal(parsed.cards[0].tag, 'Alpha artist');
+assert.equal(parsed.cards[1].tag, 'Beta artist');
+const requestedUrls = [];
+const discovered = await discoverCards(async url => { requestedUrls.push(url); return { ok: true, text: async () => fixture }; });
+assert.equal(discovered.length, 2);
+assert.deepEqual(requestedUrls, [`${GALLERY_URL}&page=1`, `${GALLERY_URL}&page=2`]);
+const strictParser = parseGalleryPage(`<a data-page="3"></a>
+  <figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/allowed.webp"><figurecaption class="imageText">Allowed</figurecaption></figure>
+  <figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v4.5/wrong-gallery.webp"><figurecaption class="imageText">Wrong gallery</figurecaption></figure>
+  <figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/tags.zip"><figurecaption class="imageText">Tags archive</figurecaption></figure>`);
+assert.deepEqual(strictParser.pages, [3]);
+assert.deepEqual(strictParser.cards.map(card => card.tag), ['Allowed']);
+assert.equal(isWebp(Buffer.from('RIFFxxxxWEBP')), true);
+assert.equal(isWebp(Buffer.from('not webp')), false);
+const runtimeParsed = parseRuntimeGalleryPage(fixture);
+assert.deepEqual(runtimeParsed.pages, [1, 2]);
+assert.equal(runtimeParsed.cards[1].sourceUrl.includes('%2520'), true);
+assert.equal(normalizeRuntimeImageUrl(runtimeParsed.cards[1].sourceUrl), runtimeParsed.cards[1].sourceUrl);
+assert.equal(normalizeRuntimeImageUrl('https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v4/a.webp'), null);
+const runtimeWebp = Buffer.from('RIFFxxxxWEBP');
+function runtimeResponse(url, body = fixture) { return { ok: true, status: 200, url, text: async () => body, arrayBuffer: async () => runtimeWebp }; }
+function runtimeRoot(name) {
+  const root = join(process.cwd(), '.qa-artifacts', `runtime-update-${name}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const catalogDir = join(root, 'catalog');
+  const embeddedPath = join(root, 'embedded.json');
+  mkdirSync(catalogDir, { recursive: true });
+  return { root, catalogDir, embeddedPath };
+}
+function embeddedArtist({ tag, sourceUrl, catalogId, image = 'catalog/embedded.webp', runtime = false }) {
+  return { id: catalogId, catalogId, tag, gallery: 'danbooru-artist-tags-2-v5', image, sourceUrl, runtime };
+}
+async function runRuntimeFixture({ name, artists = [], body = fixture, onPage, onCard }) {
+  const paths = runtimeRoot(name);
+  writeFileSync(paths.embeddedPath, JSON.stringify({ version: 2, artists, characters: [], tags: ['girl'] }));
+  const calls = { page: [], card: [] };
+  const fetchImpl = async (url, options = {}) => {
+    if (url.startsWith(GALLERY_URL)) {
+      calls.page.push(url);
+      onPage?.(url, options, calls);
+      return runtimeResponse(url, body);
+    }
+    calls.card.push(url);
+    onCard?.(url, options, calls);
+    return runtimeResponse(url);
+  };
+  const result = await runRuntimeCatalogUpdate({ ...paths, fetchImpl });
+  return { ...paths, calls, result };
+}
+
+// A source already present in the embedded V5 snapshot is not fetched or
+// copied into the runtime delta.  Only the genuinely new Beta card is fetched.
+const exactEmbedded = embeddedArtist({ tag: 'Alpha artist', sourceUrl: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/a.webp', catalogId: 'embedded-alpha' });
+const exactRun = await runRuntimeFixture({ name: 'exact-embedded', artists: [exactEmbedded] });
+assert.equal(exactRun.result.added, 1);
+assert.equal(exactRun.calls.card.filter(url => url.endsWith('/a.webp')).length, 0);
+assert.equal(exactRun.calls.card.filter(url => url.includes('b%2520artist.webp')).length, 1);
+const exactPointer = JSON.parse(readFileSync(join(exactRun.catalogDir, 'active.json'), 'utf8'));
+const exactOverlay = JSON.parse(readFileSync(join(exactRun.catalogDir, 'generations', exactPointer.generation, 'catalog.json'), 'utf8'));
+assert.deepEqual(exactOverlay.artists.map(card => card.catalogId), ['artist-v5-beta-artist-ae20ty']);
+assert.equal(exactRun.result.catalog.artists.some(card => card.catalogId === 'embedded-alpha'), true);
+
+// A unique normalized-tag match with a changed raw URL is an override: it
+// keeps the old identity, fetches once, and does not count as +N.
+const changedEmbedded = embeddedArtist({ tag: 'Alpha artist', sourceUrl: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/alpha-old.webp', catalogId: 'embedded-alpha' });
+const alphaOnlyFixture = `<nav><a data-page="1">A</a></nav><figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/a.webp"><figurecaption class="imageText">Alpha artist</figurecaption></figure>`;
+const changedRun = await runRuntimeFixture({ name: 'tag-override', artists: [changedEmbedded], body: alphaOnlyFixture });
+assert.equal(changedRun.result.changed, 1);
+assert.equal(changedRun.result.added, 0);
+assert.equal(changedRun.result.catalog.artists.find(card => card.tag === 'Alpha artist')?.catalogId, 'embedded-alpha');
+assert.equal(changedRun.calls.card.filter(url => url.endsWith('/a.webp')).length, 1);
+
+// A clean runtime update adds both discovered identities.
+const newRun = await runRuntimeFixture({ name: 'new-identities' });
+assert.equal(newRun.result.added, 2);
+assert.equal(newRun.calls.card.length, 2);
+assert.equal(readFileSync(join(newRun.catalogDir, 'active.json'), 'utf8').includes('generation'), true);
+
+// The next generation retains the prior runtime delta without downloading it
+// again, while the merged catalog still contains both cards.
+let secondPageCalls = 0;
+const secondFetch = async (url, options = {}) => {
+  if (url.startsWith(GALLERY_URL)) { secondPageCalls += 1; return runtimeResponse(url, fixture); }
+  throw new Error(`unexpected second-update card fetch: ${url}`);
+};
+const secondResult = await runRuntimeCatalogUpdate({ catalogDir: newRun.catalogDir, embeddedPath: newRun.embeddedPath, fetchImpl: secondFetch });
+assert.equal(secondResult.added, 0);
+assert.equal(secondResult.changed, 0);
+assert.equal(secondResult.catalog.artists.length, 2);
+assert.equal(secondPageCalls, 2);
+
+// The active overlay is a snapshot of the current V5 discovery. A card that
+// disappears from NAX is pruned from the next generation and merged catalog.
+const pruneFetch = async (url, options = {}) => {
+  if (url.startsWith(GALLERY_URL)) return runtimeResponse(url, alphaOnlyFixture);
+  throw new Error(`unexpected prune card fetch: ${url}`);
+};
+const prunedResult = await runRuntimeCatalogUpdate({ catalogDir: newRun.catalogDir, embeddedPath: newRun.embeddedPath, fetchImpl: pruneFetch });
+assert.equal(prunedResult.catalog.artists.length, 1);
+assert.equal(prunedResult.catalog.artists[0].tag, 'Alpha artist');
+const prunedPointer = JSON.parse(readFileSync(join(newRun.catalogDir, 'active.json'), 'utf8'));
+const prunedOverlay = JSON.parse(readFileSync(join(newRun.catalogDir, 'generations', prunedPointer.generation, 'catalog.json'), 'utf8'));
+assert.deepEqual(prunedOverlay.artists.map(card => card.tag), ['Alpha artist']);
+
+// If an override later resolves to an exact embedded source, the embedded
+// card becomes authoritative and the runtime override is removed.
+const revertEmbedded = embeddedArtist({ tag: 'Alpha artist', sourceUrl: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/a.webp', catalogId: 'embedded-alpha' });
+const alphaChangedFixture = `<nav><a data-page="1">A</a></nav><figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/alpha-new.webp"><figurecaption class="imageText">Alpha artist</figurecaption></figure>`;
+const revertInitial = await runRuntimeFixture({ name: 'override-reversion', artists: [revertEmbedded], body: alphaChangedFixture });
+assert.equal(revertInitial.result.changed, 1);
+assert.equal(revertInitial.result.catalog.artists.find(card => card.catalogId === 'embedded-alpha')?.runtime, true);
+const revertResult = await runRuntimeCatalogUpdate({ catalogDir: revertInitial.catalogDir, embeddedPath: revertInitial.embeddedPath, fetchImpl: async url => {
+  if (url.startsWith(GALLERY_URL)) return runtimeResponse(url, alphaOnlyFixture);
+  throw new Error(`unexpected reversion card fetch: ${url}`);
+} });
+assert.equal(revertResult.added, 0);
+assert.equal(revertResult.changed, 0);
+assert.equal(revertResult.catalog.artists.length, 1);
+assert.equal(revertResult.catalog.artists[0].catalogId, 'embedded-alpha');
+assert.equal(revertResult.catalog.artists[0].runtime, false);
+const revertPointer = JSON.parse(readFileSync(join(revertInitial.catalogDir, 'active.json'), 'utf8'));
+const revertOverlay = JSON.parse(readFileSync(join(revertInitial.catalogDir, 'generations', revertPointer.generation, 'catalog.json'), 'utf8'));
+assert.equal(revertOverlay.artists.length, 0);
+
+const secondPointer = JSON.parse(readFileSync(join(newRun.catalogDir, 'active.json'), 'utf8'));
+const secondOverlay = JSON.parse(readFileSync(join(newRun.catalogDir, 'generations', secondPointer.generation, 'catalog.json'), 'utf8'));
+const activeAsset = resolveActiveCatalogAsset(newRun.catalogDir, secondOverlay.artists[0].image);
+assert.equal(isWebp(readFileSync(activeAsset)), true);
+assert.throws(() => resolveActiveCatalogAsset(newRun.catalogDir, 'active.json'), /invalid runtime catalog card asset/i);
+assert.throws(() => resolveActiveCatalogAsset(newRun.catalogDir, '../active.json'), /invalid runtime catalog card asset/i);
+assert.throws(() => resolveActiveCatalogAsset(newRun.catalogDir, `cards/artist/danbooru-artist-tags-2-v5/../active.json`), /invalid runtime catalog card asset/i);
+const outsideRuntimeAsset = join(newRun.root, 'outside.webp');
+writeFileSync(outsideRuntimeAsset, runtimeWebp);
+let runtimeSymlinkCheckSkipped = false;
+try {
+  const activeFile = activeAsset;
+  const backupFile = `${activeFile}.backup`;
+  renameSync(activeFile, backupFile);
+  symlinkSync(outsideRuntimeAsset, activeFile, 'file');
+  assert.throws(() => resolveActiveCatalogAsset(newRun.catalogDir, secondOverlay.artists[0].image), /regular file|redirected/i);
+  rmSync(activeFile, { force: true });
+  renameSync(backupFile, activeFile);
+} catch (error) {
+  if (error?.code === 'EPERM' || error?.code === 'EACCES' || error?.code === 'UNKNOWN') runtimeSymlinkCheckSkipped = true;
+  else throw error;
+}
+assert.equal(typeof runtimeSymlinkCheckSkipped, 'boolean');
+
+// Existing but malformed active pointers must fail closed instead of silently
+// falling back to the embedded snapshot.
+const malformedPaths = runtimeRoot('malformed-pointer');
+writeFileSync(malformedPaths.embeddedPath, JSON.stringify({ version: 2, artists: [], characters: [], tags: [] }));
+const activePointerPath = join(malformedPaths.catalogDir, 'active.json');
+writeFileSync(activePointerPath, '{not-json');
+assert.throws(() => loadRuntimeCatalog(malformedPaths), /invalid active catalog pointer/i);
+assert.throws(() => resolveActiveCatalogAsset(malformedPaths.catalogDir, 'cards/artist/danbooru-artist-tags-2-v5/missing.webp'), /invalid active catalog pointer/i);
+for (const value of [{ generation: '../escape' }, { generation: 'bad/name' }, { generation: 42 }, {}, null]) {
+  writeFileSync(activePointerPath, JSON.stringify(value));
+  assert.throws(() => loadRuntimeCatalog(malformedPaths), /invalid active catalog pointer generation/i);
+  assert.throws(() => resolveActiveCatalogAsset(malformedPaths.catalogDir, 'cards/artist/danbooru-artist-tags-2-v5/missing.webp'), /invalid active catalog pointer generation/i);
+}
+writeFileSync(activePointerPath, JSON.stringify({ generation: 'missing-generation' }));
+assert.throws(() => loadRuntimeCatalog(malformedPaths), /invalid active catalog generation directory/i);
+assert.throws(() => resolveActiveCatalogAsset(malformedPaths.catalogDir, 'cards/artist/danbooru-artist-tags-2-v5/missing.webp'), /invalid active catalog generation directory/i);
+mkdirSync(join(malformedPaths.catalogDir, 'generations', 'empty-generation'), { recursive: true });
+writeFileSync(activePointerPath, JSON.stringify({ generation: 'empty-generation' }));
+assert.throws(() => loadRuntimeCatalog(malformedPaths), /invalid active catalog generation catalog/i);
+
+// Cancellation before staging commit leaves the active pointer untouched.
+const pointerBeforeCancel = readFileSync(join(newRun.catalogDir, 'active.json'), 'utf8');
+const cancelController = new AbortController();
+await assert.rejects(() => runRuntimeCatalogUpdate({
+  catalogDir: newRun.catalogDir,
+  embeddedPath: newRun.embeddedPath,
+  signal: cancelController.signal,
+  fetchImpl: async (url, options = {}) => {
+    if (url.startsWith(GALLERY_URL) && url.endsWith('page=2')) cancelController.abort();
+    return runtimeResponse(url, fixture);
+  }
+}), /cancelled/i);
+assert.equal(readFileSync(join(newRun.catalogDir, 'active.json'), 'utf8'), pointerBeforeCancel);
+
+// Abort exactly from the final validation progress callback. The old pointer
+// must remain byte-for-byte unchanged because commit begins only afterwards.
+const validationRun = await runRuntimeFixture({ name: 'cancel-final-validation' });
+const pointerBeforeValidationCancel = readFileSync(join(validationRun.catalogDir, 'active.json'), 'utf8');
+const validationController = new AbortController();
+await assert.rejects(() => runRuntimeCatalogUpdate({
+  catalogDir: validationRun.catalogDir,
+  embeddedPath: validationRun.embeddedPath,
+  signal: validationController.signal,
+  fetchImpl: async url => {
+    if (url.startsWith(GALLERY_URL)) return runtimeResponse(url, fixture);
+    throw new Error(`unexpected validation card fetch: ${url}`);
+  },
+  onProgress: event => { if (event.phase === 'validation' && event.message === 'Staged catalog validated') validationController.abort(); }
+}), /cancelled/i);
+assert.equal(readFileSync(join(validationRun.catalogDir, 'active.json'), 'utf8'), pointerBeforeValidationCancel);
+
+for (const paths of [exactRun, changedRun, newRun, revertInitial, malformedPaths, validationRun]) rmSync(paths.root, { recursive: true, force: true });
+
+const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const textPayload = Buffer.from('Comment\0"{\\"model_name\\":\\"Text model\\",\\"steps\\":12}"', 'utf8');
+const textChunk = Buffer.alloc(12 + textPayload.length);
+textChunk.writeUInt32BE(textPayload.length, 0); textChunk.write('tEXt', 4); textPayload.copy(textChunk, 8);
+const endChunk = Buffer.alloc(12); endChunk.write('IEND', 4);
+const parsedText = parsePngTextChunks(new Uint8Array(Buffer.concat([pngSignature, textChunk, endChunk])));
+assert.equal(parsedText[0].keyword, 'Comment');
+assert.deepEqual(parseMetadataJson(parsedText[0].text), { model_name: 'Text model', steps: 12 });
+const stealthJson = JSON.stringify({ Description: 'outer description', Comment: JSON.stringify({ model_name: 'NovelAI Diffusion V5', steps: 28, sampler: 'k_euler_ancestral', width: 1920, height: 1088, scale: 7, v4_prompt: { caption: { base_caption: 'base positive', char_captions: [{ char_caption: 'first character' }, { char_caption: 'second character' }] } }, v4_negative_prompt: { caption: { base_caption: 'base negative', char_captions: [{ char_caption: 'first negative' }] } } }) });
+const stealthCompressed = gzipSync(stealthJson);
+const stealthHeader = Buffer.alloc(19); Buffer.from('stealth_pngcomp').copy(stealthHeader); stealthHeader.writeUInt32BE(stealthCompressed.length * 8, 15);
+const stealthBits = [...Buffer.concat([stealthHeader, stealthCompressed])].flatMap(byte => Array.from({ length: 8 }, (_, bit) => (byte >> (7 - bit)) & 1));
+const alpha = new Uint8Array(stealthBits.length + 5).fill(254); stealthBits.forEach((bit, index) => { alpha[index] = 254 | bit; });
+assert.deepEqual(Buffer.from(decodeStealthPayload(alpha)), stealthCompressed);
+const normalizedStealth = normalizeMetadata(parseMetadataJson(gunzipSync(decodeStealthPayload(alpha)).toString('utf8')));
+assert.equal(normalizedStealth.model, 'NovelAI Diffusion V5');
+assert.equal(normalizedStealth.scale, '7');
+assert.equal(normalizedStealth.characters.length, 2);
+assert.equal(normalizedStealth.characters[1].positive, 'second character');
+assert.equal(normalizedStealth.characters[1].negative, '');
+const normalizedFallback = normalizeMetadata({ Source: 'V5', Description: 'fallback prompt', uc: 'fallback negative', parameters: { steps: 28, sampler: 'k_dpmpp_2m_sde', width: 1472, height: 1472, scale: 6.5 } });
+assert.equal(normalizedFallback.model, 'V5');
+assert.equal(normalizedFallback.base.positive, 'fallback prompt');
+assert.equal(normalizedFallback.characters.length, 0);
+
+function writeUint16(buffer, offset, value, little) { little ? buffer.writeUInt16LE(value, offset) : buffer.writeUInt16BE(value, offset); }
+function writeUint32(buffer, offset, value, little) { little ? buffer.writeUInt32LE(value, offset) : buffer.writeUInt32BE(value, offset); }
+function exactArrayBuffer(bytes) { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); }
+function webpChunk(type, data) {
+  const chunk = Buffer.alloc(8 + data.length + (data.length % 2));
+  chunk.write(type, 0); chunk.writeUInt32LE(data.length, 4); data.copy(chunk, 8);
+  return chunk;
+}
+function webpWithExif(exif, extras = []) {
+  const body = Buffer.concat([Buffer.from('WEBP'), ...extras, webpChunk('EXIF', exif)]);
+  const file = Buffer.alloc(8); file.write('RIFF', 0); file.writeUInt32LE(body.length, 4);
+  return Buffer.concat([file, body]);
+}
+function makeTiffUserComment(value, { little = false, marker = 'ASCII\0\0\0', unicode = false } = {}) {
+  const encoded = unicode ? Buffer.from(`\ufeff${value}`, 'utf16le') : Buffer.from(value, 'utf8');
+  const payload = unicode && !little ? Buffer.concat(Array.from({ length: encoded.length / 2 }, (_, index) => Buffer.from([encoded[index * 2 + 1], encoded[index * 2]]))) : encoded;
+  const comment = Buffer.concat([Buffer.from(marker, 'ascii'), payload, Buffer.from(unicode ? [0, 0] : [0])]);
+  const exifIfdOffset = 26;
+  const commentOffset = 44;
+  const tiff = Buffer.alloc(commentOffset + comment.length);
+  tiff.write(little ? 'II' : 'MM', 0); writeUint16(tiff, 2, 42, little); writeUint32(tiff, 4, 8, little);
+  writeUint16(tiff, 8, 1, little); writeUint16(tiff, 10, 0x8769, little); writeUint16(tiff, 12, 4, little); writeUint32(tiff, 14, 1, little); writeUint32(tiff, 18, exifIfdOffset, little);
+  writeUint16(tiff, exifIfdOffset, 1, little); writeUint16(tiff, exifIfdOffset + 2, 0x9286, little); writeUint16(tiff, exifIfdOffset + 4, 7, little); writeUint32(tiff, exifIfdOffset + 6, comment.length, little); writeUint32(tiff, exifIfdOffset + 10, commentOffset, little);
+  comment.copy(tiff, commentOffset);
+  return tiff;
+}
+
+const syntheticOuter = JSON.stringify({ Comment: JSON.stringify({ model_name: 'Little endian model', steps: 7 }) });
+const syntheticWebp = webpWithExif(makeTiffUserComment(syntheticOuter, { little: true }), [webpChunk('JUNK', Buffer.from([1, 2, 3]))]);
+assert.equal(parseWebpExifUserComment(syntheticWebp), syntheticOuter);
+assert.equal(normalizeMetadata(parseMetadataJson(parseWebpExifUserComment(syntheticWebp))).model, 'Little endian model');
+const unicodeWebp = webpWithExif(makeTiffUserComment(JSON.stringify({ model_name: 'Big endian Unicode model', steps: 9 }), { marker: 'UNICODE\0', unicode: true }));
+assert.equal(normalizeMetadata(parseMetadataJson(parseWebpExifUserComment(unicodeWebp))).model, 'Big endian Unicode model');
+const alphOnlyWebp = (() => { const body = Buffer.concat([Buffer.from('WEBP'), webpChunk('ALPH', Buffer.from([1, 2, 3]))]); const file = Buffer.alloc(8); file.write('RIFF'); file.writeUInt32LE(body.length, 4); return Buffer.concat([file, body]); })();
+assert.equal(parseWebpExifUserComment(alphOnlyWebp), null);
+assert.throws(() => parseWebpExifUserComment(syntheticWebp.subarray(0, -1)), /WebP/);
+const declaredBoundary = Buffer.from(syntheticWebp); declaredBoundary.writeUInt32LE(declaredBoundary.length - 9, 4);
+assert.throws(() => parseWebpExifUserComment(declaredBoundary), /WebP/);
+assert.throws(() => parseWebpExifUserComment(Buffer.from('not an image')), /PNG or WebP/);
+for (const [name, startsWith, lengths] of [
+  ['tags2 (1).webp', '1girl, masterpiece, best quality', [192, 106]],
+  ['tags2 (2).webp', 'best quality, 3::very aesthetic', [741, 292]]
+]) {
+  const extracted = normalizeMetadata(parseMetadataJson(parseWebpExifUserComment(new Uint8Array(readFileSync(new URL(`../${name}`, import.meta.url))))));
+  assert.deepEqual([extracted.model, extracted.steps, extracted.sampler, extracted.width, extracted.height, extracted.scale, extracted.characters.length], ['NovelAI Diffusion V5', '28', 'k_euler_ancestral', '1024', '1024', '5', 1]);
+  assert.ok(extracted.base.positive.startsWith(startsWith));
+  assert.deepEqual([extracted.characters[0].positive.length, extracted.characters[0].negative.length], lengths);
+  const extractedFromFile = await extractImageMetadata({ type: 'text/plain', arrayBuffer: async () => exactArrayBuffer(readFileSync(new URL(`../${name}`, import.meta.url))) } );
+  assert.deepEqual(extractedFromFile, extracted);
+}
+const previousImageBitmap = globalThis.createImageBitmap;
+const previousDocument = globalThis.document;
+globalThis.createImageBitmap = async () => ({ width: 1, height: 1, close() {} });
+globalThis.document = { createElement: () => ({ width: 0, height: 0, getContext: () => ({ drawImage() {}, getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]) }) }) }) };
+try {
+  await assert.rejects(() => extractImageMetadata({ arrayBuffer: async () => exactArrayBuffer(alphOnlyWebp) }), /No NovelAI metadata was found in this image/);
+} finally {
+  globalThis.createImageBitmap = previousImageBitmap;
+  globalThis.document = previousDocument;
+}
+await assert.rejects(() => extractImageMetadata({ arrayBuffer: async () => exactArrayBuffer(Buffer.from('not an image')) }), /PNG or WebP/);
+
+const artists = [{ id: 'a', catalogId: 'artist-v5-1', tag: 'artist: alpha', weight: 1 }, { id: 'b', catalogId: 'artist-v5-2', tag: 'artist: beta', weight: 0.9 }];
+assert.equal(serializeTag(artists[0]), '1.0::artist: alpha::');
+assert.equal(serializeTag(artists[1]), '0.9::artist: beta::');
+assert.equal(serializeTag({ id: 'digit', tag: 'artist: aogisa88', weight: 1.8 }), '1.8::artist: aogisa88 ::');
+assert.equal(serializeTag({ id: 'plain', tag: 'artist: aogisa', weight: 1.8 }), '1.8::artist: aogisa::');
+assert.equal(serializeTag({ id: 'trimmed', tag: '  artist: aki99   ', weight: 1 }), '1.0::artist: aki99 ::');
+assert.equal(buildBasePrompt({ frame: '1girl', artists, setting: 'indoors', render: 'best quality', undesired: 'watermark' }), '1girl, 1.0::artist: alpha::, 0.9::artist: beta::, indoors, best quality');
+assert.equal(buildArtistsPrompt(artists), '1.0::artist: alpha::, 0.9::artist: beta::');
+assert.notEqual(buildArtistsPrompt(artists), buildBasePrompt({ frame: '1girl', artists, setting: 'indoors', render: 'best quality', undesired: '' }));
+assert.equal(buildBasePrompt({ frame: 'FRAME', artists: [], setting: 'SCENE', render: 'RENDER', undesired: 'UC', }), 'FRAME, SCENE, RENDER');
+assert.equal(normalizeRandomRange({ min: 2, max: 5 }).min, 2);
+assert.equal(normalizeRandomRange({ min: 2, max: 5 }).max, 5);
+const migrated = normalizeDraft({ base: { frame: 'custom frame', artists: [{ id: 'old', tag: 'artist: legacy', weight: 1 }], setting: 'custom scene', render: 'custom render', undesired: 'keep uc' }, characters: [{ id: 'character-v4.5-1', label: 'Hero', prompt: 'girl', undesired: '' }], randomRange: { min: 3, max: 4 } });
+assert.deepEqual(migrated?.base.artists, []);
+assert.equal(migrated?.base.frame, 'custom frame');
+assert.equal(migrated?.characters[0].label, 'Hero');
+assert.deepEqual(migrated?.randomRange, { min: 3, max: 4 });
+assert.equal(normalizeAnimationMode(undefined), 'auto');
+assert.equal(normalizeAnimationMode('invalid'), 'auto');
+assert.equal(normalizeAnimationMode('on'), 'on');
+assert.equal(normalizeAnimationMode('off'), 'off');
+assert.deepEqual(normalizeSettings(undefined), { animationMode: 'auto', preloadCharacterPreviews: false });
+assert.deepEqual(normalizeSettings({ preloadCharacterPreviews: true }, 'off'), { animationMode: 'off', preloadCharacterPreviews: true });
+const normalizedMix = normalizeArtistMix({ primary: { id: 'primary', catalogId: 'artist-v5-primary', tag: 'artist: primary', weight: 1 }, companions: [{ id: 'same', catalogId: 'artist-v5-primary', tag: 'artist: duplicate', weight: 2 }, { id: 'companion', catalogId: 'artist-v5-companion', tag: 'artist: companion', weight: 0.3 }], randomRange: { min: 1, max: 1 }, favoritesOnly: true });
+assert.equal(normalizedMix.primary?.catalogId, 'artist-v5-primary');
+assert.deepEqual(normalizedMix.companions.map(item => item.catalogId), ['artist-v5-companion']);
+assert.deepEqual(normalizedMix.randomRange, { min: 2, max: 2 });
+assert.equal(normalizedMix.favoritesOnly, true);
+assert.equal(migrated?.version, 2);
+assert.equal(migrated?.animationMode, 'auto');
+const motionOn = normalizeDraft({ ...migrated, animationMode: 'on' });
+const motionOff = normalizeDraft({ ...migrated, animationMode: 'off' });
+assert.equal(motionOn?.animationMode, 'on');
+assert.equal(motionOff?.animationMode, 'off');
+assert.equal(motionOn?.base.frame, migrated?.base.frame);
+assert.equal(motionOff?.characters[0].label, migrated?.characters[0].label);
+const normalizedPresetFolders = normalizeCustomTagPresets([
+  { id: 'folder-one', name: '  Mood   Boards ', createdAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-02T00:00:00.000Z' },
+  { id: 'folder-two', name: 'mood boards', createdAt: '2025-01-03T00:00:00.000Z', updatedAt: '2025-01-04T00:00:00.000Z' },
+  { id: 'folder-one', name: 'Another folder' },
+  { id: 'bad/id', name: 'Rejected path id' }
+]);
+assert.equal(normalizedPresetFolders[0].id, DEFAULT_CUSTOM_TAG_PRESET_ID);
+assert.equal(normalizedPresetFolders[0].name, DEFAULT_CUSTOM_TAG_PRESET_NAME);
+assert.equal(normalizedPresetFolders.filter(preset => preset.name.toLocaleLowerCase() === 'mood boards').length, 1);
+assert.equal(normalizedPresetFolders.filter(preset => preset.id === 'folder-one').length, 1);
+const normalizedLegacyCustomTag = normalizeCustomTag({ id: 'legacy-tag', tag: 'tag1, tag2', zone: 'frame', imageAsset: 'legacy.png', mime: 'image/png' });
+assert.equal(normalizedLegacyCustomTag?.presetId, DEFAULT_CUSTOM_TAG_PRESET_ID);
+assert.equal(normalizedLegacyCustomTag?.kind, 'tag');
+const normalizedImageLessArtist = normalizeCustomTag({ id: 'personal-artist', kind: 'artist', tag: 'artist: Personal_Artist', zone: 'frame' });
+assert.equal(normalizedImageLessArtist?.kind, 'artist');
+assert.equal(normalizedImageLessArtist?.imageAsset, undefined);
+assert.equal(normalizeCustomTag({ id: 'broken-tag', kind: 'tag', tag: 'solo', zone: 'frame' }), null);
+assert.equal(normalizeCustomTagPresetId(undefined, normalizedPresetFolders), DEFAULT_CUSTOM_TAG_PRESET_ID);
+assert.equal(normalizeCustomTagPresetId('unknown-folder', normalizedPresetFolders), DEFAULT_CUSTOM_TAG_PRESET_ID);
+assert.equal(normalizeCustomTagPresetId('folder-one', normalizedPresetFolders), 'folder-one');
+const randomCards = pickUniqueCards([{ id: '1', tag: 'a', gallery: 'v5', image: 'a.webp', score: 0 }, { id: '2', tag: 'b', gallery: 'v5', image: 'b.webp', score: 0 }, { id: '3', tag: 'c', gallery: 'v5', image: 'c.webp', score: 0 }], 2, () => 0);
+assert.deepEqual(randomCards.map(card => card.id), ['1', '2']);
+assert.equal(randomCount(2, 3, () => 0), 2);
+assert.equal(randomCount(2, 3, () => 0.999999), 3);
+assert.equal(randomWeight(() => 0), 0.1);
+assert.equal(randomWeight(() => 0.999999), 2.0);
+assert.equal(mixCompanionScale(0.1), 0.856);
+assert.equal(mixCompanionScale(0.9), 0.984);
+assert.equal(mixCompanionScale(1), 1);
+assert.equal(mixCompanionScale(2), 1);
+const singleOrbit = mixOrbitLayout(5);
+assert.equal(singleOrbit.ringCount, 1);
+assert.equal(singleOrbit.placements.length, 5);
+assert.equal(new Set(singleOrbit.placements.map(item => `${item.angle}:${item.radius}:${item.radiusCap}`)).size, 5);
+assert.equal(singleOrbit.placements.every(item => Number.isFinite(item.angle) && item.radius > 0 && item.radiusCap > 0), true);
+assert.equal(singleOrbit.placements.every(item => item.radiusCap === 228), true);
+const multiOrbit = mixOrbitLayout(13);
+assert.equal(multiOrbit.ringCount, 3);
+assert.equal(multiOrbit.placements.length, 13);
+assert.equal(multiOrbit.height > singleOrbit.height, true);
+assert.deepEqual(mixOrbitLayout(13), multiOrbit);
+assert.equal(multiOrbit.placements.filter(item => item.ring === 0).every(item => item.radiusCap === 150), true);
+assert.equal(multiOrbit.placements.filter(item => item.ring === 1).every(item => item.radiusCap === 190), true);
+assert.equal(multiOrbit.placements.filter(item => item.ring === 2).every(item => item.radiusCap === 228), true);
+const twoRingOrbit = mixOrbitLayout(7);
+assert.equal(twoRingOrbit.placements.filter(item => item.ring === 0).every(item => item.radiusCap === 150), true);
+assert.equal(twoRingOrbit.placements.filter(item => item.ring === 1).every(item => item.radiusCap === 228), true);
+assert.equal(multiOrbit.placements.every(item => item.radius > 0 && item.radius <= 45), true);
+assert.equal(multiOrbit.placements.every(item => !('duration' in item) && !('direction' in item) && !('delay' in item)), true);
+assert.equal(new Set(multiOrbit.placements.map(item => item.angle)).size >= 6, true);
+
+assert.equal(artistDisplayName(' artist: Aogisa&nbsp;88 '), 'Aogisa 88');
+assert.equal(canonicalArtistIdentity('Artist: Aogisa_88'), canonicalArtistIdentity('aogisa 88'));
+assert.equal(canonicalArtistIdentity('artist: x&#x5f;y'), 'x y');
+const customArtistOne = { id: 'one', kind: 'artist', tag: 'artist: Aogisa_88', zone: 'frame', createdAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-01T00:00:00.000Z' };
+const customArtistTwo = { id: 'two', kind: 'artist', tag: 'different', zone: 'frame', imageAsset: 'two.webp', mime: 'image/webp', createdAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-01T00:00:00.000Z' };
+const officialArtist = { id: 'artist-v5-aogisa', catalogId: 'artist-v5-aogisa', tag: 'aogisa 88', gallery: 'v5', image: 'aogisa.webp', score: 1 };
+const mergedArtists = mergeArtistCatalog([officialArtist, { ...officialArtist, id: 'duplicate', catalogId: 'duplicate' }], [customArtistOne, customArtistTwo], tag => tag.imageAsset ? `nai-custom://asset/${tag.imageAsset}` : './plus.png');
+assert.deepEqual(mergedArtists.cards.map(card => card.catalogId), ['artist-v5-aogisa', customArtistCatalogId('two')]);
+assert.equal(mergedArtists.aliases.get(customArtistCatalogId('one')), 'artist-v5-aogisa');
+assert.equal(mergedArtists.shadowedCustomIds.has('one'), true);
+assert.equal(mergedArtists.cards.find(card => card.catalogId === customArtistCatalogId('two'))?.image, 'nai-custom://asset/two.webp');
+const migratedRows = migrateArtistAliases([{ id: 'row-one', catalogId: customArtistCatalogId('one'), tag: 'artist: Aogisa_88', weight: 1.7 }, { id: 'row-two', catalogId: 'artist-v5-aogisa', tag: 'artist: aogisa 88', weight: 0.4 }], mergedArtists.aliases);
+assert.equal(migratedRows[0].id, 'row-one');
+assert.equal(migratedRows[0].catalogId, 'artist-v5-aogisa');
+assert.deepEqual([...migrateFavoriteAliases(new Set([customArtistCatalogId('one'), 'artist-v5-aogisa']), mergedArtists.aliases)], ['artist-v5-aogisa']);
+const migratedMix = migrateArtistMixAliases({ version: 1, primary: migratedRows[0], companions: [migratedRows[1]], randomRange: { min: 2, max: 2 }, favoritesOnly: false }, mergedArtists.aliases);
+assert.equal(migratedMix.primary?.id, 'row-one');
+assert.equal(migratedMix.companions[0].id, 'row-two');
+assert.deepEqual(resolveRandomPoolRange({ min: 2, max: 5 }, 0), { min: 0, max: 0, available: 0, feasible: false });
+assert.deepEqual(resolveRandomPoolRange({ min: 2, max: 5 }, 1), { min: 1, max: 1, available: 1, feasible: false });
+assert.deepEqual(resolveRandomPoolRange({ min: 2, max: 5 }, 3), { min: 2, max: 3, available: 3, feasible: true });
+assert.deepEqual(resolveRandomPoolRange({ min: 2, max: 4 }, 5), { min: 2, max: 4, available: 5, feasible: true });
+assert.deepEqual(resolveRandomPoolRange({ min: 4, max: 8 }, 12), { min: 4, max: 8, available: 12, feasible: true });
+assert.equal(normalizeArtistWeight(-1), 0.1);
+assert.equal(normalizeArtistWeight(2.04), 2.0);
+assert.equal(normalizeArtistWeight('not a number'), 1.0);
+const randomFixture = [
+  { id: '1', tag: 'a', gallery: 'v5', image: 'a.webp', score: 0 },
+  { id: '2', tag: 'b', gallery: 'v5', image: 'b.webp', score: 0 },
+  { id: '3', tag: 'c', gallery: 'v5', image: 'c.webp', score: 0 },
+  { id: '4', tag: 'd', gallery: 'v5', image: 'd.webp', score: 0 }
+];
+const randomValues = [0, 0, 0, 0, 0.999999, 0.5];
+const randomSelection = randomArtistSelection(randomFixture, 3, () => randomValues.shift());
+assert.equal(randomSelection.length, 3);
+assert.equal(new Set(randomSelection.map(item => item.card.id)).size, 3);
+assert.deepEqual(randomSelection.map(item => item.weight), [0.1, 2.0, 1.1]);
+assert.ok(randomSelection.every(item => item.weight >= 0.1 && item.weight <= 2 && Number.isInteger(item.weight * 10)));
+assert.deepEqual(normalizeRandomRange({ min: 9, max: 3 }), { min: 9, max: 9 });
+const selected = [
+  { id: 'row-a', catalogId: 'artist-v5-alpha', image: 'old.webp', tag: 'artist: old alpha', weight: 0.7 },
+  { id: 'row-missing', catalogId: 'artist-v5-missing', image: 'kept.webp', tag: 'artist: missing', weight: 1.4 }
+];
+const current = [{ id: 'artist-v5-alpha', catalogId: 'artist-v5-alpha', tag: 'alpha current', gallery: 'danbooru-artist-tags-2-v5', image: 'new.webp', score: 0 }];
+const reconciled = reconcileSelectedArtists(selected, current);
+assert.deepEqual(reconciled.map(item => item.id), ['row-a', 'row-missing']);
+assert.equal(reconciled[0].tag, 'artist: alpha current');
+assert.equal(reconciled[0].image, 'new.webp');
+assert.equal(reconciled[1].image, 'kept.webp');
+assert.deepEqual(rerollArtistWeight(selected[0], () => 0), { ...selected[0], weight: 0.1 });
+const allWeights = rerollArtistWeights(selected, () => 0.999999);
+assert.deepEqual(allWeights.map(item => item.id), ['row-a', 'row-missing']);
+assert.deepEqual(allWeights.map(item => item.weight), [2, 2]);
+
+const stableCard = { tag: 'Alpha artist', image: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/alpha.webp', score: 0 };
+assert.equal(stableAssetFilename(stableCard), stableAssetFilename(stableCard));
+assert.equal(makeCatalog([stableCard], { characters: [], danbooruTags: [] }).artists[0].image, `cards/artist/danbooru-artist-tags-2-v5/${stableAssetFilename(stableCard)}`);
+
+const catalog = JSON.parse(readFileSync(new URL('../public/catalog/catalog.json', import.meta.url), 'utf8'));
+assert.equal(catalog.characters.length, 5457);
+assert.ok(catalog.artists.length > 0);
+assert.ok(catalog.artists.every(card => card.id.startsWith('artist-v5-') && card.gallery === 'danbooru-artist-tags-2-v5' && card.image.startsWith('cards/artist/danbooru-artist-tags-2-v5/') && card.image.endsWith('.webp')));
+assert.ok(catalog.characters.every(card => card.gallery === 'danbooru-character-tags-v4.5' && card.image.startsWith('cards/character/danbooru-character-tags-v4.5/')));
+assert.ok(catalog.tags.every(tag => !catalog.danbooruTags.some(item => item.category === 1 && item.tag === tag)));
+assert.equal(catalog.artists.filter(card => /[0-9]$/.test(card.tag)).length, 141);
+const highlightFixture = [
+  { id: 'aogisa', tag: 'aogisa', gallery: 'v5', image: 'aogisa.webp', score: 0 },
+  { id: 'aogisa88', tag: 'aogisa88', gallery: 'v5', image: 'aogisa88.webp', score: 0 },
+  { id: 'aki99', tag: 'aki99', gallery: 'v5', image: 'aki99.webp', score: 0 },
+  { id: 'spice', tag: '13 (spice!!)', gallery: 'v5', image: 'spice.webp', score: 0 },
+  { id: 'gin', tag: 'gin&#039;ichi', gallery: 'v5', image: 'gin.webp', score: 0 },
+  { id: 'space', tag: 'space artist', gallery: 'v5', image: 'space.webp', score: 0 },
+  { id: 'fullwidth', tag: 'Aki99', gallery: 'v5', image: 'fullwidth.webp', score: 0 },
+  { id: 'colon', tag: 'n:go', gallery: 'v5', image: 'n-go.webp', score: 0 },
+  { id: 'unsafe', tag: '<unsafe>', gallery: 'v5', image: 'unsafe.webp', score: 0 }
+];
+const highlighter = new MetadataArtistHighlighter(highlightFixture);
+const highlighted = highlighter.render("artist: aogisa88, AOGISA, aki99, 13 (spice!!), gin'ichi, <unsafe>, <script>");
+assert.match(highlighted, /data-artist-preview-image="\.\/catalog\/aki99\.webp"/);
+assert.match(highlighted, /data-artist-preview-tag="aki99" data-artist-preview-prompt="artist: aki99"/);
+assert.match(highlighted, /tabindex="0"/);
+assert.match(highlighted, /artist: aogisa88/);
+assert.match(highlighted, /13 \(spice!!\)/);
+assert.match(highlighted, /gin&#039;ichi/);
+assert.match(highlighted, /&lt;script&gt;/);
+assert.equal((highlighter.render('aogisa88').match(/metadata-artist-highlight/g) ?? []).length, 1);
+assert.equal((highlighter.render('aogisa88x').match(/metadata-artist-highlight/g) ?? []).length, 0);
+const whitespaceEquivalent = highlighter.render('space__artist and space   artist then ＡＫＩ９９');
+assert.equal((whitespaceEquivalent.match(/metadata-artist-highlight/g) ?? []).length, 3);
+assert.match(whitespaceEquivalent, />space__artist<|>space   artist</);
+assert.match(whitespaceEquivalent, /ＡＫＩ９９/);
+assert.equal(escapeMetadataHtml('<'), '&lt;');
+assert.equal(decodeCatalogEntities('&amp; &lt; &gt; &quot; &#x27; &#039;'), "& < > \" ' '");
+const actualAki99 = catalog.artists.find(card => card.tag === 'aki99');
+assert.ok(actualAki99);
+assert.match(new MetadataArtistHighlighter([actualAki99]).render('artist: aki99'), /metadata-artist-highlight/);
+const catalogHighlighter = new MetadataArtistHighlighter(catalog.artists);
+const catalogHighlight = catalogHighlighter.render("artist: aki99, gin'ichi (akacia), 13 (spice!!)");
+assert.equal((catalogHighlight.match(/metadata-artist-highlight/g) ?? []).length, 3);
+const explicitKnown = highlighter.render('1.2::artist: aogisa88::, artist: n:go, artist: space__artist');
+assert.equal((explicitKnown.match(/metadata-artist-highlight/g) ?? []).length, 3);
+assert.match(explicitKnown, /data-artist-preview-kind="known"/);
+assert.match(explicitKnown, />aogisa88<.*?>n:go<.*?>space__artist</);
+const explicitUnknown = highlighter.render('artist: aogisa-extra, artist: unknown person, aogisa');
+assert.equal((explicitUnknown.match(/metadata-artist-highlight unknown/g) ?? []).length, 2);
+assert.equal((explicitUnknown.match(/metadata-artist-highlight/g) ?? []).length, 3);
+assert.match(explicitUnknown, /data-artist-preview-kind="message"/);
+assert.match(explicitUnknown, /This artist is not in the local catalog, so a preview is unavailable\. You can test it directly on the NovelAI website\./);
+assert.doesNotMatch(explicitUnknown, /data-artist-preview-image="[^"]*aogisa-extra/);
+assert.equal((highlighter.render('unknown person').match(/metadata-artist-highlight/g) ?? []).length, 0);
+assert.equal((highlighter.render('notartist: unknown').match(/metadata-artist-highlight unknown/g) ?? []).length, 0);
+assert.equal((highlighter.render('some_artist: unknown').match(/metadata-artist-highlight unknown/g) ?? []).length, 0);
+assert.equal((highlighter.render('{{artist: unknown}}').match(/metadata-artist-highlight unknown/g) ?? []).length, 1);
+assert.equal((highlighter.render('ＡＲＴＩＳＴ：unknown').match(/metadata-artist-highlight unknown/g) ?? []).length, 1);
+for (const terminator of [', next', ':: next', '\nnext', '} next', '] next']) {
+  const rendered = highlighter.render(`artist: aogisa${terminator}`);
+  assert.equal((rendered.match(/metadata-artist-highlight/g) ?? []).length, 1);
+}
+const normalizedExplicit = highlighter.render('artist: ＡＫＩ９９, artist: space___artist, artist: gin&#039;ichi');
+assert.equal((normalizedExplicit.match(/metadata-artist-highlight/g) ?? []).length, 3);
+const escapedUnknown = highlighter.render('artist: <unknown "artist">');
+assert.match(escapedUnknown, /&lt;unknown &quot;artist&quot;&gt;/);
+assert.doesNotMatch(escapedUnknown, /data-artist-preview-image/);
+assert.doesNotMatch(escapedUnknown, /data-artist-preview-prompt/);
+
+const assetDir = new URL('../public/catalog/cards/artist/danbooru-artist-tags-2-v5', import.meta.url);
+const assetCount = readdirSync(assetDir).filter(file => file.endsWith('.webp')).length;
+assert.equal(assetCount, catalog.artists.length);
+const characterAssetDir = new URL('../public/catalog/cards/character/danbooru-character-tags-v4.5', import.meta.url);
+assert.equal(readdirSync(characterAssetDir).filter(file => file.endsWith('.jpg')).length, 5457);
+const browserFixture = Array.from({ length: 197 }, (_, index) => ({ id: `character-${index}`, tag: index === 150 ? 'Synthetic Beyond First Page' : `Character ${index}`, gallery: 'danbooru-character-tags-v4.5', image: `cards/character/${index}.jpg`, score: 0 }));
+const firstCharacterPage = paginateCharacters(browserFixture, { page: 1 });
+const lastCharacterPage = paginateCharacters(browserFixture, { page: 99 });
+assert.equal(CHARACTER_PAGE_SIZE, 96);
+assert.equal(firstCharacterPage.cards.length, 96);
+assert.equal(lastCharacterPage.page, 3);
+assert.equal(lastCharacterPage.cards.at(-1)?.id, 'character-196');
+assert.equal(filterCharacters(browserFixture, 'beyond first page').length, 1);
+assert.equal(paginateCharacters(browserFixture, { query: 'beyond first page' }).cards[0].id, 'character-150');
+assert.equal(paginateCharacters(browserFixture, { favoritesOnly: true, favoriteIds: new Set(['character-150']) }).filteredCount, 1);
+const artistBrowserFixture = Array.from({ length: 3587 }, (_, index) => ({ id: `artist-v5-${index}`, catalogId: `artist-v5-${index}`, tag: index === 3410 ? 'Synthetic Artist Beyond First Page' : `Artist ${index}`, gallery: 'danbooru-artist-tags-2-v5', image: `cards/artist/${index}.webp`, score: 0 }));
+const firstArtistPage = paginateArtists(artistBrowserFixture, { page: 1 });
+const lastArtistPage = paginateArtists(artistBrowserFixture, { page: 999 });
+assert.equal(ARTIST_PAGE_SIZE, 72);
+assert.equal(firstArtistPage.cards.length, 72);
+assert.equal(lastArtistPage.pageCount, 50);
+assert.equal(lastArtistPage.cards.length, 59);
+assert.equal(paginateArtists(artistBrowserFixture, { query: 'beyond first page' }).cards[0].id, 'artist-v5-3410');
+
+const uiSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+const styleSource = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+const previewSource = readFileSync(new URL('../src/artist-card-preview.ts', import.meta.url), 'utf8');
+const storageSource = readFileSync(new URL('../src/storage.ts', import.meta.url), 'utf8');
+const metadataWorkspaceSource = readFileSync(new URL('../src/metadata-workspace.ts', import.meta.url), 'utf8');
+const electronSource = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+const indexSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const packageSource = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const lockSource = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
+const tsconfigSource = JSON.parse(readFileSync(new URL('../tsconfig.json', import.meta.url), 'utf8'));
+const optimizerSource = readFileSync(new URL('./optimize-desktop-catalog.ps1', import.meta.url), 'utf8');
+const localEnvSource = readFileSync(new URL('./local-env.mjs', import.meta.url), 'utf8');
+const localRunnerSource = readFileSync(new URL('./run-local.mjs', import.meta.url), 'utf8');
+const desktopBuildSource = readFileSync(new URL('./build-desktop.mjs', import.meta.url), 'utf8');
+const installerBuildSource = readFileSync(new URL('./build-installer.mjs', import.meta.url), 'utf8');
+const installerLauncherSource = readFileSync(new URL('./installer-launcher/Program.cs', import.meta.url), 'utf8');
+const installerProofSource = readFileSync(new URL('./installer-proof/proof.nsi', import.meta.url), 'utf8');
+const installerStorePatchSource = readFileSync(new URL('./electron-builder-nsis-store.mjs', import.meta.url), 'utf8');
+const nsisIncludeSource = readFileSync(new URL('../build/installer.nsh', import.meta.url), 'utf8');
+const npmrcSource = readFileSync(new URL('../.npmrc', import.meta.url), 'utf8');
+assert.match(uiSource, /selected V5 artist weights/);
+assert.match(uiSource, /let startupBusy = false;/);
+assert.match(uiSource, /const failure = !startupBusy && startupFailures.length/);
+assert.match(uiSource, /startupBusy = true;[^]*?await preloadCards\(failed, 'Retrying failed previews'\)[^]*?startupBusy = false;/);
+assert.match(uiSource, /MetadataWorkspace/);
+assert.match(uiSource, /new MetadataWorkspace\(\(\) => catalog\.artists\)/);
+assert.match(metadataWorkspaceSource, /private readToken = 0;/);
+assert.match(metadataWorkspaceSource, /const request = \+\+this\.readToken;/);
+assert.match(metadataWorkspaceSource, /const result = await extractImageMetadata\(file\);\s+if \(request !== this\.readToken\) return;\s+this\.result = result; this\.sourceObjectUrl = URL\.createObjectURL\(file\);/);
+assert.match(metadataWorkspaceSource, /catch \(error\) \{\s+if \(request !== this\.readToken\) return;/);
+assert.match(metadataWorkspaceSource, /bindArtistCardPreview\(root\)/);
+assert.match(metadataWorkspaceSource, /this\.artistHighlighter\(\)\.render\(value\)/);
+assert.match(metadataWorkspaceSource, /const escapeHtml = escapeMetadataHtml;/);
+assert.match(metadataWorkspaceSource, />IMAGE METADATA</);
+assert.match(metadataWorkspaceSource, />Reveal the image's data\.</);
+assert.match(metadataWorkspaceSource, /Drop a image here/);
+assert.match(metadataWorkspaceSource, /Choose or drop a NovelAI Image\. Analysis stays entirely on this device and never changes your prompt builder\./);
+assert.match(metadataWorkspaceSource, /aria-label="Choose a NovelAI image or drop one here"/);
+assert.match(metadataWorkspaceSource, /accept="image\/png,\.png,image\/webp,\.webp"/);
+assert.match(metadataWorkspaceSource, /Metadata extraction is based on <a href="https:\/\/github\.com\/NovelAI\/novelai-image-metadata" target="_blank" rel="noopener noreferrer">NovelAI's official image metadata repository<\/a>\./);
+assert.match(metadataWorkspaceSource, /URL\.createObjectURL\(file\)/);
+assert.match(metadataWorkspaceSource, /URL\.revokeObjectURL\(this\.sourceObjectUrl\)/);
+assert.match(metadataWorkspaceSource, /dispose\(\): void \{ this\.readToken \+= 1; this\.releaseSourceImage\(\); \}/);
+assert.match(metadataWorkspaceSource, /class="metadata-source-image"[\s\S]*?<div class="metadata-model"/);
+assert.match(metadataWorkspaceSource, /data-metadata-copy="\$\{index\}"/);
+assert.match(metadataWorkspaceSource, /<pre>[\s\S]*?<div class="metadata-prompt-actions">[\s\S]*?>Copy prompt<\/button>/);
+assert.match(metadataWorkspaceSource, /private activePrompt\(index: number\): string/);
+assert.match(metadataWorkspaceSource, /activeValue \? '' : 'disabled'/);
+assert.match(uiSource, /metadataWorkspace\.dispose\(\);/);
+assert.match(storageSource, /export function loadCustomTags\(\): CustomTag\[\] \{[\s\S]*?if \(!bridge\(\)\) return \[\];/);
+assert.match(storageSource, /export function saveCustomTags\(tags: CustomTag\[\]\): void \{[\s\S]*?bridge\(\)\?\.save\('customTags', normalized\);/);
+assert.doesNotMatch(storageSource.match(/export function saveCustomTags[\s\S]*?\n\}/)?.[0] ?? '', /localStorage\.setItem/);
+assert.match(storageSource, /item\.imageAsset\.startsWith\('memory-'\)/);
+assert.match(storageSource, /export function normalizeCustomTagPresets\(values: unknown\): CustomTagPreset\[\] \{/);
+assert.match(storageSource, /DEFAULT_CUSTOM_TAG_PRESET_ID/);
+assert.match(storageSource, /from '\.\/custom-tag-presets\.ts'/);
+assert.equal(tsconfigSource.compilerOptions.allowImportingTsExtensions, true);
+assert.match(electronSource, /customTagPresets: \[\]/);
+assert.match(electronSource, /\['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets'\]/);
+assert.match(uiSource, /saveCustomTagPresets\(customTagPresets\)/);
+assert.match(previewSource, /data-artist-preview-message/);
+assert.match(previewSource, /previewImage\.removeAttribute\('src'\);[\s\S]*?previewImage\.alt = '';/);
+assert.match(previewSource, /function restartPreviewReveal\(host: HTMLElement\): void \{[\s\S]*?host\.classList\.remove\('is-visible'\);[\s\S]*?void host\.offsetWidth;[\s\S]*?host\.classList\.add\('is-visible'\);/);
+assert.match(previewSource, /updatePosition\(target, host\);\s+host\.setAttribute\('aria-hidden', 'false'\);\s+restartPreviewReveal\(host\);/);
+assert.match(uiSource, /role="tablist"/);
+assert.match(uiSource, /Image Metadata/);
+assert.match(uiSource, /function currentDraft\(\): PromptDraft \{[\s\S]*?animationMode \}/);
+assert.match(uiSource, /function animationModeMarkup\(\): string \{[\s\S]*?Animations[\s\S]*?value="auto"[\s\S]*?value="on"[\s\S]*?value="off"/);
+assert.equal((uiSource.match(/\$\{animationModeMarkup\(\)\}/g) ?? []).length, 1);
+assert.match(uiSource, /<div class="top-actions">\$\{animationModeMarkup\(\)\}\$\{activeWorkspace === 'prompt'/);
+assert.match(uiSource, /id="animation-mode" aria-labelledby="animation-mode-label"/);
+assert.match(uiSource, /document\.documentElement\.dataset\.animationMode = mode/);
+assert.match(uiSource, /#animation-mode[^\n]*addEventListener\('change'/);
+assert.match(uiSource, /animationMode = normalizeAnimationMode\([\s\S]*?applyAnimationMode\(animationMode\);\s+saveDraft\(currentDraft\(\)\);/);
+assert.doesNotMatch(uiSource.match(/#animation-mode[^\n]*addEventListener\('change'[\s\S]*?\n  \}\);/)?.[0] ?? '', /render\(\)/);
+assert.match(uiSource, /saveDraft\(currentDraft\(\)\);/);
+assert.match(uiSource, /const draft = currentDraft\(\); saveDraft\(draft\); window\.naiStorage\?\.saveSync\('draft', draft\)/);
+const resetSource = uiSource.match(/function resetPrompt\(\): void \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.doesNotMatch(resetSource, /animationMode\s*=/);
+assert.match(uiSource, /let pendingWorkspaceTransition: 'prompt' \| 'custom-tags' \| 'metadata' \| null = null;/);
+assert.match(uiSource, /function switchWorkspace\(workspace: 'prompt' \| 'custom-tags' \| 'metadata'\): void \{\s+if \(workspace === activeWorkspace\) return;\s+activeWorkspace = workspace;\s+pendingWorkspaceTransition = workspace;\s+render\(\);\s+\}/);
+assert.doesNotMatch(uiSource, /Compatibility marker|function switchWorkspace\(workspace: 'prompt' \| 'metadata'\)/);
+assert.match(uiSource, /function refreshConstructorGrid\(\): void \{[\s\S]*?clearArtistCardPreview\(\);[\s\S]*?grid\.innerHTML/);
+assert.match(uiSource, /function revokeCustomImageUrl\(key: string\): void \{[\s\S]*?URL\.revokeObjectURL\(url\)/);
+assert.match(uiSource, /function setCustomImageUrl\(key: string, url: string\): void \{[\s\S]*?revokeCustomImageUrl\(key\)/);
+assert.match(uiSource, /class="\$\{workspacePanelClass\('prompt'\)\}"/);
+assert.match(uiSource, /class="\$\{workspacePanelClass\('metadata'\)\}"/);
+assert.match(uiSource, /pendingWorkspaceTransition = null;\s+bindEvents\(\);/);
+assert.match(uiSource, /prompt-tab[^\n]*addEventListener\('click', \(\) => switchWorkspace\('prompt'\)\)/);
+assert.match(uiSource, /metadata-tab[^\n]*addEventListener\('click', \(\) => switchWorkspace\('metadata'\)\)/);
+assert.match(uiSource, /id="full-prompt-output"/);
+assert.match(uiSource, /id="artist-prompt-output"/);
+assert.match(uiSource, /id="copy-prompt"/);
+assert.equal((uiSource.match(/>Copy prompt</g) ?? []).length, 1);
+assert.doesNotMatch(uiSource, /copy-prompt-bottom|Offline catalog|offline snapshot/);
+const footerMarkup = uiSource.match(/<footer class="app-footer">[\s\S]*?<\/footer>/)?.[0] ?? '';
+assert.match(footerMarkup, /class="footer-brand"><span>NAI Prompt Studio<\/span><span class="footer-links">[\s\S]*?https:\/\/nax\.moe\/\?gallery=danbooru-artist-tags-2-v5[\s\S]*?NAX · CC BY 4\.0[\s\S]*?https:\/\/hothottuk\.neocities\.org\/en[\s\S]*?hothottuk's guide/);
+const customWorkspaceSource = uiSource.match(/function customTagsWorkspace\(\): string \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(customWorkspaceSource, /custom-preset-sidebar[\s\S]*?custom-tag-form[\s\S]*?custom-tag-library/);
+assert.doesNotMatch(customWorkspaceSource, /Personal images|source-note/);
+assert.match(uiSource, /const accordionOpenState: Record<Zone, boolean> = \{ frame: true, scene: true, render: true, undesired: false \};/);
+assert.match(uiSource, /function snapshotAccordionState\(\): void \{[\s\S]*?details\.open[\s\S]*?\}/);
+assert.match(uiSource, /\.accordion\[data-zone\][\s\S]*?addEventListener\('toggle'/);
+assert.match(uiSource, /function manualEditor\([\s\S]*?class="manual-editor"[\s\S]*?class="prompt-editor-toolbar"/);
+assert.doesNotMatch(uiSource, /accordion-actions/);
+assert.doesNotMatch(styleSource, /accordion-actions/);
+assert.match(uiSource, /for="\$\{editorId\}"/);
+assert.match(uiSource, /data-open-constructor="\$\{zone\}"/);
+for (const zone of ['frame', 'scene', 'render']) assert.match(uiSource, new RegExp(`manualEditor\\('${zone}'`));
+assert.match(customWorkspaceSource, /namePlaceholder[\s\S]*?customTypeSelector\(kind\)/);
+assert.match(uiSource, /id="custom-card-kind"/);
+assert.match(customWorkspaceSource, /data-custom-filter="artist"/);
+assert.match(uiSource, /function customTagKind\(item\?: CustomTag\): CustomTagKind/);
+assert.match(uiSource, /kind === 'artist' \? artistDisplayName\(rawTag\) : rawTag/);
+assert.match(uiSource, /customArtistCatalogId\(item\.id\)/);
+assert.match(uiSource, /rebuildEffectiveArtistCatalog\(\)/);
+assert.doesNotMatch(uiSource, /No image selected/);
+assert.doesNotMatch(uiSource, /Tag group and constructor are required/);
+assert.match(uiSource, /Tag and constructor are required/);
+assert.match(customWorkspaceSource, /custom-image-preview is-loaded[\s\S]*?custom-image-preview is-empty/);
+assert.match(uiSource, /classList\.add\('has-image'\)/);
+assert.match(styleSource, /custom-image-preview\.is-loaded[\s\S]*?object-fit: contain/);
+assert.match(styleSource, /custom-library-card > img \{[^}]*object-fit: contain/);
+assert.match(uiSource, /selected && !isDefault[\s\S]*?data-rename-preset[\s\S]*?data-delete-preset/);
+assert.match(uiSource, /preset-action-icon[\s\S]*?aria-label="Rename/);
+assert.match(uiSource, /preset-action-icon[\s\S]*?aria-label="Delete/);
+assert.match(styleSource, /custom-preset-list \{[^}]*padding: 6px 9px 7px 3px/);
+assert.match(styleSource, /custom-save-button, \.custom-library-actions \.tiny-copy[\s\S]*?border-radius: 999px/);
+assert.match(styleSource, /\.reroll-weight, \.reroll-action \{[^}]*border-radius: 999px/);
+assert.match(styleSource, /html, body, \* \{ scrollbar-color/);
+assert.match(styleSource, /\*::-webkit-scrollbar-thumb/);
+assert.match(uiSource, /class="number-stepper"/);
+assert.match(uiSource, /data-number-step="up"[\s\S]*?data-number-step="down"/);
+assert.match(uiSource, /input\.stepUp\(\)[\s\S]*?input\.stepDown\(\)[\s\S]*?new Event\('input', \{ bubbles: true \}\)/);
+assert.match(uiSource, /button\.disabled = input\.disabled/);
+assert.match(uiSource, /button\.addEventListener\('pointerdown', event => event\.preventDefault\(\)/);
+assert.match(styleSource, /input\[type="number"\]::\-webkit-inner-spin-button[\s\S]*?appearance: none/);
+assert.equal((uiSource.match(/>Reset prompt</g) ?? []).length, 1);
+assert.match(uiSource, /class="reset-prompt" id="reset" type="button">Reset prompt/);
+assert.doesNotMatch(uiSource, /reset-footer|New prompt|Local image analysis/);
+assert.match(styleSource, /\.reset-prompt \{[^}]*border: 1px solid var\(--danger\)[^}]*white-space: nowrap/);
+assert.match(styleSource, /\.reset-prompt:hover/);
+for (const controlId of ['copy-prompt', 'copy-artists', 'reroll-all-weights', 'random-artists', 'random-favorites-only', 'reset', 'add-character', 'open-character-picker', 'open-artist-picker', 'open-artist-picker-empty']) {
+  assert.match(uiSource, new RegExp(`id="${controlId}"`));
+}
+assert.match(styleSource, /\.empty-artist-card:hover/);
+assert.match(styleSource, /\.empty-artist-card:active/);
+assert.match(styleSource, /\.empty-artist-card:focus-visible/);
+assert.match(styleSource, /\.empty-artist-card:hover(?:\:not\(:active\))? img/);
+assert.match(styleSource, /\.workspace-tabs button:hover/);
+assert.match(styleSource, /\.workspace-tabs button:active/);
+assert.match(styleSource, /\.workspace-tabs button:focus-visible/);
+assert.match(styleSource, /\.primary, \.secondary,[\s\S]*?outline: 2px solid transparent;\s+outline-offset: 3px;[\s\S]*?outline-color var\(--motion-control\)/);
+assert.match(styleSource, /--detached-outline-clearance: 12px/);
+for (const detachedGroup of ['top-actions', 'picker-tools', 'random-actions', 'character-entry-actions', 'character-actions', 'workspace-tabs']) {
+  assert.match(styleSource, new RegExp(`\\.${detachedGroup} \\{[^}]*gap: var\\(--detached-outline-clearance\\)`));
+}
+assert.match(styleSource, /\.subheading > div \{[^}]*gap: var\(--detached-outline-clearance\)/);
+assert.match(styleSource, /\.metadata-toggle button \{[^}]*outline-offset: -2px/);
+assert.match(styleSource, /\.primary:hover:not\(:active\):not\(:disabled\):not\(:focus-visible\)[\s\S]*?border-color: var\(--accent\)[\s\S]*?outline-color: rgb\(229 201 141 \/ 88%\)[\s\S]*?box-shadow: 0 0 20px rgb\(201 168 106 \/ 34%\), 0 5px 14px/);
+assert.match(styleSource, /\.reset-prompt:hover:not\(:active\):not\(:disabled\):not\(:focus-visible\)[\s\S]*?border-color: var\(--danger\)[\s\S]*?outline-color: rgb\(228 155 157 \/ 88%\)[\s\S]*?0 0 20px rgb\(228 155 157 \/ 30%\)/);
+assert.match(styleSource, /\.primary:disabled:hover[\s\S]*?\.metadata-copy:disabled:hover \{ box-shadow: none; transform: none; \}/);
+assert.match(styleSource, /\.primary:active[\s\S]*?\.secondary:active[\s\S]*?\.chip:active/);
+assert.match(styleSource, /button:disabled \{[^}]*transition: none; transform: none;/);
+assert.match(styleSource, /\.workspace-panel-incoming \{ animation: workspace-panel-incoming 220ms/);
+const panelKeyframe = styleSource.match(/@keyframes workspace-panel-incoming \{([\s\S]*?)\n\}/)?.[1] ?? '';
+assert.match(panelKeyframe, /opacity/);
+assert.match(panelKeyframe, /transform/);
+assert.doesNotMatch(panelKeyframe, /(?:width|height|margin|padding|left|top|right|bottom)\s*:/);
+assert.doesNotMatch(styleSource, /transition\s*:\s*all\b/);
+assert.match(styleSource, /\.metadata-workspace \{ max-width: 1120px;/);
+assert.match(uiSource, /if \(fullOutput\) fullOutput\.textContent = prompt\(\);/);
+assert.match(uiSource, /if \(artistOutput\) artistOutput\.textContent = buildArtistsPrompt\(base\.artists\);/);
+assert.match(uiSource, /min="0\.1" max="2" step="0\.1"/);
+assert.match(uiSource, /random-favorites-only/);
+assert.match(uiSource, /resolveRandomPoolRange/);
+assert.match(uiSource, /needs at least 2 favorited V5 artists/);
+assert.match(uiSource, /controlMax = activeRange\.feasible \? activeRange\.available/);
+assert.doesNotMatch(uiSource, /Favorites pool \(\$\{artistFavorites\.size\}\)/);
+assert.match(uiSource, /reroll-all-weights/);
+assert.match(uiSource, /data-reroll-weight/);
+assert.doesNotMatch(uiSource, /card\.png|card-overlay/);
+assert.doesNotMatch(styleSource, /card\.png|card-overlay/);
+assert.match(uiSource, /character-picker-backdrop/);
+assert.match(uiSource, /character-previous/);
+assert.match(uiSource, /character-next/);
+assert.match(uiSource, /paginateCharacters/);
+assert.match(uiSource, /paginateArtists/);
+assert.doesNotMatch(uiSource, /slice\(0, 40\)/);
+assert.doesNotMatch(uiSource, /slice\(0,\s*240\)/);
+assert.match(uiSource, /artist-previous/);
+assert.match(uiSource, /artist-next/);
+assert.match(uiSource, /toggleFavorite\(button\.dataset\.favoriteArtist!, 'artists', true\)/);
+assert.match(uiSource, /const previousScrollTop = options\.preserveScroll \? grid\.scrollTop : 0;/);
+assert.match(uiSource, /favoriteButton\?\.focus\(\{ preventScroll: true \}\);/);
+assert.match(uiSource, /mix-artist-previous/);
+assert.match(uiSource, /mix-artist-next/);
+assert.match(uiSource, /mixOrbitMarkup/);
+assert.doesNotMatch(uiSource, /<svg[^>]*mix-orbit/);
+assert.match(uiSource, /class="mix-orbit-carrier"><div class="mix-orbit-connector"/);
+assert.match(uiSource, /data-orbit-radius-cap/);
+assert.match(uiSource, /--mix-weight-scale/);
+assert.match(uiSource, /--orbit-angle/);
+assert.match(uiSource, /--orbit-radius-cap/);
+assert.match(uiSource, /function commitArtistMix\(/);
+assert.match(uiSource, /commitArtistMix\(nextMix, notice\);/);
+assert.doesNotMatch(uiSource, /mixTransition|mixMotionEnabled|orbit-duration|orbit-direction|orbit-delay/);
+assert.match(uiSource, /character-search/);
+assert.match(uiSource, /classList\.toggle\('on', characterFavoritesOnly\)/);
+assert.match(uiSource, /setAttribute\('aria-pressed', String\(characterFavoritesOnly\)\)/);
+const characterListSource = uiSource.match(/function renderCharacterList\(\): void \{[\s\S]*?\n\}\n\nfunction refreshCharacterPicker/)?.[0] ?? '';
+assert.equal((characterListSource.match(/bindCharacterBlockEvents\(\)/g) ?? []).length, 1);
+assert.doesNotMatch(characterListSource, /data-character-name|data-copy-character|data-remove-character|data-character-details/);
+assert.match(styleSource, /artist-card-preview/);
+assert.match(styleSource, /height: min\(68vh, 520px\)/);
+assert.doesNotMatch(previewSource, /window\.addEventListener\(['"]scroll['"]/);
+assert.match(previewSource, /export function clearArtistCardPreview\(\): void/);
+assert.match(previewSource, /activeByPointer = false;\s+activeByFocus = false;\s+activeTarget = null;/);
+assert.match(previewSource, /let rangePointerFocusPending = false;/);
+assert.match(previewSource, /event\.target instanceof HTMLInputElement && event\.target\.type === 'range'/);
+assert.match(previewSource, /target\.addEventListener\('pointerdown',[\s\S]*?rangePointerFocusPending = true;[\s\S]*?activeByFocus = false;/);
+assert.match(previewSource, /target\.addEventListener\('pointerup', finishRangePointer, true\);/);
+assert.match(previewSource, /target\.addEventListener\('pointercancel', finishRangePointer, true\);/);
+assert.match(previewSource, /target\.addEventListener\('lostpointercapture', finishRangePointer, true\);/);
+assert.match(previewSource, /const pointerOriginatedRangeFocus = rangePointerFocusPending;\s+rangePointerFocusPending = false;\s+if \(pointerOriginatedRangeFocus\) return;/);
+assert.match(previewSource, /if \(activeTarget && !activeTarget\.isConnected\) \{\s+clearArtistCardPreview\(\);/);
+assert.match(uiSource, /import \{ bindArtistCardPreview, clearArtistCardPreview \} from '\.\/artist-card-preview';/);
+const renderSource = uiSource.match(/function render\(\): void \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(renderSource, /if \(!app\) return;\s+clearArtistCardPreview\(\);\s+const tabs/);
+assert.match(styleSource, /select:focus-visible/);
+assert.match(styleSource, /\.animation-setting select \{[^}]*background: var\(--bg-deep\)[^}]*color: var\(--ink\)/);
+assert.match(styleSource, /prefers-reduced-motion/);
+assert.match(styleSource, /:root:not\(\[data-animation-mode="on"\]\) \.workspace-panel-incoming \{ animation: none !important; opacity: 1 !important; transform: none !important; \}/);
+assert.match(styleSource, /:root:not\(\[data-animation-mode="on"\]\) \.empty-artist-card, :root:not\(\[data-animation-mode="on"\]\) \.empty-artist-card img \{ animation: none !important; transition: none !important; transform: none !important; \}/);
+assert.match(styleSource, /:root:not\(\[data-animation-mode="on"\]\) \.artist-card-preview \{ opacity: 0; transition: none !important; transform: none !important; \}/);
+assert.match(styleSource, /:root\[data-animation-mode="off"\] \*\{?[^\n]*animation-duration: \.001ms !important/);
+assert.match(styleSource, /:root\[data-animation-mode="off"\] \.workspace-panel-incoming \{ animation: none !important; opacity: 1 !important; transform: none !important; \}/);
+assert.match(styleSource, /:root\[data-animation-mode="off"\] \.artist-card-preview\.is-visible \{ opacity: 1; transform: none !important; \}/);
+assert.doesNotMatch(uiSource, /[—–]/);
+assert.doesNotMatch(indexSource, /[—–]/);
+assert.doesNotMatch(uiSource, /quick\s*start|prewarm/i);
+assert.match(styleSource, /:focus-visible/);
+assert.match(styleSource, /:focus-within/);
+assert.doesNotMatch(styleSource, /scale\(1\.32\)/);
+assert.match(styleSource, /scroll-padding: 72px/);
+assert.match(styleSource, /\.modal-backdrop\[hidden\] \{ display: none; \}/);
+assert.match(styleSource, /\.artist-catalog-picker \.artist-catalog-grid \{[^}]*overflow-y: auto;[^}]*scrollbar-gutter: stable;/);
+assert.match(styleSource, /\.mix-orbit-primary, \.mix-orbit-slot \{ position: absolute;/);
+assert.match(styleSource, /\.mix-artist-card\.mix-primary \{ width: 182px;/);
+assert.match(styleSource, /\.mix-artist-card \{ width: 122px;/);
+assert.match(styleSource, /\.mix-orbit-carrier \{[^}]*transform: rotate\(var\(--orbit-angle/);
+assert.match(styleSource, /\.mix-orbit-upright \{[^}]*rotate\(calc\(0deg - var\(--orbit-angle/);
+assert.match(styleSource, /\.mix-orbit-connector \{[^}]*width: var\(--orbit-distance\)/);
+assert.doesNotMatch(styleSource, /mix-orbit-carrier-spin|mix-orbit-upright-spin|mix-satellite-arrive|mix-card-arrive|mix-satellite-depart|mix-card-depart|mix-thread-reveal|is-departing|is-incoming/);
+assert.match(styleSource, /--orbit-distance: min\(var\(--orbit-radius/);
+assert.doesNotMatch(styleSource, /mix-orbit-threads|mix-orbit-thread-spin/);
+assert.doesNotMatch(styleSource, /stroke-dash(?:offset|array)/);
+assert.match(styleSource, /prefers-reduced-transparency/);
+assert.match(styleSource, /@media \(max-width: 760px\)/);
+assert.match(styleSource, /\.selected-artist-grid \{ max-width: 100%; margin: 0; padding: 24px 12px; \}/);
+assert.match(electronSource, /showErrorBox/);
+assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
+assert.match(electronSource, /window\.removeMenu\(\)/);
+assert.match(electronSource, /will-navigate/);
+assert.match(electronSource, /No system profile fallback was used/);
+assert.equal(packageSource.version, '0.3.0');
+assert.equal(lockSource.version, packageSource.version);
+assert.equal(lockSource.packages[''].version, packageSource.version);
+assert.match(packageSource.scripts['desktop:build'], /run-local\.mjs node tools\/build-desktop\.mjs/);
+assert.match(packageSource.scripts.build, /run-local\.mjs/);
+assert.match(packageSource.scripts.test, /run-local\.mjs/);
+assert.match(packageSource.scripts['installer:proof'], /run-local\.mjs/);
+assert.equal(packageSource.build.artifactName, 'NAI-Prompt-Studio-V5-Payload-${version}.${ext}');
+assert.equal(packageSource.build.nsis.include, 'build/installer.nsh');
+assert.match(localEnvSource, /\.local-cache/);
+for (const variable of ['TEMP', 'TMP', 'TMPDIR', 'ELECTRON_CACHE', 'ELECTRON_BUILDER_CACHE', 'npm_config_cache']) {
+  assert.match(localEnvSource, new RegExp(variable));
+}
+assert.match(localRunnerSource, /createLocalEnvironment\(\)/);
+assert.match(desktopBuildSource, /optimize-desktop-catalog\.ps1/);
+assert.match(desktopBuildSource, /build-installer\.mjs/);
+assert.match(installerBuildSource, /electron-builder/);
+assert.match(installerBuildSource, /\.payload/);
+assert.match(installerBuildSource, /patchInstallerStoreCopy/);
+assert.match(installerBuildSource, /restoreInstallerStoreCopy/);
+assert.match(installerStorePatchSource, /APP_INSTALLER_STORE_FILE/);
+assert.match(installerStorePatchSource, /never persist the full installer in system LOCALAPPDATA/);
+assert.match(installerLauncherSource, /ResolveNonSystemCache/);
+assert.match(installerLauncherSource, /NAI_INSTALLER_TEMP_ROOT/);
+assert.match(installerLauncherSource, /No system-drive temporary directory was used/);
+assert.match(installerLauncherSource, /There is deliberately no system-drive fallback/);
+assert.match(installerLauncherSource, /Path\.ChangeExtension\(executable, "\.payload"\)/);
+assert.match(installerLauncherSource, /EnvironmentVariables\["TEMP"\] = sessionCache/);
+assert.match(installerLauncherSource, /DeleteExactSession/);
+assert.match(installerProofSource, /PLUGINSDIR/);
+assert.match(installerProofSource, /NAI_INSTALLER_CACHE/);
+assert.match(nsisIncludeSource, /Uninstall NAI Prompt Studio\.payload/);
+assert.match(nsisIncludeSource, /NAI-Installer-Launcher\.exe/);
+assert.equal(npmrcSource.trim().split(/\r?\n/)[0], 'cache=.local-cache/npm');
+assert.match(optimizerSource, /System\.Drawing/);
+assert.match(optimizerSource, /danbooru-character-tags-v4\.5/);
+assert.match(optimizerSource, /ExpectedCount = 5457/);
+assert.match(optimizerSource, /TargetWidth = 416/);
+assert.match(optimizerSource, /TargetHeight = 608/);
+assert.match(optimizerSource, /Quality = 82/);
+assert.doesNotMatch(optimizerSource, /public[\\/]catalog/);
+assert.match(optimizerSource, /\.jpg\.optimizing/);
+
+const temp = mkdtempSync(join(tmpdir(), 'nai-v5-atomic-'));
+const liveCatalog = join(temp, 'catalog.json');
+const liveArtistDir = join(temp, 'live-artists');
+const stageCatalog = join(temp, 'stage-catalog.json');
+const stageArtistDir = join(temp, 'stage-artists');
+mkdirSync(liveArtistDir);
+writeFileSync(liveCatalog, 'old-catalog');
+writeFileSync(join(liveArtistDir, 'old.webp'), 'old-card');
+writeFileSync(stageCatalog, 'new-catalog');
+mkdirSync(stageArtistDir);
+writeFileSync(join(stageArtistDir, 'new.webp'), 'new-card');
+commitSnapshot({ stageCatalogPath: stageCatalog, stageArtistDir, catalogPath: liveCatalog, liveArtistDir });
+assert.equal(readFileSync(liveCatalog, 'utf8'), 'new-catalog');
+assert.equal(readFileSync(join(liveArtistDir, 'new.webp'), 'utf8'), 'new-card');
+
+const failureCatalog = join(temp, 'failure-catalog.json');
+const failureArtistDir = join(temp, 'failure-artists');
+const failureStageCatalog = join(temp, 'failure-stage-catalog.json');
+mkdirSync(failureArtistDir);
+writeFileSync(failureCatalog, 'prior-catalog');
+writeFileSync(join(failureArtistDir, 'prior.webp'), 'prior-card');
+writeFileSync(failureStageCatalog, 'broken-catalog');
+assert.throws(() => commitSnapshot({ stageCatalogPath: failureStageCatalog, stageArtistDir: join(temp, 'missing-stage-artists'), catalogPath: failureCatalog, liveArtistDir: failureArtistDir }));
+assert.equal(readFileSync(failureCatalog, 'utf8'), 'prior-catalog');
+assert.equal(readFileSync(join(failureArtistDir, 'prior.webp'), 'utf8'), 'prior-card');
+
+const seedLive = join(temp, 'seed-live');
+const seedStage = join(temp, 'seed-stage');
+mkdirSync(seedLive);
+mkdirSync(seedStage);
+const seedCard = { tag: 'Seed artist', image: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/seed.webp', score: 0 };
+const seedId = stableCatalogId(seedCard);
+writeFileSync(join(seedLive, 'legacy-index.webp'), 'RIFFxxxxWEBP');
+const seededCount = seedStageFromLive([seedCard], [{ id: seedId, catalogId: seedId, image: 'cards/artist/danbooru-artist-tags-2-v5/legacy-index.webp', sourceUrl: seedCard.image }], seedStage, seedLive);
+assert.equal(seededCount, 1);
+assert.equal(isWebp(readFileSync(join(seedStage, stableAssetFilename(seedCard)))), true);
+const changedSourceCard = { ...seedCard, image: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/seed-renamed.webp' };
+assert.equal(seedStageFromLive([changedSourceCard], [{ id: 'legacy-id', catalogId: 'legacy-id', tag: seedCard.tag, image: 'cards/artist/danbooru-artist-tags-2-v5/legacy-index.webp', sourceUrl: seedCard.image }], seedStage, seedLive), 0);
+writeFileSync(join(seedLive, 'invalid.webp'), 'not webp');
+const invalidSeed = { ...seedCard, tag: 'Invalid seed', image: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/invalid.webp' };
+assert.equal(seedStageFromLive([invalidSeed], [{ id: stableCatalogId(invalidSeed), catalogId: stableCatalogId(invalidSeed), image: 'cards/artist/danbooru-artist-tags-2-v5/invalid.webp', sourceUrl: invalidSeed.image }], seedStage, seedLive), 0);
+
+const devPaths = resolveAppPaths({ isPackaged: false, workspaceDir: 'D:/workspace', executablePath: 'C:/Program Files/NAI/Prompt Studio.exe' });
+assert.equal(devPaths.dataDir.replaceAll('\\', '/'), 'D:/workspace/.app-data');
+const packagedPaths = resolveAppPaths({ isPackaged: true, workspaceDir: 'D:/workspace', executablePath: 'C:/Program Files/NAI/Prompt Studio.exe' });
+assert.equal(packagedPaths.dataDir.replaceAll('\\', '/'), 'C:/Program Files/NAI/data');
+assert.match(devPaths.logsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/logs$/);
+assert.match(devPaths.crashDumpsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/crash-dumps$/);
+assert.match(devPaths.customTagsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/custom-tags$/);
+const pathTemp = mkdtempSync(join(tmpdir(), 'nai-paths-'));
+const writablePaths = resolveAppPaths({ isPackaged: false, workspaceDir: pathTemp, executablePath: 'C:/Prompt Studio.exe' });
+ensureWritable(writablePaths);
+const legacy = join(pathTemp, 'legacy', 'workspace.json');
+mkdirSync(join(pathTemp, 'legacy'));
+writeFileSync(legacy, '{"version":1}');
+assert.equal(migrateLegacyWorkspace(legacy, writablePaths.workspaceFile), true);
+assert.equal(readFileSync(writablePaths.workspaceFile, 'utf8'), '{"version":1}');
+writeFileSync(writablePaths.workspaceFile, '{"version":2}');
+assert.equal(migrateLegacyWorkspace(legacy, writablePaths.workspaceFile), false);
+const blockedTarget = join(pathTemp, 'blocked');
+writeFileSync(blockedTarget, 'file');
+assert.throws(() => ensureWritable(resolveAppPaths({ isPackaged: false, workspaceDir: blockedTarget, executablePath: 'C:/Prompt Studio.exe' })), /cannot write its profile/i);
+rmSync(pathTemp, { recursive: true, force: true });
+rmSync(temp, { recursive: true, force: true });
+console.log(`Tests passed: page discovery, atomic replacement/failure recovery, WebP validation, prompt serialization, migration, random uniqueness, and exact catalog assets (${catalog.artists.length} V5 artists / ${catalog.characters.length} characters).`);

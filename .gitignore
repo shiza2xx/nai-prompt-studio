@@ -1,0 +1,62 @@
+# Dependencies and compiled output
+/node_modules/
+/dist/
+/release/
+/release-v5/
+/release-*/
+/.installer-smoke/
+/.qa-artifacts/
+/.build-artifacts/
+*.log
+/build-check.log
+
+# Local application state, caches, and credentials
+/.app-data/
+/.local-cache/
+/.nax-cache/
+/.github-cli/
+/.env
+/.env.*
+!/.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Large catalog snapshots are distributed as release assets
+/public/catalog/
+/src/data/nax-import.json
+
+# Private workflow and agent material
+/AGENTS.md
+/agent_docs/
+/docs/
+/.agents/
+/.codex/
+/.codex_workflow_hidden_resource
+/.codex_workflow_hidden_resources/
+
+# Local references and test images
+/reference.jpg
+/reference 2.png
+/plus.png
+/card.png
+/error.jpg
+/tags*.png
+/tags*.jpg
+/tags*.jpeg
+/tags*.webp
+/Start NAI Prompt Studio.cmd
+
+# Local update fixtures and previous installer experiments
+/update-test-manifest*.json
+/old-builders/
+/builder-backups/
+
+# Editor and OS files
+/.idea/
+/.vscode/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
