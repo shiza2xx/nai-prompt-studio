@@ -26,7 +26,7 @@ The Settings workspace can check for a newer public release, show download progr
 
 ## Roadmap
 
-- **Shareable prompt exchange:** import and export Prompt Builder prompts and user presets in a portable format so they can be shared with other users. This is planned and is not implemented yet.
+- **Shareable Custom Tags folders:** export and import complete Custom Tags folders so users can share visual tag collections and quickly use them inside the Prompt Builder constructors. This is planned and is not implemented yet.
 
 ## Source-only clones and catalog hydration
 
