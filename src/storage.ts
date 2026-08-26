@@ -1,6 +1,6 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { mixCompanionCapacity } from './artist-mix-layout.ts';
-import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, SavedLibraryItem, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
+import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -95,9 +95,48 @@ export function normalizeSavedPromptSnapshot(value: unknown): SavedPromptSnapsho
   return draft ? cloneValue({ version: 2, base: draft.base, characters: draft.characters, randomRange: draft.randomRange ?? { min: 2, max: 5 } }) : undefined;
 }
 
+function normalizeSavedPromptData(value: unknown, prompt: string): SavedPromptData | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Partial<SavedPromptData>;
+  const characters = Array.isArray(source.characters) ? source.characters.flatMap((character, index) => {
+    if (!character || typeof character !== 'object') return [];
+    const value = character as Partial<SavedPromptData['characters'][number]>;
+    return [{ id: typeof value.id === 'string' && value.id ? value.id : `character-${index + 1}`, label: normalizeSavedName(value.label, `Character ${index + 1}`), positive: typeof value.positive === 'string' ? value.positive : '', negative: typeof value.negative === 'string' ? value.negative : '' }];
+  }) : [];
+  return {
+    ...(typeof source.model === 'string' ? { model: source.model.slice(0, 160) } : {}),
+    ...(typeof source.steps === 'string' ? { steps: source.steps.slice(0, 80) } : {}),
+    ...(typeof source.sampler === 'string' ? { sampler: source.sampler.slice(0, 160) } : {}),
+    ...(typeof source.width === 'string' ? { width: source.width.slice(0, 32) } : {}),
+    ...(typeof source.height === 'string' ? { height: source.height.slice(0, 32) } : {}),
+    ...(typeof source.cfg === 'string' ? { cfg: source.cfg.slice(0, 80) } : {}),
+    positive: typeof source.positive === 'string' ? source.positive : prompt,
+    negative: typeof source.negative === 'string' ? source.negative : '',
+    characters
+  };
+}
+
+function snapshotToPromptData(snapshot: SavedPromptSnapshot | undefined, prompt: string): SavedPromptData | undefined {
+  if (!snapshot) return undefined;
+  return { positive: prompt || [snapshot.base.frame, snapshot.base.artists.map(item => item.tag).join(', '), snapshot.base.setting, snapshot.base.render].filter(Boolean).join(', '), negative: snapshot.base.undesired, characters: snapshot.characters.map(character => ({ id: character.id, label: character.label, positive: character.prompt, negative: character.undesired })) };
+}
+
+function normalizeSavedArtistMixData(value: unknown, prompt: string, fallback?: ArtistMixDraft): SavedArtistMixData | undefined {
+  const source = value && typeof value === 'object' ? value as Partial<SavedArtistMixData> : {};
+  const artists = Array.isArray(source.artists) ? source.artists.flatMap((raw, index) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const item = raw as Partial<WeightedTag>;
+    const tag = typeof item.tag === 'string' ? item.tag.trim().slice(0, 300) : '';
+    if (!tag) return [];
+    return [{ id: typeof item.id === 'string' && item.id ? item.id : `saved-artist-${index + 1}`, ...(typeof item.catalogId === 'string' ? { catalogId: item.catalogId } : {}), ...(typeof item.image === 'string' ? { image: item.image } : {}), tag, weight: normalizeArtistWeight(item.weight) }];
+  }) : [...(fallback?.anchors ?? []), ...(fallback?.companions ?? [])];
+  const serializedPrompt = typeof source.serializedPrompt === 'string' ? source.serializedPrompt : prompt;
+  return artists.length || serializedPrompt ? { artists, serializedPrompt } : undefined;
+}
+
 export function normalizeSavedLibraryItem(value: unknown, fallbackNow = new Date().toISOString()): SavedLibraryItem | null {
   if (!value || typeof value !== 'object') return null;
-  const source = value as Partial<SavedLibraryItem> & { snapshot?: unknown; draft?: unknown };
+  const source = value as Partial<SavedLibraryItem> & { snapshot?: unknown; draft?: unknown; data?: unknown; source?: unknown; description?: unknown };
   const kind = source.kind === 'artist-mix' ? 'artist-mix' : 'prompt';
   const idValue = typeof source.id === 'string' ? source.id.trim() : '';
   if (!idValue || !/^[a-zA-Z0-9_-]+$/.test(idValue)) return null;
@@ -105,8 +144,11 @@ export function normalizeSavedLibraryItem(value: unknown, fallbackNow = new Date
   const updatedAt = normalizeSavedTimestamp(source.updatedAt, createdAt);
   const prompt = typeof source.prompt === 'string' ? source.prompt : '';
   const common = {
+    version: 4 as const,
     id: idValue,
     name: normalizeSavedName(source.name, kind === 'artist-mix' ? 'Artist Mix' : 'Saved prompt'),
+    source: source.source === 'manual' || source.source === 'prompt-builder' || source.source === 'artist-mix' || source.source === 'metadata' || source.source === 'legacy' ? source.source : 'legacy',
+    ...(typeof source.description === 'string' && source.description.trim() ? { description: source.description.trim().slice(0, 2000) } : {}),
     prompt,
     ...(typeof source.imageAsset === 'string' && /^[a-zA-Z0-9._-]+$/.test(source.imageAsset) && !source.imageAsset.includes('..') ? { imageAsset: source.imageAsset } : {}),
     ...(normalizeSavedMime(source.mime) ? { mime: normalizeSavedMime(source.mime) } : {}),
@@ -116,12 +158,14 @@ export function normalizeSavedLibraryItem(value: unknown, fallbackNow = new Date
   };
   if (kind === 'artist-mix') {
     const snapshot = normalizeArtistMix(source.snapshot);
-    if (!snapshot.anchors.length && !snapshot.companions.length) return null;
-    return cloneValue({ ...common, kind, snapshot });
+    const data = normalizeSavedArtistMixData(source.data, prompt, snapshot);
+    if (!snapshot.anchors.length && !snapshot.companions.length && !data) return null;
+    return cloneValue({ ...common, kind, snapshot, ...(data ? { data } : {}) });
   }
   const snapshot = normalizeSavedPromptSnapshot(source.snapshot ?? source.draft);
+  const data = normalizeSavedPromptData(source.data, prompt) ?? snapshotToPromptData(snapshot, prompt);
   const legacy = (source as { legacy?: unknown }).legacy === true || !snapshot;
-  return cloneValue({ ...common, kind, ...(snapshot ? { snapshot } : {}), ...(legacy ? { legacy: true } : {}) } satisfies SavedPromptItem);
+  return cloneValue({ ...common, kind, ...(snapshot ? { snapshot } : {}), ...(data ? { data } : {}), ...(legacy ? { legacy: true } : {}) } satisfies SavedPromptItem);
 }
 
 export function normalizeSavedLibrary(values: unknown): SavedLibraryItem[] {
@@ -233,7 +277,7 @@ export function normalizeAnimationMode(value: unknown): AnimationMode {
   return value === 'on' || value === 'off' ? value : 'auto';
 }
 export function normalizeTheme(value: unknown): StudioTheme {
-  return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' ? value : 'arcane-gold';
+  return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' || value === 'celestial-light' || value === 'ember-peach' || value === 'gothic-ivory' ? value : 'arcane-gold';
 }
 
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {

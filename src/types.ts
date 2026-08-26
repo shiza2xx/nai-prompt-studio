@@ -1,7 +1,7 @@
 export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 
 export type AnimationMode = 'auto' | 'on' | 'off';
-export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir';
+export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir' | 'celestial-light' | 'ember-peach' | 'gothic-ivory';
 
 export interface WeightedTag {
   id: string;
@@ -36,8 +36,13 @@ export interface SavedPromptSnapshot {
 }
 
 export interface SavedLibraryCommon {
+  /** V4 records are autonomous documents, never pointers into live workspaces. */
+  version?: 4;
   id: string;
+  kind: 'prompt' | 'artist-mix';
+  source?: 'manual' | 'prompt-builder' | 'artist-mix' | 'metadata' | 'legacy';
   name: string;
+  description?: string;
   /** Flattened base or artist prompt retained for quick copy and migration. */
   prompt: string;
   imageAsset?: string;
@@ -47,8 +52,33 @@ export interface SavedLibraryCommon {
   updatedAt: string;
 }
 
+export interface SavedPromptCharacterData {
+  id: string;
+  label: string;
+  positive: string;
+  negative: string;
+}
+
+export interface SavedPromptData {
+  model?: string;
+  steps?: string;
+  sampler?: string;
+  width?: string;
+  height?: string;
+  cfg?: string;
+  positive: string;
+  negative: string;
+  characters: SavedPromptCharacterData[];
+}
+
+export interface SavedArtistMixData {
+  artists: WeightedTag[];
+  serializedPrompt: string;
+}
+
 export interface SavedPromptItem extends SavedLibraryCommon {
   kind: 'prompt';
+  data?: SavedPromptData;
   /** Missing only for migrated legacy PromptSet records, which are copy-only. */
   snapshot?: SavedPromptSnapshot;
   legacy?: boolean;
@@ -56,6 +86,7 @@ export interface SavedPromptItem extends SavedLibraryCommon {
 
 export interface SavedArtistMixItem extends SavedLibraryCommon {
   kind: 'artist-mix';
+  data?: SavedArtistMixData;
   snapshot: ArtistMixDraft;
 }
 

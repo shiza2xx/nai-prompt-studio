@@ -35,10 +35,16 @@ declare global {
 }
 
 export interface UpdateManifest { available: boolean; schemaVersion?: 1; version: string; asset?: string; url?: string; size?: number; sha512?: string; releaseNotes?: string; }
+export interface UpdateProgress { phase: 'starting' | 'downloading' | 'retrying' | 'verifying' | 'ready' | 'paused' | 'error'; completed: number; total: number; percent: number; attempt: number; message?: string; }
+export type UpdateDownloadResult = { state: 'ready' | 'cancelled' | 'up-to-date'; version: string; downloaded: boolean };
+export type UpdateInstallResult = { state: 'installing'; started: boolean };
 export interface NAIUpdaterBridge {
   check(): Promise<UpdateManifest>;
-  downloadAndInstall(manifest: UpdateManifest): Promise<{ started: boolean; downloaded?: boolean }>;
+  download(manifest: UpdateManifest): Promise<UpdateDownloadResult>;
+  cancel(): Promise<boolean>;
+  install(manifest?: UpdateManifest): Promise<UpdateInstallResult>;
   version(): Promise<string>;
+  onProgress(listener: (event: UpdateProgress) => void): () => void;
 }
 
 export interface NAICatalogBridge {

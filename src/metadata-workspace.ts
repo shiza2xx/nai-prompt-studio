@@ -1,10 +1,19 @@
 import { bindArtistCardPreview } from './artist-card-preview';
 import { extractImageMetadata, type ImageMetadata, type MetadataCharacter } from './image-metadata';
-import { escapeMetadataHtml, MetadataArtistHighlighter } from './metadata-artist-highlight';
-import type { CatalogCard } from './types';
+import { escapeMetadataHtml, extractMetadataArtists, MetadataArtistHighlighter, serializeMetadataArtists } from './metadata-artist-highlight';
+import type { CatalogCard, SavedArtistMixData, SavedPromptData } from './types';
 
 type State = 'empty' | 'loading' | 'success' | 'error';
 const escapeHtml = escapeMetadataHtml;
+
+export interface MetadataSavePayload {
+  source: 'metadata';
+  filename: string;
+  preview: { bytes: Uint8Array; mime: 'image/png' | 'image/webp'; originalName: string };
+  prompt: SavedPromptData;
+  artistMix?: SavedArtistMixData;
+}
+export type MetadataSaveKind = 'prompt' | 'artist-mix';
 
 export class MetadataWorkspace {
   private state: State = 'empty';
@@ -16,9 +25,14 @@ export class MetadataWorkspace {
   private highlighter = new MetadataArtistHighlighter([]);
   private sourceObjectUrl: string | null = null;
   private sourceFilename = '';
+  private sourceBytes: Uint8Array | null = null;
+  private sourceMime: 'image/png' | 'image/webp' | null = null;
+  private savedKinds = new Set<MetadataSaveKind>();
+  private cachedSavePayload: MetadataSavePayload | null | undefined;
+  private cachedPayloadCatalog: readonly CatalogCard[] | null = null;
   private readToken = 0;
 
-  constructor(private readonly catalogArtists: () => readonly CatalogCard[] = () => [], private readonly imageResolver?: (card: CatalogCard) => string) {}
+  constructor(private readonly catalogArtists: () => readonly CatalogCard[] = () => [], private readonly imageResolver?: (card: CatalogCard) => string, private readonly onSave?: (kind: MetadataSaveKind, payload: MetadataSavePayload) => Promise<boolean> | boolean) {}
 
   markup(): string {
     const status = this.state === 'loading' ? '<p class="metadata-status" role="status"><i class="status-skeleton"></i>Reading local image metadata...</p>'
@@ -43,12 +57,13 @@ export class MetadataWorkspace {
       const index = Number(button.dataset.metadataPolarity);
       const polarity = button.dataset.polarity === 'negative' ? 'negative' : 'positive';
       if (index < 0) this.basePolarity = polarity; else this.characterPolarities[index] = polarity;
-      refresh();
+      this.patchPolarityBlock(button.closest<HTMLElement>('[data-metadata-block]'), index, polarity);
     }));
     root.querySelectorAll<HTMLButtonElement>('[data-metadata-copy]').forEach(button => button.addEventListener('click', () => {
       const value = this.activePrompt(Number(button.dataset.metadataCopy));
       if (value) void this.copyPrompt(value, button);
     }));
+    root.querySelectorAll<HTMLButtonElement>('[data-metadata-save]').forEach(button => button.addEventListener('click', () => void this.saveToLibrary(button.dataset.metadataSave === 'artist-mix' ? 'artist-mix' : 'prompt', refresh)));
     bindArtistCardPreview(root);
   }
 
@@ -57,9 +72,11 @@ export class MetadataWorkspace {
     this.releaseSourceImage();
     this.state = 'loading'; this.result = null; this.error = ''; refresh();
     try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const mime = bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP' ? 'image/webp' : 'image/png';
       const result = await extractImageMetadata(file);
       if (request !== this.readToken) return;
-      this.result = result; this.sourceObjectUrl = URL.createObjectURL(file); this.sourceFilename = file.name; this.basePolarity = 'positive'; this.characterPolarities = this.result.characters.map(() => 'positive'); this.state = 'success';
+      this.result = result; this.sourceObjectUrl = URL.createObjectURL(file); this.sourceFilename = file.name; this.sourceBytes = bytes; this.sourceMime = mime; this.savedKinds = new Set(); this.cachedSavePayload = undefined; this.cachedPayloadCatalog = null; this.basePolarity = 'positive'; this.characterPolarities = this.result.characters.map(() => 'positive'); this.state = 'success';
     }
     catch (error) {
       if (request !== this.readToken) return;
@@ -70,17 +87,60 @@ export class MetadataWorkspace {
 
   dispose(): void { this.readToken += 1; this.releaseSourceImage(); }
 
+  /** Returns only validated image bytes and structured fields, never an object URL. */
+  getSavePayload(): MetadataSavePayload | null {
+    if (!this.result || !this.sourceBytes || !this.sourceMime || !this.sourceFilename) return null;
+    const catalog = this.catalogArtists();
+    if (this.cachedSavePayload !== undefined && catalog === this.cachedPayloadCatalog) return this.cachedSavePayload;
+    const artists = extractMetadataArtists(this.result.base.positive, catalog);
+    const prompt: SavedPromptData = { model: this.result.model, steps: this.result.steps, sampler: this.result.sampler, width: this.result.width, height: this.result.height, cfg: this.result.scale, positive: this.result.base.positive, negative: this.result.base.negative, characters: this.result.characters.map((item, index) => ({ id: `metadata-character-${index + 1}`, label: `Character ${index + 1}`, positive: item.positive, negative: item.negative })) };
+    this.cachedPayloadCatalog = catalog;
+    this.cachedSavePayload = { source: 'metadata', filename: this.sourceFilename, preview: { bytes: this.sourceBytes.slice(), mime: this.sourceMime, originalName: this.sourceFilename }, prompt, ...(artists.length ? { artistMix: { artists, serializedPrompt: serializeMetadataArtists(artists) } } : {}) };
+    return this.cachedSavePayload;
+  }
+
+  private async saveToLibrary(kind: MetadataSaveKind, refresh: () => void): Promise<void> {
+    const payload = this.getSavePayload();
+    if (!payload || !this.onSave || (kind === 'artist-mix' && !payload.artistMix) || this.savedKinds.has(kind)) return;
+    try {
+      if (await this.onSave(kind, payload)) this.savedKinds.add(kind);
+    } catch (error) { this.error = error instanceof Error ? error.message : 'The item could not be saved.'; }
+    refresh();
+  }
+
   private polarityBlock(label: string, prompt: MetadataCharacter, index: number, polarity: 'positive' | 'negative'): string {
     const activeValue = prompt[polarity];
     const value = activeValue || '(No prompt recorded for this side.)';
     const copyLabel = `Copy ${label} ${polarity} prompt`;
-    return `<article class="metadata-prompt"><header><b>${label}</b><div class="metadata-toggle" role="group" aria-label="${escapeHtml(label)} polarity"><button type="button" class="${polarity === 'positive' ? 'on' : ''}" data-metadata-polarity="${index}" data-polarity="positive" aria-pressed="${polarity === 'positive'}">Positive</button><button type="button" class="${polarity === 'negative' ? 'on' : ''}" data-metadata-polarity="${index}" data-polarity="negative" aria-pressed="${polarity === 'negative'}">Negative</button></div></header><pre>${this.artistHighlighter().render(value)}</pre><div class="metadata-prompt-actions"><button class="secondary metadata-copy" type="button" data-metadata-copy="${index}" aria-label="${escapeHtml(copyLabel)}" ${activeValue ? '' : 'disabled'}>Copy prompt</button></div></article>`;
+    return `<article class="metadata-prompt" data-metadata-block="${index}"><header><b>${label}</b><div class="metadata-toggle" role="group" aria-label="${escapeHtml(label)} polarity"><button type="button" class="${polarity === 'positive' ? 'on' : ''}" data-metadata-polarity="${index}" data-polarity="positive" aria-pressed="${polarity === 'positive'}">Positive</button><button type="button" class="${polarity === 'negative' ? 'on' : ''}" data-metadata-polarity="${index}" data-polarity="negative" aria-pressed="${polarity === 'negative'}">Negative</button></div></header><pre>${this.artistHighlighter().render(value)}</pre><div class="metadata-prompt-actions"><button class="secondary metadata-copy" type="button" data-metadata-copy="${index}" aria-label="${escapeHtml(copyLabel)}" ${activeValue ? '' : 'disabled'}>Copy prompt</button></div></article>`;
+  }
+
+  private patchPolarityBlock(block: HTMLElement | null, index: number, polarity: 'positive' | 'negative'): void {
+    if (!block || !this.result) return;
+    const prompt = index < 0 ? this.result.base : this.result.characters[index];
+    if (!prompt) return;
+    block.querySelectorAll<HTMLButtonElement>('[data-metadata-polarity]').forEach(button => {
+      const on = button.dataset.polarity === polarity;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-pressed', String(on));
+    });
+    const value = prompt[polarity];
+    const pre = block.querySelector<HTMLElement>('pre');
+    if (pre) pre.innerHTML = this.artistHighlighter().render(value || '(No prompt recorded for this side.)');
+    const copy = block.querySelector<HTMLButtonElement>('[data-metadata-copy]');
+    if (copy) {
+      copy.disabled = !value;
+      copy.setAttribute('aria-label', `Copy ${index < 0 ? 'Base prompt' : `Character ${index + 1}`} ${polarity} prompt`);
+    }
+    bindArtistCardPreview(block);
   }
 
   private resultMarkup(result: ImageMetadata): string {
     const settings = [result.steps && `${result.steps} steps`, result.sampler, result.width && result.height && `${result.width} x ${result.height}`, result.scale && `CFG ${result.scale}`].filter(Boolean).join('  ·  ') || 'Settings unavailable';
     const characters = result.characters.length ? result.characters.map((item, index) => this.polarityBlock(`Character ${index + 1}`, item, index, this.characterPolarities[index] ?? 'positive')).join('') : '<p class="metadata-no-characters">No character prompts were recorded in this image.</p>';
-    const sourceImage = this.sourceObjectUrl ? `<figure class="metadata-source-image"><img src="${escapeHtml(this.sourceObjectUrl)}" alt="Uploaded image: ${escapeHtml(this.sourceFilename)}"><figcaption>${escapeHtml(this.sourceFilename)}</figcaption></figure>` : '';
+    const savePayload = this.getSavePayload();
+    const saveActions = savePayload ? `<div class="metadata-save-actions"><button class="primary" type="button" data-metadata-save="prompt" ${this.savedKinds.has('prompt') ? 'disabled' : ''}>${this.savedKinds.has('prompt') ? 'Saved' : 'Add to Saved Library'}</button>${savePayload.artistMix ? `<button class="secondary" type="button" data-metadata-save="artist-mix" ${this.savedKinds.has('artist-mix') ? 'disabled' : ''}>${this.savedKinds.has('artist-mix') ? 'Saved' : 'Save Artist Mix'}</button>` : ''}</div>` : '';
+    const sourceImage = this.sourceObjectUrl ? `<figure class="metadata-source-image"><img src="${escapeHtml(this.sourceObjectUrl)}" alt="Uploaded image: ${escapeHtml(this.sourceFilename)}"><figcaption>${escapeHtml(this.sourceFilename)}</figcaption>${saveActions}</figure>` : '';
     return `<section class="metadata-results">${sourceImage}<div class="metadata-model"><span>MODEL</span><b>${escapeHtml(result.model)}</b></div><div class="metadata-settings"><span>SETTINGS</span><b>${escapeHtml(settings)}</b></div>${this.polarityBlock('Base prompt', result.base, -1, this.basePolarity)}${characters}</section>`;
   }
 
@@ -102,6 +162,11 @@ export class MetadataWorkspace {
     if (this.sourceObjectUrl) URL.revokeObjectURL(this.sourceObjectUrl);
     this.sourceObjectUrl = null;
     this.sourceFilename = '';
+    this.sourceBytes = null;
+    this.sourceMime = null;
+    this.savedKinds.clear();
+    this.cachedSavePayload = undefined;
+    this.cachedPayloadCatalog = null;
   }
 
   private artistHighlighter(): MetadataArtistHighlighter {

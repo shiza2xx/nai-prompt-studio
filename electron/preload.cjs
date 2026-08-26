@@ -23,6 +23,13 @@ contextBridge.exposeInMainWorld('naiCatalog', {
 
 contextBridge.exposeInMainWorld('naiUpdater', {
   check: () => ipcRenderer.invoke('app-update:check'),
-  downloadAndInstall: manifest => ipcRenderer.invoke('app-update:download-install', manifest),
-  version: () => ipcRenderer.invoke('app-update:version')
+  download: manifest => ipcRenderer.invoke('app-update:download', manifest),
+  cancel: () => ipcRenderer.invoke('app-update:cancel'),
+  install: manifest => ipcRenderer.invoke('app-update:install', manifest),
+  version: () => ipcRenderer.invoke('app-update:version'),
+  onProgress: listener => {
+    const handler = (_event, value) => listener(value);
+    ipcRenderer.on('app-update:progress', handler);
+    return () => ipcRenderer.removeListener('app-update:progress', handler);
+  }
 });

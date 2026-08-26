@@ -24,4 +24,10 @@ The guide and its images remain the property of their respective author or right
 - License: MIT
 - Use: reference behavior and compatibility concepts for local PNG and WebP metadata extraction
 
+## Danbooru tag CSV
+
+- Source: [SpadeA/danbooru-tag-csv](https://huggingface.co/datasets/SpadeA/danbooru-tag-csv)
+- License identified by the dataset: MIT
+- Use: Danbooru tag names and categories used by catalog import tooling
+
 NovelAI is a trademark of Anlatan. This project is an independent community tool and is not affiliated with or endorsed by Anlatan.

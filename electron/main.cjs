@@ -6,9 +6,13 @@ const { pathToFileURL } = require('node:url');
 const { resolveAppPaths, ensureWritable } = require('./app-paths.cjs');
 const { containedAsset, validateImagePayload, writeAsset } = require('./custom-tag-assets.cjs');
 const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
-const { checkForUpdate, downloadInstaller, validateManifest } = require('./app-updater.cjs');
+const { checkForUpdate, downloadInstaller, validateManifest, UpdateAbortError } = require('./app-updater.cjs');
+
+const APP_USER_MODEL_ID = 'com.novelai.promptstudio';
+const APP_ICON = path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'app-icon.png');
 
 app.setName('NAI Prompt Studio');
+app.setAppUserModelId(APP_USER_MODEL_ID);
 protocol.registerSchemesAsPrivileged([
   { scheme: 'nai-custom', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
   { scheme: 'nai-catalog', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
@@ -120,6 +124,9 @@ ipcMain.handle('library:image-delete', async (_event, asset) => {
 
 let catalogUpdateController = null;
 let catalogUpdatePromise = null;
+let appUpdateController = null;
+let appUpdatePromise = null;
+let appUpdateReady = null;
 function embeddedCatalogPath() {
   const packaged = path.join(__dirname, '..', 'dist', 'catalog', 'catalog.json');
   const development = path.join(__dirname, '..', 'public', 'catalog', 'catalog.json');
@@ -139,17 +146,39 @@ ipcMain.handle('catalog:update', async () => {
 ipcMain.handle('catalog:cancel', async () => { if (catalogUpdateController) catalogUpdateController.abort(); return Boolean(catalogUpdateController); });
 ipcMain.handle('app-update:version', async () => app.getVersion());
 ipcMain.handle('app-update:check', async () => app.isPackaged ? checkForUpdate(app.getVersion()) : { available: false, version: app.getVersion(), development: true });
-ipcMain.handle('app-update:download-install', async (_event, rawManifest) => {
+function emitAppUpdateProgress(event) {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('app-update:progress', event);
+}
+ipcMain.handle('app-update:download', async (_event, rawManifest) => {
   if (!app.isPackaged) throw new Error('Application updates are disabled in development mode.');
+  if (appUpdatePromise) throw new Error('An application update download is already running.');
   const manifest = validateManifest(rawManifest, app.getVersion());
-  if (!manifest.available) return { started: false };
-  const owner = BrowserWindow.getFocusedWindow();
-  const consent = await dialog.showMessageBox(owner, { type: 'info', title: 'NAI Prompt Studio update', message: `Download NAI Prompt Studio ${manifest.version}?`, detail: manifest.releaseNotes || 'The installer is verified with SHA-512 and stored inside this installation.', buttons: ['Download', 'Cancel'], defaultId: 0, cancelId: 1 });
-  if (consent.response !== 0) return { started: false };
-  const installer = await downloadInstaller(manifest, appPaths.updatesDir);
+  if (!manifest.available) return { state: 'up-to-date', version: manifest.version, downloaded: false };
+  appUpdateReady = null;
+  appUpdateController = new AbortController();
+  appUpdatePromise = downloadInstaller(manifest, appPaths.updatesDir, { signal: appUpdateController.signal, onProgress: emitAppUpdateProgress })
+    .then(installer => { appUpdateReady = { manifest, installer }; return { state: 'ready', version: manifest.version, downloaded: true }; })
+    .catch(error => {
+      if (error instanceof UpdateAbortError || error?.code === 'ABORT_ERR') return { state: 'cancelled', version: manifest.version, downloaded: false };
+      throw error;
+    })
+    .finally(() => { appUpdateController = null; appUpdatePromise = null; });
+  return appUpdatePromise;
+});
+ipcMain.handle('app-update:cancel', async () => {
+  if (!appUpdateController) return false;
+  appUpdateController.abort();
+  return true;
+});
+ipcMain.handle('app-update:install', async (_event, rawManifest) => {
+  if (!app.isPackaged) throw new Error('Application updates are disabled in development mode.');
+  if (appUpdatePromise) throw new Error('Wait for the application update download to finish.');
+  if (!appUpdateReady) throw new Error('The application update is not verified and ready to install.');
+  const manifest = rawManifest ? validateManifest(rawManifest, app.getVersion()) : appUpdateReady.manifest;
+  if (!manifest.available || manifest.version !== appUpdateReady.manifest.version || manifest.sha512 !== appUpdateReady.manifest.sha512) throw new Error('The verified update record does not match this manifest.');
+  if (!fs.existsSync(appUpdateReady.installer)) throw new Error('The verified update installer is no longer available.');
+  const installer = appUpdateReady.installer;
   const installParent = path.dirname(path.dirname(process.execPath));
-  const launch = await dialog.showMessageBox(owner, { type: 'question', title: 'Update ready', message: 'The verified update is ready to install.', detail: 'NAI Prompt Studio will close. Your data folder will be preserved.', buttons: ['Install now', 'Later'], defaultId: 0, cancelId: 1 });
-  if (launch.response !== 0) return { started: false, downloaded: true };
   const launcher = path.join(__dirname, 'update-launcher.cjs');
   const child = spawn(process.execPath, [launcher, String(process.pid), installer, installParent], {
     detached: true,
@@ -161,7 +190,8 @@ ipcMain.handle('app-update:download-install', async (_event, rawManifest) => {
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   child.unref();
   setTimeout(() => app.quit(), 40);
-  return { started: true };
+  appUpdateReady = null;
+  return { state: 'installing', started: true };
 });
 
 function createWindow() {
@@ -171,9 +201,10 @@ function createWindow() {
     height: 920,
     minWidth: 980,
     minHeight: 700,
-    backgroundColor: '#100b13',
+    backgroundColor: '#000000',
     title: 'NAI Prompt Studio',
-    icon: path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'app-icon.png'),
+    // Source icon pipeline: icon.png -> public/app-icon.png -> build/icon.ico.
+    icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

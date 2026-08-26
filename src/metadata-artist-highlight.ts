@@ -1,4 +1,5 @@
-import type { CatalogCard } from './types';
+import { serializeTag } from './prompt.ts';
+import type { CatalogCard, WeightedTag } from './types';
 
 const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' };
 const NAMED_ENTITIES: Record<string, string> = { amp: '&', apos: "'", gt: '>', lt: '<', quot: '"' };
@@ -24,6 +25,81 @@ function normalizeName(value: string): string {
 
 function artistKey(value: string): string {
   return normalizeName(value).replace(/[ _]+/g, ' ');
+}
+
+function artistName(value: string): string {
+  return decodeCatalogEntities(value).replace(/^artist\s*:\s*/iu, '').trim();
+}
+
+/** A structured, DOM-free artist extraction API for Metadata saves. */
+export function extractMetadataArtists(basePositive: string, cards: readonly CatalogCard[]): WeightedTag[] {
+  const catalog = new Map<string, CatalogCard>();
+  for (const card of cards) {
+    const key = artistKey(artistName(card.tag));
+    if (key && !catalog.has(key)) catalog.set(key, card);
+  }
+  const found: WeightedTag[] = [];
+  const foundByIdentity = new Map<string, { index: number; authority: number; position: number }>();
+  const add = (name: string, weight: number, authority: number, position: number, card?: CatalogCard): void => {
+    const cleaned = artistName(name);
+    if (!cleaned) return;
+    const canonical = card ? (card.catalogId ?? card.id) : `unknown:${artistKey(cleaned)}`;
+    if (!canonical) return;
+    const item: WeightedTag = { id: canonical, catalogId: card?.catalogId ?? card?.id, image: card?.image, tag: `artist: ${card ? artistName(card.tag) : cleaned}`, weight: Number.isFinite(weight) && weight > 0 ? weight : 1 };
+    const existing = foundByIdentity.get(canonical);
+    if (!existing) {
+      foundByIdentity.set(canonical, { index: found.length, authority, position });
+      found.push(item);
+    } else if (authority > existing.authority) {
+      found[existing.index] = item;
+      existing.authority = authority;
+      existing.position = Math.min(existing.position, position);
+    }
+  };
+
+  // Canonical NovelAI serialization is the highest-authority explicit form.
+  // Require its `artist:` marker so an arbitrary weighted prompt segment is
+  // never promoted into an unknown artist.
+  const canonical = /([0-9]+(?:\.[0-9]+)?)\s*::\s*artist\s*:\s*([^,:\n]+?)\s*::/giu;
+  for (let match = canonical.exec(basePositive); match; match = canonical.exec(basePositive)) {
+    const name = match[2].trim();
+    add(name, Number(match[1]), 3, match.index, catalog.get(artistKey(name)));
+  }
+  // Older canonical records omit `artist:`. They are catalog-only so an
+  // unrelated weighted segment cannot become an unknown artist.
+  const canonicalKnown = /([0-9]+(?:\.[0-9]+)?)\s*::\s*([^,:\n]+?)\s*::/giu;
+  for (let match = canonicalKnown.exec(basePositive); match; match = canonicalKnown.exec(basePositive)) {
+    const name = artistName(match[2]);
+    const card = catalog.get(artistKey(name));
+    if (card) add(name, Number(match[1]), 3, match.index, card);
+  }
+  // Older metadata can instead encode `artist: name::weight`.
+  const legacyWeighted = /(?<![\p{L}\p{N}_])artist\s*:\s*([^,:\n\}\]]+?)\s*::\s*([0-9]+(?:\.[0-9]+)?)(?=\s*(?:,|\n|\}|\]|$))/giu;
+  for (let match = legacyWeighted.exec(basePositive); match; match = legacyWeighted.exec(basePositive)) {
+    const name = match[1].trim();
+    add(name, Number(match[2]), 2, match.index, catalog.get(artistKey(name)));
+  }
+  // Explicit values are deliberately retained even when absent from the catalog.
+  const explicit = /(?<![\p{L}\p{N}_])artist\s*:\s*([^,:\n\}\]]+?)(?=\s*(?:,|\n|\}|\]|$))/giu;
+  for (let match = explicit.exec(basePositive); match; match = explicit.exec(basePositive)) {
+    const name = match[1].trim();
+    add(name, 1, 1, match.index, catalog.get(artistKey(name)));
+  }
+  // Known names may occur as ordinary positive tags. Boundary matching avoids substrings.
+  const normalized = normalizePrompt(basePositive);
+  for (const [key, card] of catalog) {
+    const pattern = new RegExp(`(?<!${WORD_CHARACTER})${namePattern(normalizeName(artistName(card.tag)))}(?!${WORD_CHARACTER})`, 'giu');
+    if (pattern.test(normalized.text)) add(card.tag, 1, 0, basePositive.length, card);
+  }
+  return found
+    .map(item => ({ item, position: foundByIdentity.get(item.id)?.position ?? basePositive.length }))
+    .sort((left, right) => left.position - right.position)
+    .map(({ item }) => item);
+}
+
+/** Serialize the extracted records with the same digit-ending safeguard as the prompt builder. */
+export function serializeMetadataArtists(artists: readonly WeightedTag[]): string {
+  return artists.map(item => serializeTag(item)).filter((item): item is string => Boolean(item)).join(', ');
 }
 
 function escapeRegex(value: string): string {

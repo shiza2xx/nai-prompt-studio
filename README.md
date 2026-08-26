@@ -1,24 +1,32 @@
 # NAI Prompt Studio
 
-NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prompts, mixing V5 artist tags, managing custom visual tags, and reading image metadata.
+NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prompts, experimenting with V5 artist combinations, managing visual prompt references, and reading image metadata.
 
 ## Features
 
-- Prompt Builder with visual tag constructors for frame, scene, and render choices
-- V5 artist browser with favorites, weighted tags, card previews, and random selection
-- Artist Mix workspace for keeping one or more primary artists fixed while shuffling companions
-- Character prompt workspace with searchable card browser
-- Custom Tags presets with personal preview images and descriptions
-- Saved Library for editable Prompt Builder and Artist Mix snapshots, optional cover images, search and restore
-- Local NovelAI image metadata inspection for PNG and WebP files
-- App-local settings, cache, catalog data, logs, and verified GitHub updates
-- Four interface themes: Arcane Gold, Midnight Blue, Raspberry Rose and Noir
+- Prompt Builder with visual constructors for Frame, Scene, and Render/Quality tags, plus separate undesired-content and character prompts
+- V5 artist browser with favorites, weighted tags, animated card previews, random artist counts, and per-card or global weight rerolls
+- Artist Mix workspace with one or more fixed primary artists and shuffled companion artists, favorites-only pools, focus mode, and one-click prompt copying
+- Searchable character card browser with separate positive and negative character prompts
+- Custom Tags presets with personal images, descriptions, and custom artist cards; a matching future NAX entry can replace a personal artist preview automatically
+- Saved Library for independent prompt and Artist Mix records with optional cover images, editable descriptions, positive/negative switching, character details, and per-field copy actions
+- Local NovelAI image metadata inspection for PNG and WebP files, including model, generation settings, base prompts, character prompts, artist highlighting, preview cards, and direct Saved Library actions
+- Manual and optional startup checks for additions to the exact NAX V5 artist catalog, with live catalog refresh after downloading
+- App-local settings, caches, catalog data, logs, and verified GitHub update downloads
+- Seven interface themes: Arcane Gold, Midnight Blue, Raspberry Rose, Noir, Celestial Light, Ember Peach, and Gothic
+- First-run guide, percentage-based startup loading screen, configurable interface animations, and hover previews for visual cards
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
 
 ## Saved Library and updates
 
-Saved Library keeps prompt snapshots, Artist Mix snapshots and optional cover images in the local application profile. Nothing is uploaded automatically. The Settings workspace can check for a newer public release, verify its size and SHA-512 digest, and launch the new installer in the same installation folder while preserving the existing `data` directory.
+Saved Library keeps independent prompt records, Artist Mix records, metadata-derived prompts, and optional cover images in the local application profile. Each prompt section can be inspected and copied separately. Nothing is uploaded automatically.
+
+The Settings workspace can check for a newer public release, show download progress, verify the installer size and SHA-512 digest, and launch the new installer for the same installation folder while preserving the existing `data` directory.
+
+## Roadmap
+
+- **Shareable prompt exchange:** import and export Prompt Builder prompts and user presets in a portable format so they can be shared with other users. This is planned and is not implemented yet.
 
 ## Source-only clones and catalog hydration
 
@@ -58,7 +66,7 @@ Create the Windows installer:
 npm run desktop:build
 ```
 
-The generated setup is a single-file Windows installer. It lets the user choose an installation directory, creates the application folder there, and keeps the installed profile and update cache beside the executable.
+The generated setup is a single-file Windows installer. It lets the user choose an installation directory, creates the application folder there, offers Start Menu and Desktop shortcut options, and can launch the app from the finish page. The uninstaller can preserve or remove the local profile. Installed settings, catalogs, custom cards, and update cache remain beside the application instead of moving to another drive.
 
 All project commands route temporary files and package caches into project-local folders on the current drive. Development state lives in `.app-data`. An installed copy stores mutable data in its own `data` folder beside the application files.
 
@@ -69,6 +77,8 @@ The Windows setup is currently unsigned, so Microsoft SmartScreen may show an un
 The V5 artist catalog is derived from the exact [NAX V5 artist gallery](https://nax.moe/?gallery=danbooru-artist-tags-2-v5). NAX artist preview assets are distributed under CC BY 4.0 and retain source attribution.
 
 Built-in visual tag references are based on [hothottuk's NovelAI guide](https://hothottuk.neocities.org/en). The metadata reader is based on concepts and compatible behavior from the official [NovelAI image metadata repository](https://github.com/NovelAI/novelai-image-metadata).
+
+Danbooru tag names used by the catalog tooling come from the [SpadeA/danbooru-tag-csv dataset](https://huggingface.co/datasets/SpadeA/danbooru-tag-csv).
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and license boundaries.
 

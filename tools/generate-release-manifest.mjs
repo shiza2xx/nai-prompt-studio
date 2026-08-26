@@ -15,7 +15,7 @@ const manifest = {
   url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
   size: stat.size,
   sha512: sha.digest('hex'),
-  releaseNotes: 'Saved Library, multi-anchor Artist Mix, four studio themes, and verified in-app updates.'
+  releaseNotes: 'Resumable verified updates, clearer progress, and a theme-native Settings update card.'
 };
 await fs.writeFile(join(projectRoot, 'release-v5', 'update-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(JSON.stringify(manifest, null, 2));

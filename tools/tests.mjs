@@ -3,9 +3,11 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { buildArtistsPrompt, buildBasePrompt, serializeTag } from '../src/prompt.ts';
-import { MetadataArtistHighlighter, decodeCatalogEntities, escapeMetadataHtml } from '../src/metadata-artist-highlight.ts';
+import { MetadataArtistHighlighter, decodeCatalogEntities, escapeMetadataHtml, extractMetadataArtists, serializeMetadataArtists } from '../src/metadata-artist-highlight.ts';
 import { normalizeAnimationMode, normalizeArtistMix, normalizeCustomTag, normalizeCustomTagPresetId, normalizeCustomTagPresets, normalizeDraft, normalizeRandomRange, normalizeSavedLibrary, normalizeSavedLibraryItem, normalizeTheme, normalizeSettings } from '../src/storage.ts';
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from '../src/custom-tag-presets.ts';
 import { commitSnapshot, discoverCards, GALLERY_URL, isWebp, makeCatalog, parseGalleryPage, seedStageFromLive, stableAssetFilename, stableCatalogId } from './update-v5-catalog.mjs';
@@ -21,7 +23,7 @@ const require = createRequire(import.meta.url);
 const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../electron/app-paths.cjs');
 const { containedAsset, hasValidMagic, validateImagePayload } = require('../electron/custom-tag-assets.cjs');
 const { loadCatalog: loadRuntimeCatalog, parseGalleryPage: parseRuntimeGalleryPage, normalizeImageUrl: normalizeRuntimeImageUrl, runUpdate: runRuntimeCatalogUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('../electron/catalog-updater.cjs');
-const { compareVersions, validateManifest } = require('../electron/app-updater.cjs');
+const { compareVersions, validateManifest, readResponseJson, downloadInstaller, parseContentRange } = require('../electron/app-updater.cjs');
 
 const legacySaved = normalizeSavedLibraryItem({ id: 'legacy-one', name: 'Legacy one', prompt: '1girl, soft light', createdAt: '2024-01-01T00:00:00.000Z' });
 assert.equal(legacySaved?.kind, 'prompt');
@@ -51,6 +53,26 @@ assert.deepEqual(normalizeSavedLibrary([legacySaved, normalizedSavedPrompt, norm
 assert.equal(normalizeTheme('raspberry-rose'), 'raspberry-rose');
 assert.equal(normalizeTheme('noir'), 'noir');
 assert.equal(normalizeTheme('unsupported'), 'arcane-gold');
+assert.equal(normalizeTheme('celestial-light'), 'celestial-light');
+assert.equal(normalizeTheme('ember-peach'), 'ember-peach');
+assert.equal(normalizeTheme('gothic-ivory'), 'gothic-ivory');
+const v4SavedPrompt = normalizeSavedLibraryItem({ id: 'v4-prompt', version: 4, kind: 'prompt', source: 'manual', name: 'Independent', description: 'A complete local record', prompt: 'base positive', imageAsset: 'v4-prompt.webp', mime: 'image/webp', createdAt: '2026-08-26T00:00:00.000Z', updatedAt: '2026-08-26T00:00:00.000Z', data: { model: 'nai-diffusion-4', steps: '28', sampler: 'k_euler', width: '832', height: '1216', cfg: '5', positive: 'base positive', negative: 'base negative', characters: [{ id: 'one', label: 'Hero', positive: 'hero positive', negative: 'hero negative' }] } });
+assert.equal(v4SavedPrompt?.kind === 'prompt' ? v4SavedPrompt.data?.characters[0].negative : '', 'hero negative');
+assert.equal(v4SavedPrompt?.imageAsset, 'v4-prompt.webp');
+const artistExtractionFixture = [{ id: 'artist-v5-known', catalogId: 'artist-v5-known', tag: 'Known Artist 7', gallery: 'v5', image: 'known.webp', score: 0 }];
+const extractedMetadataArtists = extractMetadataArtists('artist: Unknown Painter::1.4, 0.8::Known Artist 7 ::, Known Artist 7', artistExtractionFixture);
+assert.equal(extractedMetadataArtists.length, 2);
+assert.equal(extractedMetadataArtists[0].tag, 'artist: Unknown Painter');
+assert.equal(extractedMetadataArtists[0].weight, 1.4);
+assert.equal(extractedMetadataArtists[1].catalogId, 'artist-v5-known');
+assert.match(serializeMetadataArtists(extractedMetadataArtists), /Known Artist 7 ::/);
+const canonicalSerializedMetadataArtists = extractMetadataArtists('1.4::artist: Known Artist 7::', artistExtractionFixture);
+assert.equal(canonicalSerializedMetadataArtists.length, 1);
+assert.equal(canonicalSerializedMetadataArtists[0].weight, 1.4);
+const canonicalUnknownMetadataArtist = extractMetadataArtists('1.4::artist: Unknown Painter::', []);
+assert.equal(canonicalUnknownMetadataArtist.length, 1);
+assert.equal(canonicalUnknownMetadataArtist[0].tag, 'artist: Unknown Painter');
+assert.equal(canonicalUnknownMetadataArtist[0].weight, 1.4);
 
 assert.equal(compareVersions('0.4.0', '0.3.9'), 1);
 assert.equal(compareVersions('0.4.0', '0.4.0'), 0);
@@ -60,6 +82,149 @@ assert.equal(validateManifest({ ...validUpdateManifest, version: '0.3.9' }, '0.4
 assert.throws(() => validateManifest({ ...validUpdateManifest, version: 'latest' }, '0.4.0'), /invalid semantic version/i);
 assert.throws(() => validateManifest({ ...validUpdateManifest, url: 'https://example.com/NAI-Prompt-Studio-V5-Setup-0.4.1.exe' }, '0.4.0'), /host is not trusted/i);
 assert.throws(() => validateManifest({ ...validUpdateManifest, sha512: 'invalid' }, '0.4.0'), /SHA-512/i);
+assert.deepEqual(parseContentRange('bytes 10-20/42'), { start: 10, end: 20, total: 42 });
+assert.equal(parseContentRange('bytes 10-/42'), null);
+
+function mockedResponse(chunks, statusCode = 200, headers = {}, complete = true) {
+  const response = Readable.from(chunks);
+  response.statusCode = statusCode;
+  response.headers = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), String(value)]));
+  response.complete = complete;
+  return response;
+}
+function updateFixture(bytes = 4096) {
+  const payload = Buffer.alloc(bytes, 73);
+  return { payload, manifest: { available: true, schemaVersion: 1, version: '0.5.6', asset: 'NAI-Prompt-Studio-V5-Setup-0.5.6.exe', url: 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.6/NAI-Prompt-Studio-V5-Setup-0.5.6.exe', size: payload.length, sha512: createHash('sha512').update(payload).digest('hex'), releaseNotes: 'Fixture' } };
+}
+const manifestStall = new Readable({ read() {} });
+manifestStall.complete = false;
+await assert.rejects(readResponseJson(manifestStall, 1024, { idleTimeoutMs: 5 }), /manifest response stalled/i);
+const manifestAbortController = new AbortController();
+const manifestAbort = new Readable({ read() {} });
+manifestAbort.complete = false;
+const manifestAbortPromise = readResponseJson(manifestAbort, 1024, { idleTimeoutMs: 1000, signal: manifestAbortController.signal });
+manifestAbortController.abort();
+await assert.rejects(manifestAbortPromise, error => error?.code === 'ABORT_ERR');
+const updateTemp = mkdtempSync(join(tmpdir(), 'nai-update-'));
+const normalFixture = updateFixture();
+const normalProgress = [];
+const normalTarget = await downloadInstaller(normalFixture.manifest, updateTemp, { requestImpl: async () => mockedResponse([normalFixture.payload]), onProgress: event => normalProgress.push(event), retryDelayMs: 0 });
+assert.equal(readFileSync(normalTarget).equals(normalFixture.payload), true);
+assert.equal(normalProgress.at(-1).phase, 'ready');
+assert.equal(normalProgress.at(-1).percent, 100);
+rmSync(normalTarget, { force: true });
+const resumeFixture = updateFixture();
+const resumePartial = join(updateTemp, resumeFixture.manifest.asset + '.partial');
+const resumeSplit = 1300;
+writeFileSync(resumePartial, resumeFixture.payload.subarray(0, resumeSplit));
+const resumeHeaders = [];
+let resumeAttempt = 0;
+await downloadInstaller(resumeFixture.manifest, updateTemp, { maxAttempts: 2, retryDelayMs: 0, requestImpl: async (_url, request) => {
+  resumeHeaders.push(request.headers?.Range || '');
+  resumeAttempt += 1;
+  if (resumeAttempt === 1) return mockedResponse([resumeFixture.payload.subarray(resumeSplit, resumeSplit + 700)], 206, { 'content-range': `bytes ${resumeSplit}-${resumeSplit + 699}/${resumeFixture.manifest.size}`, 'content-length': 700 }, false);
+  const start = Number(String(request.headers?.Range || '').match(/(\d+)/)?.[1] ?? resumeSplit);
+  return mockedResponse([resumeFixture.payload.subarray(start)], 206, { 'content-range': `bytes ${start}-${resumeFixture.manifest.size - 1}/${resumeFixture.manifest.size}`, 'content-length': resumeFixture.manifest.size - start });
+} });
+assert.deepEqual(resumeHeaders, [`bytes=${resumeSplit}-`, `bytes=${resumeSplit + 700}-`]);
+assert.equal(readFileSync(join(updateTemp, resumeFixture.manifest.asset)).equals(resumeFixture.payload), true);
+const restartFixture = updateFixture();
+restartFixture.manifest.version = '0.5.7';
+restartFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.7.exe';
+restartFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.7/NAI-Prompt-Studio-V5-Setup-0.5.7.exe';
+const restartPartial = join(updateTemp, restartFixture.manifest.asset + '.partial');
+writeFileSync(restartPartial, Buffer.alloc(200, 1));
+let restartRange = '';
+await downloadInstaller(restartFixture.manifest, updateTemp, { requestImpl: async (_url, request) => { restartRange = request.headers?.Range || ''; return mockedResponse([restartFixture.payload]); } });
+assert.equal(restartRange, 'bytes=200-');
+assert.equal(readFileSync(join(updateTemp, restartFixture.manifest.asset)).equals(restartFixture.payload), true);
+const complete416Fixture = updateFixture();
+complete416Fixture.manifest.version = '0.5.8';
+complete416Fixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.8.exe';
+complete416Fixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.8/NAI-Prompt-Studio-V5-Setup-0.5.8.exe';
+const complete416Partial = join(updateTemp, complete416Fixture.manifest.asset + '.partial');
+writeFileSync(complete416Partial, complete416Fixture.payload);
+let complete416Calls = 0;
+await downloadInstaller(complete416Fixture.manifest, updateTemp, { forceRangeRequest: true, requestImpl: async (_url, request) => { complete416Calls += 1; assert.equal(request.headers.Range, `bytes=${complete416Fixture.manifest.size}-`); return mockedResponse([], 416); } });
+assert.equal(complete416Calls, 1);
+assert.equal(readFileSync(join(updateTemp, complete416Fixture.manifest.asset)).equals(complete416Fixture.payload), true);
+const invalid416Fixture = updateFixture();
+invalid416Fixture.manifest.version = '0.5.13';
+invalid416Fixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.13.exe';
+invalid416Fixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.13/NAI-Prompt-Studio-V5-Setup-0.5.13.exe';
+const invalid416Partial = join(updateTemp, invalid416Fixture.manifest.asset + '.partial');
+writeFileSync(invalid416Partial, invalid416Fixture.payload.subarray(0, 100));
+await assert.rejects(downloadInstaller(invalid416Fixture.manifest, updateTemp, { maxAttempts: 1, requestImpl: async () => mockedResponse([], 416) }), /incomplete resume range/i);
+assert.equal(readdirSync(updateTemp).includes(invalid416Fixture.manifest.asset + '.partial'), false);
+const malformedFixture = updateFixture();
+malformedFixture.manifest.version = '0.5.9';
+malformedFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.9.exe';
+malformedFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.9/NAI-Prompt-Studio-V5-Setup-0.5.9.exe';
+const malformedPartial = join(updateTemp, malformedFixture.manifest.asset + '.partial');
+writeFileSync(malformedPartial, Buffer.alloc(200, 4));
+let malformedCalls = 0;
+await downloadInstaller(malformedFixture.manifest, updateTemp, { maxAttempts: 2, retryDelayMs: 0, requestImpl: async () => { malformedCalls += 1; return malformedCalls === 1 ? mockedResponse([Buffer.alloc(10)], 206, { 'content-range': 'bytes 999-1008/4096', 'content-length': 10 }) : mockedResponse([malformedFixture.payload]); } });
+assert.equal(malformedCalls, 2);
+assert.equal(readFileSync(join(updateTemp, malformedFixture.manifest.asset)).equals(malformedFixture.payload), true);
+const timeoutFixture = updateFixture();
+timeoutFixture.manifest.version = '0.5.11';
+timeoutFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.11.exe';
+timeoutFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.11/NAI-Prompt-Studio-V5-Setup-0.5.11.exe';
+await assert.rejects(downloadInstaller(timeoutFixture.manifest, updateTemp, { maxAttempts: 1, idleTimeoutMs: 5, requestImpl: async () => {
+  const response = new Readable({ read() {} }); response.statusCode = 200; response.headers = {}; response.complete = false; return response;
+} }), /stalled|premature/i);
+const cancelFixture = updateFixture();
+cancelFixture.manifest.version = '0.5.12';
+cancelFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.12.exe';
+cancelFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.12/NAI-Prompt-Studio-V5-Setup-0.5.12.exe';
+const updateCancelController = new AbortController();
+const updateCancelStream = new Readable({ read() { if (!this.sent) { this.sent = true; this.push(cancelFixture.payload.subarray(0, 500)); } } });
+updateCancelStream.statusCode = 200; updateCancelStream.headers = {}; updateCancelStream.complete = false;
+await assert.rejects(downloadInstaller(cancelFixture.manifest, updateTemp, { signal: updateCancelController.signal, maxAttempts: 1, idleTimeoutMs: 1000, requestImpl: async () => updateCancelStream, onProgress: event => { if (event.phase === 'downloading' && event.completed > 0) updateCancelController.abort(); } }), error => error?.code === 'ABORT_ERR');
+assert.equal(readFileSync(join(updateTemp, cancelFixture.manifest.asset + '.partial')).length, 500);
+const mismatchFixture = updateFixture();
+ mismatchFixture.manifest.version = '0.5.10';
+ mismatchFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.10.exe';
+ mismatchFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.10/NAI-Prompt-Studio-V5-Setup-0.5.10.exe';
+await assert.rejects(downloadInstaller({ ...mismatchFixture.manifest, sha512: 'f'.repeat(128) }, updateTemp, { maxAttempts: 1, requestImpl: async () => mockedResponse([mismatchFixture.payload]) }), /size or SHA-512/i);
+assert.equal(readdirSync(updateTemp).includes(mismatchFixture.manifest.asset + '.partial'), false);
+const fullMismatchFixture = updateFixture();
+fullMismatchFixture.manifest.version = '0.5.18';
+fullMismatchFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.18.exe';
+fullMismatchFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.18/NAI-Prompt-Studio-V5-Setup-0.5.18.exe';
+writeFileSync(join(updateTemp, fullMismatchFixture.manifest.asset + '.partial'), Buffer.alloc(fullMismatchFixture.manifest.size, 1));
+let fullMismatchRange = 'unset';
+await downloadInstaller(fullMismatchFixture.manifest, updateTemp, { maxAttempts: 1, requestImpl: async (_url, request) => { fullMismatchRange = request.headers?.Range || ''; return mockedResponse([fullMismatchFixture.payload]); } });
+assert.equal(fullMismatchRange, '');
+const oversizeFixture = updateFixture();
+oversizeFixture.manifest.version = '0.5.14';
+oversizeFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.14.exe';
+oversizeFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.14/NAI-Prompt-Studio-V5-Setup-0.5.14.exe';
+await assert.rejects(downloadInstaller(oversizeFixture.manifest, updateTemp, { maxAttempts: 1, requestImpl: async () => mockedResponse([Buffer.concat([oversizeFixture.payload, Buffer.from([1])])]) }), /exceeded the manifest size/i);
+assert.equal(readdirSync(updateTemp).includes(oversizeFixture.manifest.asset + '.partial'), false);
+const shortFixture = updateFixture();
+shortFixture.manifest.version = '0.5.15';
+shortFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.15.exe';
+shortFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.15/NAI-Prompt-Studio-V5-Setup-0.5.15.exe';
+await assert.rejects(downloadInstaller(shortFixture.manifest, updateTemp, { maxAttempts: 1, requestImpl: async () => mockedResponse([shortFixture.payload.subarray(0, 200)]) }), /ended before the manifest size/i);
+assert.equal(readFileSync(join(updateTemp, shortFixture.manifest.asset + '.partial')).length, 200);
+rmSync(join(updateTemp, shortFixture.manifest.asset + '.partial'), { force: true });
+const prematureFixture = updateFixture();
+prematureFixture.manifest.version = '0.5.16';
+prematureFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.16.exe';
+prematureFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.16/NAI-Prompt-Studio-V5-Setup-0.5.16.exe';
+await assert.rejects(downloadInstaller(prematureFixture.manifest, updateTemp, { maxAttempts: 1, requestImpl: async () => mockedResponse([prematureFixture.payload.subarray(0, 200)], 200, {}, false) }), /prematurely/i);
+assert.equal(readFileSync(join(updateTemp, prematureFixture.manifest.asset + '.partial')).length, 200);
+rmSync(join(updateTemp, prematureFixture.manifest.asset + '.partial'), { force: true });
+const reuseFixture = updateFixture();
+reuseFixture.manifest.version = '0.5.17';
+reuseFixture.manifest.asset = 'NAI-Prompt-Studio-V5-Setup-0.5.17.exe';
+reuseFixture.manifest.url = 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.5.17/NAI-Prompt-Studio-V5-Setup-0.5.17.exe';
+const reuseTarget = await downloadInstaller(reuseFixture.manifest, updateTemp, { requestImpl: async () => mockedResponse([reuseFixture.payload]) });
+const reuseProgress = [];
+assert.equal(await downloadInstaller(reuseFixture.manifest, updateTemp, { requestImpl: async () => { throw new Error('verified target should be reused'); }, onProgress: event => reuseProgress.push(event) }), reuseTarget);
+assert.equal(reuseProgress.at(-1).message, 'Verified update already downloaded.');
+rmSync(updateTemp, { recursive: true, force: true });
 
 let loaderActive = 0;
 let loaderPeak = 0;
@@ -508,7 +673,11 @@ const singleOrbit = mixOrbitLayout(5);
 assert.equal(singleOrbit.ringCount, 2);
 assert.equal(singleOrbit.placements.length, 5);
 assert.equal(new Set(singleOrbit.placements.map(item => `${item.x}:${item.y}`)).size, 5);
-assert.equal(singleOrbit.placements.every(item => item.x >= 5 && item.x <= 95 && (item.y === 24 || item.y === 76)), true);
+assert.equal(singleOrbit.placements.some(item => item.y < 50) && singleOrbit.placements.some(item => item.y > 50), true);
+for (const placement of singleOrbit.placements) {
+  assert.ok(placement.box.left >= 0 && placement.box.top >= 0);
+  assert.ok(placement.box.left + placement.box.width <= 1100 && placement.box.top + placement.box.height <= singleOrbit.height);
+}
 const multiOrbit = mixOrbitLayout(13);
 assert.equal(multiOrbit.ringCount, 2);
 assert.equal(multiOrbit.placements.length, 11);
@@ -522,17 +691,10 @@ assert.equal(new Set(multiOrbit.placements.map(item => `${item.x}:${item.y}`)).s
 for (const anchorCount of [1, 2, 3, 4]) {
   for (const companionCount of [2, 5, 8, 12]) {
     const layout = mixOrbitLayout(companionCount, anchorCount);
-    assert.equal(layout.placements.every(item => item.y === 24 || item.y === 76), true);
+    assert.equal(layout.placements.every(item => item.row === (item.y < 50 ? 'top' : 'bottom')), true);
     assert.equal(new Set(layout.placements.map(item => `${item.x}:${item.y}`)).size, layout.placements.length);
-    for (const row of ['top', 'bottom']) {
-      const xs = layout.placements.filter(item => item.row === row).map(item => item.x).sort((a, b) => a - b);
-      for (let index = 1; index < xs.length; index += 1) assert.ok(xs[index] - xs[index - 1] >= 11.25);
-    }
-    for (const orbitWidth of [896, 1320]) {
-      const companionWidth = Math.min(108, Math.max(88, orbitWidth === 896 ? 980 * 0.09 : 1404 * 0.09));
-      const anchorWidth = anchorCount === 1 ? (orbitWidth === 896 ? 150 : 160) : anchorCount * (orbitWidth === 896 ? 100 : 120) + (anchorCount - 1) * 4;
-      for (const placement of layout.placements) assert.ok(Math.abs(placement.x - 50) / 100 * orbitWidth > anchorWidth / 2 + companionWidth / 2);
-    }
+    assert.equal(layout.placements.every(item => item.box.left >= 0 && item.box.top >= 0 && item.box.left + item.box.width <= 1100 && item.box.top + item.box.height <= layout.height), true);
+    if (layout.placements.length >= 3) assert.equal(layout.placements.some(item => item.y < 50) && layout.placements.some(item => item.y > 50), true);
   }
 }
 
@@ -777,14 +939,15 @@ assert.equal(mixOrbitLayout(13, 4).placements.length, 8);
 const threeAnchorNine = mixOrbitLayout(9, 3);
 assert.equal(threeAnchorNine.placements.length, 9);
 assert.equal(new Set(threeAnchorNine.placements.map(item => `${item.x}:${item.y}`)).size, 9);
-assert.equal(mixOrbitLayout(13, 4).placements.every(item => item.x >= 5 && item.x <= 95 && (item.y === 24 || item.y === 76)), true);
+assert.equal(mixOrbitLayout(13, 4).placements.every(item => item.box.left >= 0 && item.box.top >= 0 && item.box.left + item.box.width <= 1100 && item.box.top + item.box.height <= mixOrbitLayout(13, 4).height), true);
 assert.equal(mixOrbitLayout(13, 4).placements.every(item => !('duration' in item) && !('direction' in item) && !('delay' in item)), true);
 const mixCardSource = uiSource.match(/function mixArtistCardMarkup\([\s\S]*?\n\}/)?.[0] ?? '';
 assert.doesNotMatch(mixCardSource, /<code/);
 assert.match(styleSource, /R3 artist mix geometry/);
 assert.match(styleSource, /@media \(min-width: 901px\)[\s\S]*?\.mix-orbit \{ min-height: 0; \}/);
 assert.match(styleSource, /\.mix-orbit-primary \{ max-width: min\(52%, 560px\); \}/);
-assert.match(styleSource, /@media \(max-width: 900px\)[\s\S]*?\.mix-orbit-primary \{ width: 100%; max-width: none; \}/);
+assert.doesNotMatch(styleSource, /@media \(max-width: 900px\)[\s\S]*?\.mix-orbit \{ display: grid;/);
+assert.doesNotMatch(styleSource, /\.mix-orbit\[data-layout-ready="false"\] \.mix-orbit-slot \{ visibility: hidden; \}/);
 assert.match(styleSource, /\.mix-anchor-group \{ flex-wrap: wrap; gap: 4px; max-width: 100%;/);
 assert.match(uiSource, /requestAnimationFrame\(\(\) => \{[\s\S]*?requestAnimationFrame\(\(\) => \{/);
 assert.match(uiSource, /new ResizeObserver\(\(\) => scheduleMixOrbitThreads\(\)\)/);
@@ -931,8 +1094,7 @@ assert.match(uiSource, /mix-artist-next/);
 assert.match(uiSource, /mixOrbitMarkup/);
 assert.doesNotMatch(uiSource, /<svg[^>]*mix-orbit/);
 assert.match(uiSource, /class="mix-orbit-carrier"><div class="mix-orbit-connector"/);
-assert.match(uiSource, /data-orbit-x/);
-assert.match(uiSource, /data-orbit-y/);
+assert.match(uiSource, /slot\.dataset\.orbitRow = placement\.row/);
 assert.match(uiSource, /--mix-weight-scale/);
 assert.match(uiSource, /--orbit-x/);
 assert.match(uiSource, /--orbit-y/);
@@ -1008,9 +1170,35 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.5.0');
+assert.equal(packageSource.version, '0.6.0');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
+assert.match(uiSource, /const APP_VERSION = '0\.6\.0'/);
+assert.match(uiSource, /type AppUpdatePhase = 'idle' \| 'checking' \| 'available' \| 'downloading' \| 'paused' \| 'verifying' \| 'ready' \| 'installing' \| 'up-to-date' \| 'error'/);
+assert.match(uiSource, /role="progressbar"/);
+assert.match(uiSource, /Download update/);
+assert.match(uiSource, /Resume download/);
+assert.match(uiSource, /Cancel download/);
+assert.match(uiSource, /Install now/);
+assert.match(uiSource, /bindAppUpdateProgress/);
+assert.match(uiSource, /appUpdatePhase === 'downloading' \|\| appUpdatePhase === 'verifying' \|\| appUpdatePhase === 'installing'/);
+assert.match(uiSource, /Download \$\{progress\.percent\}% complete, .* of .*\./);
+assert.match(uiSource, /if \(!window\.naiUpdater \|\| appUpdatePhase === 'downloading'/);
+assert.doesNotMatch(uiSource, /settingsWorkspaceLegacy/);
+assert.match(uiSource, /function settingsWorkspace\(\): string \{[\s\S]*?appUpdateMarkup\(browserOnly\)/);
+for (const updateControlId of ['check-app-update', 'download-app-update', 'resume-app-update', 'cancel-app-update', 'install-app-update', 'download-missing-v5', 'cancel-v5-update']) {
+  assert.equal((uiSource.match(new RegExp(`id="${updateControlId}"`, 'g')) ?? []).length, 1);
+}
+assert.doesNotMatch(uiSource, /downloadAndInstall/);
+assert.doesNotMatch(electronSource, /app-update:download-install/);
+assert.doesNotMatch(electronSource, /showMessageBox/);
+assert.match(electronSource, /app-update:progress/);
+assert.match(electronSource, /app-update:cancel/);
+assert.match(electronSource, /app-update:install/);
+assert.match(preloadSource, /download: manifest/);
+assert.match(preloadSource, /onProgress/);
+assert.doesNotMatch(preloadSource, /downloadAndInstall/);
+assert.match(electronSource, /app-update:progress/);
 assert.match(packageSource.scripts['desktop:build'], /run-local\.mjs node tools\/build-desktop\.mjs/);
 assert.match(packageSource.scripts.build, /run-local\.mjs/);
 assert.match(packageSource.scripts.test, /run-local\.mjs/);
@@ -1121,4 +1309,143 @@ writeFileSync(blockedTarget, 'file');
 assert.throws(() => ensureWritable(resolveAppPaths({ isPackaged: false, workspaceDir: blockedTarget, executablePath: 'C:/Prompt Studio.exe' })), /cannot write its profile/i);
 rmSync(pathTemp, { recursive: true, force: true });
 rmSync(temp, { recursive: true, force: true });
+
+// V0.6 source contracts: autonomous library records, metadata-only extraction,
+// theme chooser, monotonic startup percent, collision solver, installer policy.
+assert.match(typesSource, /version\?: 4;[\s\S]*source\?: 'manual'/);
+assert.match(storageSource, /normalizeSavedPromptData/);
+assert.match(uiSource, /openLibrarySaveModal\('prompt', 'manual'\)/);
+assert.match(uiSource, /openLibrarySaveModal\('artist-mix', 'manual'\)/);
+assert.doesNotMatch(uiSource, /data-restore-library|>Restore</);
+assert.doesNotMatch(uiSource, /Saved sets/);
+assert.match(uiSource, /id="save-prompt-library"/);
+assert.match(uiSource, /id="copy-prompt"[\s\S]*?id="save-prompt-library"/);
+assert.match(metadataWorkspaceSource, /getSavePayload\(\): MetadataSavePayload \| null/);
+assert.match(metadataWorkspaceSource, /Add to Saved Library/);
+assert.match(metadataWorkspaceSource, /Save Artist Mix/);
+assert.match(metadataWorkspaceSource, /extractMetadataArtists\(this\.result\.base\.positive/);
+assert.doesNotMatch(metadataWorkspaceSource.match(/getSavePayload\(\)[\s\S]*?\n  \}/)?.[0] ?? '', /sourceObjectUrl/);
+assert.match(uiSource, /celestial-light[\s\S]*ember-peach[\s\S]*id: 'gothic-ivory', label: 'Gothic'/);
+assert.doesNotMatch(uiSource, /Gothic Ivory/);
+assert.match(indexSource, /celestial-light','ember-peach','gothic-ivory/);
+assert.match(indexSource, /name="theme-color" content="#000000"/);
+assert.match(electronSource, /backgroundColor: '#000000'/);
+assert.match(uiSource, /v060-themes/);
+assert.match(styleSource, /\[data-theme="celestial-light"\][\s\S]*color-scheme: light/);
+assert.match(styleSource, /\[data-theme="ember-peach"\]/);
+const gothicThemeTokens = styleSource.match(/\[data-theme="gothic-ivory"\]\s*\{([^}]*)\}/)?.[1] ?? '';
+assert.ok(gothicThemeTokens, 'Gothic theme token block is present');
+for (const token of ['--bg-deep: #000', '--panel: #151515', '--panel-raised: #222', '--accent: #fff', '--accent-bright: #fff', '--accent-rgb: 255 255 255', '--accent-bright-rgb: 255 255 255']) assert.match(gothicThemeTokens, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+assert.match(styleSource, /\[data-theme-swatch="gothic-ivory"\]\s*\{\s*background: #fff/);
+assert.match(styleSource, /\[data-theme="gothic-ivory"\] \.startup-shell \{ background: #000; \}/);
+assert.match(styleSource, /\[data-theme="gothic-ivory"\] \.startup-panel \{ background: var\(--panel\); \}/);
+assert.match(uiSource, /aria-valuemax="100" aria-valuenow="\$\{progress\}"/);
+assert.doesNotMatch(uiSource.match(/async function preloadCards[\s\S]*?\n\}/)?.[0] ?? '', /startupCompleted = 0/);
+const boundedOrbit = mixOrbitLayout(9, 3, { width: 1180, height: 450, companionWidth: 124, companionHeight: 156, anchorWidth: 360, anchorHeight: 208 });
+assert.equal(boundedOrbit.placements.length, 9);
+for (let left = 0; left < boundedOrbit.placements.length; left += 1) for (let right = left + 1; right < boundedOrbit.placements.length; right += 1) {
+  const a = boundedOrbit.placements[left].box; const b = boundedOrbit.placements[right].box;
+  assert.equal(a.left + a.width <= b.left || b.left + b.width <= a.left || a.top + a.height <= b.top || b.top + b.height <= a.top, true);
+}
+const screenshotOrbit = mixOrbitLayout(3, 1, { width: 1180, height: 450, companionWidth: 164, companionHeight: 198, anchorWidth: 160, anchorHeight: 286 });
+assert.equal(screenshotOrbit.density, 'regular');
+assert.equal(new Set(screenshotOrbit.placements.map(item => `${item.x < 50 ? 'left' : 'right'}:${item.y < 50 ? 'top' : 'bottom'}`)).size, 3);
+// Measured layouts must retain every companion at the supported minimum and
+// wide desktop widths, while keeping companion cards contained and disjoint.
+for (const width of [720, 784, 896, 1024, 1400]) {
+  const orbitWidth = width - 32;
+  for (const height of [360, 390, 420, 450]) for (const anchorCount of [1, 2, 3, 4]) {
+    const companionCount = mixCompanionCapacity(anchorCount);
+    const anchorWidth = anchorCount === 1 ? 160 : Math.min(560, anchorCount * 96 + (anchorCount - 1) * 4);
+    const measured = mixOrbitLayout(companionCount, anchorCount, { width: orbitWidth, height, companionWidth: Math.min(140, Math.max(120, width * 0.12)), companionHeight: 156, anchorWidth, anchorHeight: anchorCount === 1 ? 286 : 190 });
+    assert.equal(measured.placements.length, companionCount);
+    assert.equal(measured.height, height);
+    assert.ok(measured.companionWidth >= 88);
+    const anchor = { left: (orbitWidth - anchorWidth) / 2, top: (measured.height - (anchorCount === 1 ? 286 : 190)) / 2, width: anchorWidth, height: anchorCount === 1 ? 286 : 190 };
+    for (let index = 0; index < measured.placements.length; index += 1) {
+      const box = measured.placements[index].box;
+      assert.ok(box.left >= 0 && box.top >= 0 && box.left + box.width <= orbitWidth && box.top + box.height <= measured.height);
+      assert.equal(box.left >= anchor.left + anchor.width || anchor.left >= box.left + box.width || box.top >= anchor.top + anchor.height || anchor.top >= box.top + box.height, true);
+      for (let other = index + 1; other < measured.placements.length; other += 1) {
+        const peer = measured.placements[other].box;
+        assert.equal(box.left + box.width <= peer.left || peer.left + peer.width <= box.left || box.top + box.height <= peer.top || peer.top + peer.height <= box.top, true);
+      }
+    }
+  }
+}
+// A compact multi-anchor reflow is measured again after CSS collapses the
+// anchor cards to their horizontal 64px form; even the shortest supported
+// orbit must then expose every companion.
+const compactSecondPass = mixOrbitLayout(9, 3, { width: 600, height: 300, companionWidth: 164, companionHeight: 198, anchorWidth: 296, anchorHeight: 64 });
+assert.equal(compactSecondPass.density, 'compact');
+assert.equal(compactSecondPass.placements.length, 9);
+assert.doesNotMatch(styleSource, /\.mix-stage \{[^}]*overflow: visible/);
+assert.match(uiSource, /data-layout-ready="true"/);
+assert.doesNotMatch(styleSource, /\.mix-orbit\[data-layout-ready="false"\] \.mix-orbit-slot \{ visibility: hidden; \}/);
+assert.match(uiSource, /data-remove-library-character="\$\{escapeHtml\(character\.id\)\}"/);
+assert.match(uiSource, /function removeLibraryCharacter\(characterId: string\)[\s\S]*?captureLibraryFormDraft\(\)[\s\S]*?filter\(character => character\.id !== characterId\)[\s\S]*?focus\(\{ preventScroll: true \}\)/);
+assert.match(styleSource, /\.saved-library-character-remove \{[^}]*border-radius: 50%/);
+assert.match(styleSource, /\.saved-library-character-remove:hover, \.saved-library-character-remove:focus-visible \{[^}]*background: var\(--danger\)/);
+assert.match(styleSource, /\.saved-library-form-scroll \{[^}]*padding: 4px 10px 8px 6px;[^}]*scrollbar-gutter: stable/);
+assert.match(styleSource, /\.saved-library-character-add \{[^}]*justify-self: start;[^}]*border-radius: 999px/);
+assert.match(metadataWorkspaceSource, /patchPolarityBlock\(button\.closest<HTMLElement>/);
+assert.doesNotMatch(metadataWorkspaceSource.match(/\[data-metadata-polarity\][\s\S]*?\}\)\);/)?.[0] ?? '', /refresh\(\)/);
+assert.match(metadataWorkspaceSource, /cachedSavePayload/);
+assert.match(uiSource, /activeWorkspace === 'metadata' \? `<section[\s\S]*?metadataWorkspace\.markup\(\)/);
+assert.doesNotMatch(uiSource, /const metadataMarkup =/);
+assert.doesNotMatch(uiSource, /data-copy-library-card/);
+assert.match(uiSource, /data-library-copy=/);
+assert.match(uiSource, /\.\.\.libraryFormPrompt, characters:/);
+assert.doesNotMatch(uiSource.match(/const promptFields = kind === 'prompt'[\s\S]*?;\n/)?.[0] ?? '', /saved-library-model|saved-library-steps|saved-library-sampler|saved-library-width|saved-library-height|saved-library-cfg/);
+assert.match(previewSource, /data-library-preview-image/);
+assert.match(styleSource, /\.saved-library-card \{[^}]*grid-template-columns: 124px minmax\(0, 1fr\)/);
+assert.match(styleSource, /@media \(max-width: 900px\)[\s\S]*?\.saved-library-card \{ grid-template-columns: 110px minmax\(0, 1fr\)/);
+assert.match(uiSource, /const generationMarkup = generationValues\.length \?/);
+assert.doesNotMatch(uiSource.match(/function savedLibraryCardMarkup[\s\S]*?\n\}/)?.[0] ?? '', /\|\| 'Unavailable'/);
+assert.match(uiSource, /<div class="mix-actions">[\s\S]*?\$\{status\}<\/section><section class="mix-stage"/);
+assert.match(styleSource, /\.mix-random-settings > \.random-notice \{[^}]*grid-column: 1 \/ -1/);
+assert.match(uiSource, /button\?\.classList\.contains\('library-copy-icon'\)[\s\S]*?button\.dataset\.copied = 'true'/);
+assert.match(uiSource, /tabindex="0" role="img" aria-label="Preview cover for/);
+assert.match(nsisIncludeSource, /Preserve local settings, storage, downloads and custom cards/);
+assert.match(nsisIncludeSource, /NSD_CreateCheckbox[\s\S]*?Create Start Menu shortcut[\s\S]*?NSD_CreateCheckbox[\s\S]*?Create Desktop shortcut/);
+assert.match(nsisIncludeSource, /installer-options\.ini/);
+assert.match(nsisIncludeSource, /NAI Prompt Studio\.exe/);
+assert.match(nsisIncludeSource, /Get-CimInstance Win32_Process/);
+assert.match(nsisIncludeSource, /SetOutPath "\$INSTDIR\\\.nai-uninstaller-cache"/);
+assert.doesNotMatch(nsisIncludeSource, /SetOutPath "\$INSTDIR\\data\\temp\\installer"/);
+assert.match(installerLauncherSource, /Path\.Combine\(launcherDirectory, "\.nai-uninstaller-cache"\)/);
+assert.doesNotMatch(installerLauncherSource, /Directory\.GetParent\(fullCache\)\?\.FullName/);
+assert.match(installerLauncherSource, /DirectoryInfo installParent = Directory\.GetParent\(fullCache\);[\s\S]*?installParent == null \? null : installParent\.FullName/);
+assert.doesNotMatch(installerLauncherSource, /Path\.Combine\(launcherDirectory, "data", "temp", "installer"\)/);
+assert.match(nsisIncludeSource, /\$\{isUpdated\}/);
+const closeExactStudioProcessSource = nsisIncludeSource.match(/!macro CloseExactStudioProcessBody[\s\S]*?!macroend/)?.[0] ?? '';
+assert.match(closeExactStudioProcessSource, /\$\$target=.*?\$\$self=.*?\$\$p=/);
+assert.doesNotMatch(closeExactStudioProcessSource, /(?<!\$)\$(?:target|self|p|closed|x|q|_)(?!\$)/);
+assert.match(nsisIncludeSource, /!macro customCheckAppRunning[\s\S]*?!ifdef BUILD_UNINSTALLER[\s\S]*?Call un\.CloseExactStudioProcess[\s\S]*?!else[\s\S]*?Call CloseExactStudioProcess/);
+assert.match(nsisIncludeSource, /Function CloseExactStudioProcess[\s\S]*?!insertmacro CloseExactStudioProcessBody[\s\S]*?FunctionEnd/);
+assert.match(nsisIncludeSource, /Function un\.CloseExactStudioProcess[\s\S]*?!insertmacro CloseExactStudioProcessBody[\s\S]*?FunctionEnd/);
+assert.match(nsisIncludeSource, /!ifndef BUILD_UNINSTALLER\s+Function LoadNAIShortcutPolicy[\s\S]*?Function NAIShortcutOptionsLeave[\s\S]*?FunctionEnd\s+!endif/);
+assert.match(nsisIncludeSource, /!ifdef BUILD_UNINSTALLER\s+!macro customUnWelcomePage[\s\S]*?Function un\.NAIPreserveDataLeave[\s\S]*?FunctionEnd\s+!endif/);
+assert.match(nsisIncludeSource, /!ifdef BUILD_UNINSTALLER\s+Var NAIPreserveData\s+Var NAIPreserveDataCheckbox\s+!else\s+Var NAIStartMenuShortcut[\s\S]*?Var NAIShortcutPolicyDirectory\s+!endif/);
+const customInstallSource = nsisIncludeSource.match(/!macro customInstall[\s\S]*?!macroend/)?.[0] ?? '';
+assert.doesNotMatch(customInstallSource, /ReadINIStr[\s\S]*installer-options\.ini/);
+// The assisted template inserts customUninstallPage after MUI_UNPAGE_INSTFILES;
+// data-retention choices therefore must be collected by the pre-action welcome hook.
+assert.match(nsisIncludeSource, /!macro customUnWelcomePage[\s\S]*?NSD_CreateCheckbox/);
+assert.match(nsisIncludeSource, /!macro customUnWelcomePage\s+UninstPage custom un\.NAIPreserveDataPage un\.NAIPreserveDataLeave\s+!macroend/);
+assert.doesNotMatch(nsisIncludeSource.match(/!macro customUnInstall[\s\S]*?!macroend/)?.[0] ?? '', /MessageBox MB_YESNO/);
+const preserveDataPageSource = nsisIncludeSource.match(/Function un\.NAIPreserveDataPage[\s\S]*?FunctionEnd/)?.[0] ?? '';
+assert.doesNotMatch(preserveDataPageSource, /\$\{isUpdated\}/);
+assert.match(preserveDataPageSource, /\$\{GetParameters\}[\s\S]*?\$\{GetOptions\}[\s\S]*?"--updated"[\s\S]*?\$\{IfNot\} \$\{Errors\}/);
+const customHeaderSource = nsisIncludeSource.match(/!macro customHeader[\s\S]*?!macroend/)?.[0] ?? '';
+assert.doesNotMatch(customHeaderSource, /!macro customCheckAppRunning/);
+assert.match(nsisIncludeSource, /!include "LogicLib\.nsh"[\s\S]*?!include "FileFunc\.nsh"[\s\S]*?!include "nsDialogs\.nsh"[\s\S]*?!macro customHeader/);
+assert.equal(packageSource.build.nsis.runAfterFinish, true);
+assert.equal(packageSource.build.nsis.createStartMenuShortcut, true);
+assert.equal(packageSource.build.nsis.createDesktopShortcut, false);
+assert.match(electronSource, /APP_USER_MODEL_ID/);
+assert.match(electronSource, /app\.setAppUserModelId\(APP_USER_MODEL_ID\)/);
+assert.match(electronSource, /APP_ICON/);
+assert.match(installerLauncherSource, /CanonicalApplicationExecutable/);
+assert.match(installerLauncherSource, /NAISETUPV0600000/);
 console.log(`Tests passed: page discovery, atomic replacement/failure recovery, WebP validation, prompt serialization, migration, random uniqueness, and exact catalog assets (${catalog.artists.length} V5 artists / ${catalog.characters.length} characters).`);

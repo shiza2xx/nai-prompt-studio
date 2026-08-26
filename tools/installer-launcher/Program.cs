@@ -9,8 +9,10 @@ using System.Text;
 internal static class Program
 {
     private const string Product = "NAI Prompt Studio";
+    // Must stay aligned with the Electron executable, taskbar identity and NSIS shortcuts.
+    private const string CanonicalApplicationExecutable = "NAI Prompt Studio.exe";
     private const int FooterSize = 96;
-    private const string FooterMagic = "NAISETUPV0400000";
+    private const string FooterMagic = "NAISETUPV0600000";
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int MessageBoxW(IntPtr window, string text, string caption, uint type);
@@ -187,7 +189,7 @@ internal static class Program
     {
         string systemRoot = NormalizeRoot(Path.GetPathRoot(Environment.SystemDirectory));
         if (installedUninstaller)
-            return ValidateCacheBase(Path.Combine(launcherDirectory, "data", "temp", "installer"), systemRoot);
+            return ValidateCacheBase(Path.Combine(launcherDirectory, ".nai-uninstaller-cache"), systemRoot);
         string requested = Environment.GetEnvironmentVariable("NAI_INSTALLER_TEMP_ROOT");
         if (!string.IsNullOrWhiteSpace(requested))
             return ValidateCacheBase(Path.GetFullPath(requested), systemRoot);
@@ -264,6 +266,11 @@ internal static class Program
             string fullBase = Path.GetFullPath(cacheBase).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             if (!fullSession.StartsWith(fullBase, StringComparison.OrdinalIgnoreCase)) return;
             if (!Path.GetFileName(fullSession).StartsWith("session-", StringComparison.Ordinal)) return;
+            string fullCache = Path.GetFullPath(cacheBase);
+            if (!string.Equals(Path.GetFileName(fullCache), ".nai-uninstaller-cache", StringComparison.OrdinalIgnoreCase)) return;
+            DirectoryInfo installParent = Directory.GetParent(fullCache);
+            string installDirectory = installParent == null ? null : installParent.FullName;
+            if (string.IsNullOrEmpty(installDirectory)) return;
             string commandInterpreter = Environment.GetEnvironmentVariable("ComSpec");
             if (string.IsNullOrWhiteSpace(commandInterpreter)) commandInterpreter = Path.Combine(Environment.SystemDirectory, "cmd.exe");
             string cleanupScript = Path.Combine(Path.GetFullPath(cacheBase), "cleanup-" + Guid.NewGuid().ToString("N") + ".cmd");
@@ -271,6 +278,7 @@ internal static class Program
                 "@echo off\r\n" +
                 "ping 127.0.0.1 -n 3 >nul\r\n" +
                 "rmdir /s /q \"" + fullSession.Replace("\"", string.Empty) + "\"\r\n" +
+                "start \"\" /b cmd /d /s /c \"ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"\"" + fullCache.Replace("\"", string.Empty) + "\"\" & rmdir \"\"" + installDirectory.Replace("\"", string.Empty) + "\"\"\"\r\n" +
                 "del /f /q \"%~f0\"\r\n",
                 Encoding.ASCII);
             var cleanup = new ProcessStartInfo(commandInterpreter)

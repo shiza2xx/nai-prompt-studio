@@ -1,4 +1,4 @@
-const PREVIEW_SELECTOR = '[data-artist-preview-image], [data-artist-preview-message], [data-constructor-preview-tag]';
+const PREVIEW_SELECTOR = '[data-artist-preview-image], [data-artist-preview-message], [data-constructor-preview-tag], [data-library-preview-image]';
 
 let previewHost: HTMLElement | null = null;
 let activeTarget: HTMLElement | null = null;
@@ -56,9 +56,10 @@ function showPreview(target: HTMLElement, byPointer: boolean): void {
   if (!previewImage || !tag || !prompt || !description) return;
   const kind = target.dataset.artistPreviewKind === 'message' ? 'message' : 'known';
   const constructor = target.hasAttribute('data-constructor-preview-tag');
-  const imageSource = constructor ? target.dataset.constructorPreviewImage : target.dataset.artistPreviewImage;
-  const displayTag = constructor ? target.dataset.constructorPreviewTag : target.dataset.artistPreviewTag;
-  const displayDescription = constructor ? target.dataset.constructorPreviewDescription : '';
+  const library = target.hasAttribute('data-library-preview-image');
+  const imageSource = constructor ? target.dataset.constructorPreviewImage : library ? target.dataset.libraryPreviewImage : target.dataset.artistPreviewImage;
+  const displayTag = constructor ? target.dataset.constructorPreviewTag : library ? target.dataset.libraryPreviewTag : target.dataset.artistPreviewTag;
+  const displayDescription = constructor ? target.dataset.constructorPreviewDescription : library ? target.dataset.libraryPreviewDescription : '';
   previewImage.removeAttribute('src');
   previewImage.alt = '';
   tag.textContent = displayTag ?? '';
@@ -72,7 +73,7 @@ function showPreview(target: HTMLElement, byPointer: boolean): void {
   } else {
     previewImage.src = imageSource ?? '';
     previewImage.alt = displayTag ?? '';
-    prompt.textContent = constructor ? 'Prompt builder tag' : target.dataset.artistPreviewPrompt ?? '';
+    prompt.textContent = constructor ? 'Prompt builder tag' : library ? target.dataset.libraryPreviewPrompt ?? '' : target.dataset.artistPreviewPrompt ?? '';
   }
   updatePosition(target, host);
   host.setAttribute('aria-hidden', 'false');

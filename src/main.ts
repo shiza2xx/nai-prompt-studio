@@ -4,20 +4,21 @@ import { bindArtistCardPreview, clearArtistCardPreview } from './artist-card-pre
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from './artist-catalog';
 import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from './artist-mix-layout';
 import { paginateArtists, paginateCharacters } from './catalog-browser';
-import { MetadataWorkspace } from './metadata-workspace';
+import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } from './metadata-workspace';
 import { decodePreviews } from './preview-loader';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
 import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
 import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorZone } from './prompt-constructor';
 import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
-import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, SavedLibraryItem, SavedPromptSnapshot, WeightedTag } from './types';
+import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptSnapshot, WeightedTag } from './types';
+import type { UpdateManifest, UpdateProgress } from './global';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
 type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 'saved-library' | null;
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.6.0';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -73,7 +74,12 @@ let catalogUpdateUnsubscribe: (() => void) | null = null;
 let catalogUpdateBusy = false;
 let catalogUpdateStatus = '';
 let catalogUpdateError = '';
-let appUpdateStatus = '';
+type AppUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'paused' | 'verifying' | 'ready' | 'installing' | 'up-to-date' | 'error';
+let appUpdatePhase: AppUpdatePhase = 'idle';
+let appUpdateManifest: UpdateManifest | null = null;
+let appUpdateProgress: UpdateProgress = { phase: 'starting', completed: 0, total: 0, percent: 0, attempt: 0 };
+let appUpdateMessage = '';
+let appUpdateUnsubscribe: (() => void) | null = null;
 let onboardingOpen = false;
 let onboardingSteps: Array<{ id: string; title: string; copy: string }> = [];
 let onboardingIndex = 0;
@@ -101,15 +107,22 @@ const customImageUrls = new Map<string, string>();
 const savedLibraryImageUrls = new Map<string, string>();
 let savedLibrarySearch = '';
 let savedLibraryFilter: 'all' | 'prompt' | 'artist-mix' = 'all';
-let libraryModalMode: 'save-prompt' | 'save-mix' | 'edit' | 'restore' | 'delete' | null = null;
+let libraryModalMode: 'save-prompt' | 'save-mix' | 'edit' | 'delete' | null = null;
 let libraryModalItemId: string | null = null;
 let libraryCoverBytes: Uint8Array | null = null;
 let libraryCoverMime: SavedLibraryItem['mime'] = undefined;
 let libraryCoverName = '';
 let libraryCoverError = '';
 let libraryCoverRemoved = false;
+let libraryFormSource: SavedLibraryItem['source'] = 'manual';
+let libraryFormName = '';
+let libraryFormDescription = '';
+let libraryFormPrompt: SavedPromptData = { positive: '', negative: '', characters: [] };
+let libraryFormMix: SavedArtistMixData = { artists: [], serializedPrompt: '' };
+let libraryFormScrollTop = 0;
+const libraryPolarities = new Map<string, { base: 'positive' | 'negative'; characters: Array<'positive' | 'negative'> }>();
 // Legacy compatibility marker: new MetadataWorkspace(() => catalog.artists)
-const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card));
+const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card), saveMetadataToLibrary);
 
 function revokeCustomImageUrl(key: string): void {
   const url = customImageUrls.get(key);
@@ -197,21 +210,28 @@ function applyAnimationMode(mode: AnimationMode): void {
   if (typeof document !== 'undefined') document.documentElement.dataset.animationMode = mode;
 }
 function applyTheme(): void { document.documentElement.dataset.theme = settings.theme; }
+const studioThemes: Array<{ id: AppSettings['theme']; label: string }> = [
+  { id: 'arcane-gold', label: 'Arcane Gold' }, { id: 'midnight-blue', label: 'Midnight Blue' }, { id: 'raspberry-rose', label: 'Raspberry Rose' }, { id: 'noir', label: 'Noir' },
+  { id: 'celestial-light', label: 'Celestial Light' }, { id: 'ember-peach', label: 'Ember Peach' }, { id: 'gothic-ivory', label: 'Gothic' }
+];
+function themeOptions(): string { return studioThemes.map(theme => `<option value="${theme.id}"${settings.theme === theme.id ? ' selected' : ''}>${theme.label}</option>`).join(''); }
 function onboardingMarkup(): string {
   if (!onboardingOpen || !onboardingSteps.length) return '';
   const step = onboardingSteps[onboardingIndex];
-  return `<div class="modal-backdrop onboarding-backdrop"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="guide-title"><p class="eyebrow">STUDIO GUIDE ${onboardingIndex + 1} / ${onboardingSteps.length}</p><h2 id="guide-title">${escapeHtml(step.title)}</h2><p>${escapeHtml(step.copy)}</p><div class="onboarding-actions"><button class="secondary" id="guide-skip" type="button">Skip guide</button><button class="primary" id="guide-next" type="button">${onboardingIndex + 1 === onboardingSteps.length ? 'Open studio' : 'Next'}</button></div></section></div>`;
+  const isThemeStep = step.id === 'v060-themes';
+  const chooser = isThemeStep ? `<div class="onboarding-theme-choices" role="group" aria-label="Choose a studio theme">${studioThemes.map(theme => `<button type="button" class="theme-swatch ${settings.theme === theme.id ? 'selected' : ''}" data-guide-theme="${theme.id}" aria-pressed="${settings.theme === theme.id}"><i data-theme-swatch="${theme.id}"></i>${theme.label}</button>`).join('')}</div>` : '';
+  return `<div class="modal-backdrop onboarding-backdrop"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="guide-title"><p class="eyebrow">STUDIO GUIDE ${onboardingIndex + 1} / ${onboardingSteps.length}</p><h2 id="guide-title">${escapeHtml(step.title)}</h2><p>${escapeHtml(step.copy)}</p>${chooser}<div class="onboarding-actions"><button class="secondary" id="guide-skip" type="button">Skip guide</button><button class="primary" id="guide-next" type="button">${onboardingIndex + 1 === onboardingSteps.length ? 'Open studio' : 'Next'}</button></div></section></div>`;
 }
 function startGuide(replay = false): void {
   const overview = [
     { id: 'overview-prompt', title: 'Prompt Builder', copy: 'Build frame, scene, render, artist and character prompt blocks in one workspace.' },
     { id: 'overview-mix', title: 'Artist Mix', copy: 'Pin up to four anchor artists, then remix companions without changing your anchors.' },
-    { id: 'overview-saved-library', title: 'Saved Library', copy: 'Save complete Prompt Builder and Artist Mix snapshots, then restore or copy them from one library.' },
+    { id: 'overview-saved-library', title: 'Saved Library', copy: 'Create independent prompt and Artist Mix records, then edit or copy them from one library.' },
     { id: 'overview-custom', title: 'Custom Tags', copy: 'Create personal prompt cards and artist cards with images and notes.' },
     { id: 'overview-metadata', title: 'Image Metadata', copy: 'Drop a PNG or WebP image to inspect and copy its NovelAI generation data.' },
     { id: 'overview-settings', title: 'Settings', copy: 'Choose a theme, control motion and manage catalog or application updates.' }
   ];
-  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings now includes four studio themes, catalog refresh controls and secure GitHub update checks.' }, { id: 'v050-saved-library', title: 'Saved Library', copy: 'Save complete Prompt Builder and Artist Mix snapshots, then restore or copy them from one library.' }];
+  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings includes studio themes, catalog refresh controls and secure GitHub update checks.' }, { id: 'v050-saved-library', title: 'Saved Library', copy: 'Save complete prompt and Artist Mix records, then edit or copy them from one library.' }, { id: 'v060-themes', title: 'Seven studio themes', copy: 'Choose a theme now. Your selection applies immediately and stays on this device.' }];
   const candidates = replay || !existingProfileAtStartup ? overview : update;
   onboardingSteps = replay ? candidates : candidates.filter(step => !settings.seenGuideIds.includes(step.id));
   onboardingIndex = 0; onboardingOpen = onboardingSteps.length > 0;
@@ -260,7 +280,7 @@ function constructorButton(zone: ConstructorZone): string {
 
 function zoneDetails(): string {
   return `<aside class="zone zone-left" aria-label="Prompt sections">
-    <div class="full-prompt"><div><span>FULL PROMPT</span><small>frame, artists, scene, render</small></div><code id="full-prompt-output">${escapeHtml(prompt())}</code><button class="primary" id="copy-prompt" type="button">Copy prompt</button></div>
+    <div class="full-prompt"><div><span>FULL PROMPT</span><small>frame, artists, scene, render</small></div><code id="full-prompt-output">${escapeHtml(prompt())}</code><div class="full-prompt-actions"><button class="primary" id="copy-prompt" type="button">Copy prompt</button><button class="secondary" id="save-prompt-library" type="button">Save prompt</button></div></div>
     <details class="accordion" data-zone="frame"${accordionOpenState.frame ? ' open' : ''}><summary><span class="zone-number">01</span><span><b>Frame</b><small>Composition, shot, viewpoint</small></span></summary>${manualEditor('frame', 'frame', base.frame, 'Frame & composition', '1girl, upper body, looking at viewer')}</details>
     <details class="accordion" data-zone="scene"${accordionOpenState.scene ? ' open' : ''}><summary><span class="zone-number">02</span><span><b>Scene</b><small>Setting, light, atmosphere</small></span></summary>${manualEditor('scene', 'setting', base.setting, 'Scene & lighting', 'indoors, soft lighting')}</details>
     <details class="accordion" data-zone="render"${accordionOpenState.render ? ' open' : ''}><summary><span class="zone-number">03</span><span><b>Render / Quality</b><small>Medium, shading, quality</small></span></summary>${manualEditor('render', 'render', base.render, 'Render & quality', 'anime coloring, masterpiece, best quality')}</details>
@@ -345,16 +365,16 @@ function mixArtistCardMarkup(item: WeightedTag, anchor: boolean): string {
 function mixOrbitMarkup(): string {
   const anchors = artistMix.anchors;
   const companions = artistMix.companions;
-  const layout = mixOrbitLayout(companions.length, anchors.length);
+  const fallbackLayout = mixOrbitLayout(companions.length, anchors.length);
   const satellites = companions.map((item, index) => {
-    const placement = layout.placements[index];
     const scale = mixCompanionScale(item.weight);
-    return `<div class="mix-orbit-slot" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-row="${placement.row}" data-orbit-x="${placement.x}" data-orbit-y="${placement.y}" style="--orbit-x:${placement.x}%;--orbit-y:${placement.y}%;--mix-weight-scale:${scale}"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
+    const fallback = fallbackLayout.placements[index] ?? { x: 50, y: 50, row: 'top' as const };
+    return `<div class="mix-orbit-slot" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-row="${fallback.row}" style="--mix-weight-scale:${scale};--orbit-x:${fallback.x}%;--orbit-y:${fallback.y}%"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
   }).join('');
   const center = anchors.length
     ? `<div class="mix-orbit-primary mix-anchor-group" role="group" aria-label="Pinned anchor artists">${anchors.map(item => mixArtistCardMarkup(item, true)).join('')}</div>`
     : '<div class="mix-orbit-primary" role="listitem"><button class="empty-artist-card mix-orbit-empty" id="open-mix-primary-picker-empty" type="button"><img src="./plus.png" alt=""><b>Choose anchor artist</b><small>Your fixed center for this mix</small></button></div>';
-  return `<div class="mix-orbit" role="list" aria-label="Primary artist surrounded by companion artists" style="--mix-orbit-height:${layout.height}px;--mix-orbit-rings:${layout.ringCount}"><div class="mix-orbit-ring mix-orbit-ring-inner" aria-hidden="true"></div><div class="mix-orbit-ring mix-orbit-ring-outer" aria-hidden="true"></div>${center}${satellites}</div>`;
+  return `<div class="mix-orbit" role="list" aria-label="Primary artist surrounded by companion artists" data-layout-ready="true"><div class="mix-orbit-ring mix-orbit-ring-inner" aria-hidden="true"></div><div class="mix-orbit-ring mix-orbit-ring-outer" aria-hidden="true"></div>${center}${satellites}</div>`;
 }
 
 function rectangleEdge(rect: DOMRect, targetX: number, targetY: number): { x: number; y: number } {
@@ -372,7 +392,15 @@ function layoutMixOrbitThreads(): void {
   if (!orbit || !anchor) return;
   const orbitRect = orbit.getBoundingClientRect();
   const anchorRect = anchor.getBoundingClientRect();
-  orbit.querySelectorAll<HTMLElement>('.mix-orbit-slot').forEach(slot => {
+  const slots = [...orbit.querySelectorAll<HTMLElement>('.mix-orbit-slot')];
+  const requestedWidth = Math.min(168, Math.max(154, orbitRect.width * 0.135));
+  const measuredLayout = mixOrbitLayout(slots.length, artistMix.anchors.length, { width: orbitRect.width, height: orbitRect.height, companionWidth: requestedWidth, companionHeight: 198, anchorWidth: anchorRect.width, anchorHeight: anchorRect.height });
+  orbit.dataset.layoutDensity = measuredLayout.density;
+  orbit.style.setProperty('--mix-companion-width', `${measuredLayout.companionWidth}px`);
+  orbit.style.setProperty('--mix-companion-height', `${measuredLayout.companionHeight}px`);
+  slots.forEach((slot, index) => {
+    const placement = measuredLayout.placements[index];
+    if (placement) { slot.style.setProperty('--orbit-x', `${placement.x}%`); slot.style.setProperty('--orbit-y', `${placement.y}%`); slot.dataset.orbitRow = placement.row; }
     const card = slot.querySelector<HTMLElement>('.mix-artist-card');
     const connector = slot.querySelector<HTMLElement>('.mix-orbit-connector');
     if (!card || !connector) return;
@@ -388,6 +416,9 @@ function layoutMixOrbitThreads(): void {
     connector.style.width = `${Math.hypot(dx, dy)}px`;
     connector.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
   });
+  // Markup ships deterministic fallback coordinates, so an unusually small
+  // transient measurement never makes the artist cards disappear.
+  orbit.dataset.layoutReady = 'true';
 }
 
 let mixThreadSettleFrame: number | undefined;
@@ -436,16 +467,52 @@ function artistMixWorkspace(): string {
   const poolSize = mixPool().length;
   const status = mixNotice ? `<p class="random-notice" role="status">${escapeHtml(mixNotice)}</p>` : '';
   const panelLabel = focusMode ? 'aria-label="Artist Mix"' : 'aria-labelledby="artist-mix-tab"';
-  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><div class="mix-actions"><button class="primary" id="mix-artists" type="button">Mix artists</button><button class="secondary" id="mix-reroll-companion-weights" type="button">Reroll companions</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div></section>${status}<section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
+  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><div class="mix-actions"><button class="primary" id="mix-artists" type="button">Mix artists</button><button class="secondary" id="mix-reroll-companion-weights" type="button">Reroll companions</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div>${status}</section><section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
 }
 
 function mixPickerMarkup(): string {
   return `<div class="modal-backdrop mix-picker-backdrop" id="mix-picker-backdrop" hidden><section class="picker-modal artist-catalog-picker" role="dialog" aria-modal="true" aria-label="Choose a V5 artist for Artist Mix"><header><div><p class="eyebrow">ARTIST MIX · V5</p><h2>Choose an artist</h2><p id="mix-picker-count">${catalog.artists.length.toLocaleString()} cards</p></div><button class="icon-button" id="close-mix-picker" type="button" aria-label="Close artist picker">×</button></header><div class="picker-tools"><input id="mix-artist-search" value="${escapeHtml(artistSearch)}" placeholder="Search V5 artists..." aria-label="Search V5 artists"><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-picker-favorites" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites</button></div><div class="artist-grid artist-catalog-grid" id="mix-artist-grid" tabindex="0"></div><footer class="catalog-pagination"><button class="secondary" id="mix-artist-previous" type="button" disabled>Previous</button><span id="mix-artist-page-status" role="status" aria-live="polite">Page 1</span><button class="secondary" id="mix-artist-next" type="button" disabled>Next</button></footer></section></div>`;
 }
 
+function formatUpdateBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let amount = value;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
+  return `${index === 0 ? Math.round(amount) : amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function appUpdatePhaseCopy(): string {
+  if (appUpdatePhase === 'checking') return 'Checking official releases...';
+  if (appUpdatePhase === 'available') return `Version ${appUpdateManifest?.version ?? ''} is available.`;
+  if (appUpdatePhase === 'downloading') return 'Downloading update...';
+  if (appUpdatePhase === 'paused') return 'Download paused. Your partial file is kept for resume.';
+  if (appUpdatePhase === 'verifying') return 'Verifying update...';
+  if (appUpdatePhase === 'ready') return 'Update verified and ready to install.';
+  if (appUpdatePhase === 'installing') return 'Installing update...';
+  if (appUpdatePhase === 'up-to-date') return 'NAI Prompt Studio is up to date.';
+  if (appUpdatePhase === 'error') return appUpdateMessage || 'The update action failed.';
+  return 'Ready to check.';
+}
+
+function appUpdateMarkup(browserOnly: boolean): string {
+  if (browserOnly) return '<p class="settings-disabled" role="status">Updates are available in the desktop app.</p>';
+  const activeTransfer = appUpdatePhase === 'downloading' || appUpdatePhase === 'verifying';
+  const updateBusy = activeTransfer || appUpdatePhase === 'installing';
+  const showProgress = activeTransfer || appUpdatePhase === 'paused' || appUpdatePhase === 'ready';
+  const progress = appUpdateProgress;
+  const manifest = appUpdateManifest;
+  const details = manifest?.available ? `<div class="app-update-details"><b>Version ${escapeHtml(manifest.version)}</b><span>${formatUpdateBytes(manifest.size ?? 0)}</span>${manifest.releaseNotes ? `<p>${escapeHtml(manifest.releaseNotes)}</p>` : ''}</div>` : '';
+  const progressMarkup = showProgress ? `<div class="app-update-progress" id="app-update-progress"><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent}" aria-label="Application update download progress"><span style="width:${progress.percent}%"></span></div><small id="app-update-progress-label">Download ${progress.percent}% complete, ${formatUpdateBytes(progress.completed)} of ${formatUpdateBytes(progress.total)}.${progress.message ? ` ${escapeHtml(progress.message)}` : ''}</small></div>` : '';
+  const actions = `<div class="settings-actions app-update-actions"><button class="secondary" id="check-app-update" type="button" ${appUpdatePhase === 'checking' || updateBusy ? 'disabled' : ''}>${appUpdatePhase === 'checking' ? 'Checking...' : 'Check for updates now'}</button>${appUpdatePhase === 'available' ? '<button class="primary" id="download-app-update" type="button">Download update</button>' : ''}${activeTransfer ? '<button class="secondary" id="cancel-app-update" type="button">Cancel download</button>' : ''}${appUpdatePhase === 'paused' || (appUpdatePhase === 'error' && Boolean(appUpdateManifest)) ? '<button class="primary" id="resume-app-update" type="button">Resume download</button>' : ''}${appUpdatePhase === 'ready' ? '<button class="primary" id="install-app-update" type="button">Install now</button>' : ''}</div>`;
+  return `<div class="app-update-subsection"><div class="catalog-update-status app-update-status" id="app-update-status" role="status" aria-live="polite">${escapeHtml(appUpdatePhaseCopy())}</div>${details}${progressMarkup}${actions}</div>`;
+}
+
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
-  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme"><option value="arcane-gold"${settings.theme === 'arcane-gold' ? ' selected' : ''}>Arcane Gold</option><option value="midnight-blue"${settings.theme === 'midnight-blue' ? ' selected' : ''}>Midnight Blue</option><option value="raspberry-rose"${settings.theme === 'raspberry-rose' ? ' selected' : ''}>Raspberry Rose</option><option value="noir"${settings.theme === 'noir' ? ' selected' : ''}>Noir</option></select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">V5 ARTIST CATALOG</p><h3>Catalog and app updates</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Catalog checks use only the exact NAX V5 gallery. App updates use the official GitHub release manifest and verified SHA-512.</p>${browserOnly ? '<p class="settings-disabled" role="status">Updates are available in the desktop app.</p>' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || appUpdateStatus || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="check-app-update" type="button">Check for updates now</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`}</section></div></section>`;
+  const catalogControls = browserOnly ? '' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`;
+  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">V5 ARTIST CATALOG</p><h3>Catalog and app updates</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Catalog checks use only the exact NAX V5 gallery. App updates use the official GitHub release manifest and verified SHA-512.</p>${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -481,47 +548,55 @@ function characterBlock(character: Character, index: number): string {
   return `<article class="character-block"><header><div class="character-title"><span class="number">${index + 1}</span><input class="character-name" value="${escapeHtml(character.label)}" data-character-name="${character.id}" aria-label="Character name"></div><div class="character-actions"><button class="small" data-character-details="${character.id}">Details</button><button class="small" data-copy-character="${character.id}">Copy</button><button class="icon-button" data-remove-character="${character.id}" aria-label="Remove character">×</button></div></header>${editor('character', character.id, character.prompt, 'Character prompt', 'girl, blue eyes, short hair')}${editor('undesired', character.id, character.undesired, 'Character undesired', 'hat, blurry')}</article>`;
 }
 
-function savedMenu(): string {
-  const recent = savedLibrary.filter(item => item.kind === 'prompt').slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 5);
-  return `<details class="saved-menu"><summary>Saved sets <span>${savedLibrary.length}</span></summary><div class="saved-list">${recent.length ? recent.map(item => `<button data-copy-library="${escapeHtml(item.id)}"><b>${escapeHtml(item.name)}</b><small>${escapeHtml(item.prompt || 'Saved Prompt Builder snapshot')}</small></button>`).join('') : '<small>No saved prompts yet.</small>'}<button class="primary" id="save-set">＋ Save current</button><button class="secondary" id="open-saved-library-menu" type="button">Open Saved Library</button></div></details>`;
-}
-
 function savedLibraryItems(): SavedLibraryItem[] {
   const query = savedLibrarySearch.trim().toLocaleLowerCase();
   return savedLibrary.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).filter(item => {
     const typeMatch = savedLibraryFilter === 'all' || item.kind === savedLibraryFilter;
-    const textMatch = !query || `${item.name} ${item.prompt} ${item.originalName ?? ''}`.toLocaleLowerCase().includes(query);
+    const detailText = item.kind === 'prompt' ? `${item.data?.positive ?? ''} ${item.data?.negative ?? ''} ${item.data?.characters.map(character => `${character.label} ${character.positive} ${character.negative}`).join(' ') ?? ''}` : `${item.data?.serializedPrompt ?? ''} ${item.data?.artists.map(artist => artist.tag).join(' ') ?? ''}`;
+    const textMatch = !query || `${item.name} ${item.description ?? ''} ${item.prompt} ${item.originalName ?? ''} ${detailText}`.toLocaleLowerCase().includes(query);
     return typeMatch && textMatch;
   });
 }
 
 function savedLibraryCardMarkup(item: SavedLibraryItem): string {
   const image = libraryImageUrl(item);
-  const legacy = item.kind === 'prompt' && item.legacy === true;
-  const label = item.kind === 'artist-mix' ? 'Artist Mix' : legacy ? 'Legacy prompt, copy only' : 'Prompt Builder';
+  const label = item.kind === 'artist-mix' ? 'Artist Mix' : 'Prompt';
   const date = new Date(item.updatedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  const copyValue = item.kind === 'prompt' && item.snapshot ? buildBasePrompt(item.snapshot.base) : item.prompt;
-  return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}">${image ? `<img src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><code>${escapeHtml(copyValue || 'No prompt text')}</code>${legacy ? '<p class="saved-library-legacy" role="status">Migrated legacy record. Restore is unavailable.</p>' : ''}<div class="saved-library-actions"><button class="primary" type="button" data-restore-library="${escapeHtml(item.id)}" ${legacy ? 'disabled title="Legacy records are copy-only"' : ''}>Restore</button><button class="secondary" type="button" data-copy-library-card="${escapeHtml(item.id)}">Copy</button><button class="tiny-copy" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="tiny-copy" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
+  const polarity = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: (item.kind === 'prompt' ? item.data?.characters ?? [] : []).map(() => 'positive' as const) };
+  libraryPolarities.set(item.id, polarity);
+  const promptBlock = (labelValue: string, value: { positive: string; negative: string }, index: number, active: 'positive' | 'negative'): string => {
+    const text = value[active] || '(No prompt recorded for this side.)';
+    return `<article class="saved-library-prompt" data-library-block="${escapeHtml(item.id)}:${index}"><header><b>${escapeHtml(labelValue)}</b><div class="metadata-toggle" role="group" aria-label="${escapeHtml(labelValue)} polarity"><button type="button" class="${active === 'positive' ? 'on' : ''}" data-library-polarity="${escapeHtml(item.id)}" data-library-index="${index}" data-polarity="positive" aria-pressed="${active === 'positive'}">Positive</button><button type="button" class="${active === 'negative' ? 'on' : ''}" data-library-polarity="${escapeHtml(item.id)}" data-library-index="${index}" data-polarity="negative" aria-pressed="${active === 'negative'}">Negative</button></div></header><pre>${escapeHtml(text)}</pre><button class="library-copy-icon" type="button" data-library-copy="${escapeHtml(item.id)}" data-library-index="${index}" aria-label="Copy ${escapeHtml(labelValue)} ${active} prompt" title="Copy ${escapeHtml(labelValue)} ${active} prompt" ${value[active] ? '' : 'disabled'}></button></article>`;
+  };
+  const generationValues = item.kind === 'prompt' ? [item.data?.model, item.data?.steps && `${item.data.steps} steps`, item.data?.sampler, item.data?.width && item.data?.height && `${item.data.width} x ${item.data.height}`, item.data?.cfg && `CFG ${item.data.cfg}`].filter(Boolean) : [];
+  const generationMarkup = generationValues.length ? `<div class="saved-library-generation"><span>Generation metadata</span><code>${escapeHtml(generationValues.join(' | '))}</code></div>` : '';
+  const details = item.kind === 'prompt'
+    ? `<details class="saved-library-details"><summary>Prompt details</summary>${promptBlock('Base prompt', { positive: item.data?.positive ?? item.prompt, negative: item.data?.negative ?? '' }, -1, polarity.base)}${(item.data?.characters ?? []).map((character, index) => promptBlock(character.label, character, index, polarity.characters[index] ?? 'positive')).join('')}${generationMarkup}</details>`
+    : `<details class="saved-library-details"><summary>Artist details</summary><code>${escapeHtml(item.data?.artists.map(artist => `${artist.tag} (${artist.weight})`).join(', ') || 'No structured artists')}</code></details>`;
+  const previewAttrs = image ? ` tabindex="0" role="img" aria-label="Preview cover for ${escapeHtml(item.name)}" data-library-preview-image="${escapeHtml(image)}" data-library-preview-tag="${escapeHtml(item.name)}" data-library-preview-prompt="${escapeHtml(item.kind === 'prompt' ? item.data?.positive ?? item.prompt : item.data?.serializedPrompt ?? item.prompt)}" data-library-preview-description="${escapeHtml(item.description ?? '')}"` : '';
+  return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}"${previewAttrs}>${image ? `<img src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><p class="saved-library-description">${escapeHtml(item.description || 'No description.')}</p>${details}<div class="saved-library-actions"><button class="secondary saved-library-rounded" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="secondary saved-library-rounded" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
 }
 
 function savedLibraryWorkspace(): string {
   const items = savedLibraryItems();
-  return `<section id="saved-library-panel" class="saved-library-workspace" role="tabpanel" aria-labelledby="saved-library-tab"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="saved-library-title">Saved Library</h2><p>Keep complete prompt and Artist Mix snapshots on this device.</p></div><div class="saved-library-header-actions"><button class="primary" id="save-library-prompt" type="button">＋ Save prompt</button><button class="secondary" id="save-library-mix" type="button">＋ Save Artist Mix</button></div></header><div class="saved-library-tools"><input id="saved-library-search" value="${escapeHtml(savedLibrarySearch)}" placeholder="Search saved items..." aria-label="Search Saved Library"><div class="saved-library-filter" role="group" aria-label="Filter Saved Library"><button class="chip ${savedLibraryFilter === 'all' ? 'on' : ''}" type="button" data-library-filter="all">All</button><button class="chip ${savedLibraryFilter === 'prompt' ? 'on' : ''}" type="button" data-library-filter="prompt">Prompts</button><button class="chip ${savedLibraryFilter === 'artist-mix' ? 'on' : ''}" type="button" data-library-filter="artist-mix">Artist Mix</button></div></div><div class="saved-library-grid" id="saved-library-grid">${items.length ? items.map(savedLibraryCardMarkup).join('') : `<div class="saved-library-empty"><span class="brand-mark">✦</span><h3>${savedLibrary.length ? 'No saved items match this search.' : 'Your Saved Library is ready.'}</h3><p>${savedLibrary.length ? 'Try a different name or type filter.' : 'Save a Prompt Builder or Artist Mix snapshot to keep the exact setup for later.'}</p><button class="secondary" type="button" id="save-library-empty">Save a prompt</button></div>`}</div></section>`;
+  const emptyCopy = savedLibrary.length ? 'Try a different name or type filter.' : 'Create an independent prompt or Artist Mix record.';
+  return `<section id="saved-library-panel" class="saved-library-workspace" role="tabpanel" aria-labelledby="saved-library-tab"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="saved-library-title">Saved Library</h2><p>Create independent prompt and Artist Mix records on this device.</p></div><div class="saved-library-header-actions"><button class="primary" id="save-library-prompt" type="button">＋ New Prompt</button><button class="secondary" id="save-library-mix" type="button">＋ New Artist Mix</button></div></header><div class="saved-library-tools"><input id="saved-library-search" value="${escapeHtml(savedLibrarySearch)}" placeholder="Search saved items..." aria-label="Search Saved Library"><div class="saved-library-filter" role="group" aria-label="Filter Saved Library"><button class="chip ${savedLibraryFilter === 'all' ? 'on' : ''}" type="button" data-library-filter="all">All</button><button class="chip ${savedLibraryFilter === 'prompt' ? 'on' : ''}" type="button" data-library-filter="prompt">Prompts</button><button class="chip ${savedLibraryFilter === 'artist-mix' ? 'on' : ''}" type="button" data-library-filter="artist-mix">Artist Mix</button></div></div><div class="saved-library-grid" id="saved-library-grid">${items.length ? items.map(savedLibraryCardMarkup).join('') : `<div class="saved-library-empty"><span class="brand-mark">✦</span><h3>${savedLibrary.length ? 'No saved items match this search.' : 'Your Saved Library is ready.'}</h3><p>${emptyCopy}</p><button class="secondary" type="button" id="save-library-empty">New Prompt</button></div>`}</div></section>`;
 }
 
 function savedLibraryModalMarkup(): string {
   if (!libraryModalMode) return '';
   const item = libraryModalItemId ? savedLibrary.find(value => value.id === libraryModalItemId) : undefined;
-  const isConfirm = libraryModalMode === 'restore' || libraryModalMode === 'delete';
-  if (isConfirm) {
-    const restore = libraryModalMode === 'restore';
-    return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="detail-modal saved-library-confirm" role="dialog" aria-modal="true" aria-labelledby="saved-library-confirm-title"><header><div><p class="eyebrow">SAVED LIBRARY</p><h2 id="saved-library-confirm-title">${restore ? 'Restore this snapshot?' : 'Delete this saved item?'}</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><p>${restore ? `Restore <b>${escapeHtml(item?.name ?? 'this item')}</b> into the current workspace? Your current unsaved setup will be replaced.` : `Delete <b>${escapeHtml(item?.name ?? 'this item')}</b>? Its cover image will also be removed from this device.`}</p><div class="saved-library-modal-actions"><button class="${restore ? 'primary' : 'danger-button'}" id="confirm-library-action" type="button">${restore ? 'Restore snapshot' : 'Delete item'}</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></section></div>`;
+  if (libraryModalMode === 'delete') {
+    return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="detail-modal saved-library-confirm" role="dialog" aria-modal="true" aria-labelledby="saved-library-confirm-title"><header><div><p class="eyebrow">SAVED LIBRARY</p><h2 id="saved-library-confirm-title">Delete this saved item?</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><p>Delete <b>${escapeHtml(item?.name ?? 'this item')}</b>? Its cover image will also be removed from this device.</p><div class="saved-library-modal-actions"><button class="danger-button" id="confirm-library-action" type="button">Delete item</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></section></div>`;
   }
   const editing = libraryModalMode === 'edit';
   const kind = editing ? item?.kind : libraryModalMode === 'save-mix' ? 'artist-mix' : 'prompt';
   const currentImage = libraryCoverRemoved ? '' : libraryCoverBytes && libraryCoverMime ? savedLibraryImageUrls.get('__draft__') ?? '' : item ? libraryImageUrl(item) : '';
   const imagePreview = currentImage ? `<div class="saved-library-cover-preview"><img src="${escapeHtml(currentImage)}" alt="Selected cover preview"><button class="tiny-copy" id="remove-library-cover" type="button">Remove cover</button></div>` : '<p class="saved-library-cover-empty">Optional PNG, JPEG, or WebP cover up to 20 MiB.</p>';
-  return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="picker-modal saved-library-form-modal" role="dialog" aria-modal="true" aria-labelledby="saved-library-form-title"><header><div><p class="eyebrow">${editing ? 'EDIT SAVED ITEM' : kind === 'artist-mix' ? 'SAVE ARTIST MIX' : 'SAVE PROMPT'}</p><h2 id="saved-library-form-title">${editing ? 'Edit Saved Library item' : 'Name this snapshot'}</h2><p>${editing ? 'Rename this item or change its optional cover.' : 'The full editable snapshot will be saved with this name.'}</p></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><form id="saved-library-form"><label class="field"><span>Name</span><input id="saved-library-name" maxlength="120" required value="${escapeHtml(item?.name ?? '')}" placeholder="e.g. Soft portrait setup"></label><label class="field saved-library-cover-field"><span>Cover image <i>Optional</i></span><div class="saved-library-cover-drop${currentImage ? ' has-image' : ''}" id="saved-library-cover-drop"><input id="saved-library-cover-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" hidden><button type="button" class="secondary" id="choose-library-cover">Choose cover</button><span>or drop an image here</span>${imagePreview}</div><p class="saved-library-cover-error" id="saved-library-cover-error" role="alert">${escapeHtml(libraryCoverError)}</p></label><div class="saved-library-modal-actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Save to library'}</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></form></section></div>`;
+  const promptFields = kind === 'prompt'
+    ? `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Base positive</span><textarea id="saved-library-positive">${escapeHtml(libraryFormPrompt.positive)}</textarea></label><label class="field"><span>Base negative</span><textarea id="saved-library-negative">${escapeHtml(libraryFormPrompt.negative)}</textarea></label><div class="saved-library-characters">${libraryFormPrompt.characters.map((character, index) => `<section data-library-character-section="${escapeHtml(character.id)}"><div class="saved-library-character-heading"><b>${escapeHtml(character.label || `Character ${index + 1}`)}</b><button class="saved-library-character-remove" type="button" data-remove-library-character="${escapeHtml(character.id)}" aria-label="Remove ${escapeHtml(character.label || `Character ${index + 1}`)}" title="Remove character"><span aria-hidden="true">−</span></button></div><label class="field"><span>Character label</span><input data-library-character-label="${index}" value="${escapeHtml(character.label)}"></label><label class="field"><span>Character positive</span><textarea data-library-character-positive="${index}">${escapeHtml(character.positive)}</textarea></label><label class="field"><span>Character negative</span><textarea data-library-character-negative="${index}">${escapeHtml(character.negative)}</textarea></label></section>`).join('')}<button class="secondary saved-library-character-add" id="add-library-character" type="button">Add character</button></div>`
+    : `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Artist prompt</span><textarea id="saved-library-mix-prompt">${escapeHtml(libraryFormMix.serializedPrompt)}</textarea></label>`;
+  return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="picker-modal saved-library-form-modal" role="dialog" aria-modal="true" aria-labelledby="saved-library-form-title"><header><div><p class="eyebrow">${editing ? 'EDIT SAVED ITEM' : kind === 'artist-mix' ? 'SAVE ARTIST MIX' : 'SAVE PROMPT'}</p><h2 id="saved-library-form-title">${editing ? 'Edit Saved Library item' : 'Create an independent record'}</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><form id="saved-library-form"><div class="saved-library-form-scroll" data-library-form-scroll><label class="field"><span>Name</span><input id="saved-library-name" maxlength="120" required value="${escapeHtml(libraryFormName)}" placeholder="e.g. Soft portrait setup"></label>${promptFields}<label class="field saved-library-cover-field"><span>Preview <i>Optional</i></span><div class="saved-library-cover-drop${currentImage ? ' has-image' : ''}" id="saved-library-cover-drop"><input id="saved-library-cover-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" hidden><button type="button" class="secondary" id="choose-library-cover">Choose preview</button><span>or drop an image here</span>${imagePreview}</div><p class="saved-library-cover-error" id="saved-library-cover-error" role="alert">${escapeHtml(libraryCoverError)}</p></label></div><div class="saved-library-modal-actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Save to library'}</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></form></section></div>`;
 }
 
 function customTagImageUrl(tag: CustomTag): string {
@@ -692,17 +767,24 @@ function render(): void {
   clearArtistCardPreview();
   const tabs = focusMode ? '' : `<div class="workspace-tabs" role="tablist" aria-label="Studio workspaces"><button id="prompt-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'prompt'}" aria-controls="prompt-panel" class="${activeWorkspace === 'prompt' ? 'on' : ''}">Prompt Builder</button><button id="artist-mix-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'artist-mix'}" aria-controls="artist-mix-panel" class="${activeWorkspace === 'artist-mix' ? 'on' : ''}">Artist Mix</button><button id="saved-library-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'saved-library'}" aria-controls="saved-library-panel" class="${activeWorkspace === 'saved-library' ? 'on' : ''}">Saved Library</button><button id="custom-tags-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'custom-tags'}" aria-controls="custom-tags-panel" class="${activeWorkspace === 'custom-tags' ? 'on' : ''}">Custom Tags</button><button id="metadata-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'metadata'}" aria-controls="metadata-panel" class="${activeWorkspace === 'metadata' ? 'on' : ''}">Image Metadata</button><button id="settings-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'settings'}" aria-controls="settings-panel" class="${activeWorkspace === 'settings' ? 'on' : ''}">Settings</button></div>`;
   snapshotAccordionState();
-  const promptMarkup = `<section id="prompt-panel" class="${workspacePanelClass('prompt')}" role="tabpanel" aria-labelledby="prompt-tab"><section class="workspace-intro"><div><p class="eyebrow">FOUR-ZONE WORKSPACE</p><h2>Build the prompt in order.</h2><p>Frame → artists → scene → render. Undesired content and character blocks stay separate.</p></div></section><section class="four-zone-grid">${zoneDetails()}${artistZone()}${charactersZone()}</section><footer class="app-footer"><div class="footer-brand"><span>NAI Prompt Studio</span><span class="footer-links"><a href="https://nax.moe/?gallery=danbooru-artist-tags-2-v5" target="_blank" rel="noopener noreferrer">NAX · CC BY 4.0</a><a href="https://hothottuk.neocities.org/en" target="_blank" rel="noopener noreferrer">hothottuk's guide</a></span></div></footer></section>`;
-  const metadataMarkup = `<section id="metadata-panel" class="${workspacePanelClass('metadata')}" role="tabpanel" aria-labelledby="metadata-tab">${metadataWorkspace.markup()}</section>`;
-  const customTagsMarkup = `<section id="custom-tags-panel" class="${workspacePanelClass('custom-tags')}" role="tabpanel" aria-labelledby="custom-tags-tab">${customTagsWorkspace()}</section>`;
-  const libraryMarkup = savedLibraryWorkspace();
-  const activeMarkup = activeWorkspace === 'prompt' ? promptMarkup : activeWorkspace === 'artist-mix' ? artistMixWorkspace() : activeWorkspace === 'saved-library' ? libraryMarkup : activeWorkspace === 'custom-tags' ? customTagsMarkup : activeWorkspace === 'metadata' ? metadataMarkup : settingsWorkspace();
+  const activeMarkup = activeWorkspace === 'prompt'
+    ? `<section id="prompt-panel" class="${workspacePanelClass('prompt')}" role="tabpanel" aria-labelledby="prompt-tab"><section class="workspace-intro"><div><p class="eyebrow">FOUR-ZONE WORKSPACE</p><h2>Build the prompt in order.</h2><p>Frame → artists → scene → render. Undesired content and character blocks stay separate.</p></div></section><section class="four-zone-grid">${zoneDetails()}${artistZone()}${charactersZone()}</section><footer class="app-footer"><div class="footer-brand"><span>NAI Prompt Studio</span><span class="footer-links"><a href="https://nax.moe/?gallery=danbooru-artist-tags-2-v5" target="_blank" rel="noopener noreferrer">NAX · CC BY 4.0</a><a href="https://hothottuk.neocities.org/en" target="_blank" rel="noopener noreferrer">hothottuk's guide</a></span></div></footer></section>`
+    : activeWorkspace === 'artist-mix' ? artistMixWorkspace()
+    : activeWorkspace === 'saved-library' ? savedLibraryWorkspace()
+    : activeWorkspace === 'custom-tags' ? `<section id="custom-tags-panel" class="${workspacePanelClass('custom-tags')}" role="tabpanel" aria-labelledby="custom-tags-tab">${customTagsWorkspace()}</section>`
+    : activeWorkspace === 'metadata' ? `<section id="metadata-panel" class="${workspacePanelClass('metadata')}" role="tabpanel" aria-labelledby="metadata-tab">${metadataWorkspace.markup()}</section>`
+    : settingsWorkspace();
   const shellClass = `${focusMode ? 'app-shell focus-shell' : 'app-shell'}${startupEntryPending ? ' startup-entry' : ''}`;
-  app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? `${savedMenu()}<button class="reset-prompt" id="reset" type="button">Reset prompt</button>` : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
+  app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
   pendingWorkspaceTransition = null;
   bindEvents();
   document.querySelector('#guide-skip')?.addEventListener('click', finishGuide);
   document.querySelector('#guide-next')?.addEventListener('click', () => { if (onboardingIndex + 1 < onboardingSteps.length) { onboardingIndex += 1; render(); } else finishGuide(); });
+  document.querySelectorAll<HTMLButtonElement>('[data-guide-theme]').forEach(button => button.addEventListener('click', () => {
+    const theme = button.dataset.guideTheme;
+    if (!studioThemes.some(item => item.id === theme)) return;
+    settings = { ...settings, theme: theme as AppSettings['theme'] }; applyTheme(); saveSettings(settings); render();
+  }));
   if (activeWorkspace === 'metadata') metadataWorkspace.bind(app, render);
   if (activeWorkspace === 'settings') bindSettingsEvents();
   if (activeWorkspace === 'artist-mix') bindArtistMixEvents();
@@ -790,7 +872,41 @@ function closeLibraryModal(): void {
   render();
 }
 
-function openLibrarySaveModal(kind: 'prompt' | 'artist-mix'): void {
+function promptDataFromBuilder(): SavedPromptData { return { positive: buildBasePrompt(base), negative: base.undesired, characters: characters.map(character => ({ id: character.id, label: character.label, positive: character.prompt, negative: character.undesired })) }; }
+function mixDataFromBuilder(): SavedArtistMixData { const artists = JSON.parse(JSON.stringify(mixArtists())) as WeightedTag[]; return { artists, serializedPrompt: buildArtistsPrompt(artists) }; }
+function structuredArtistsFromPrompt(value: string): WeightedTag[] {
+  const artists: WeightedTag[] = [];
+  const seen = new Set<string>();
+  const matcher = /([0-9]+(?:\.[0-9]+)?)\s*::\s*([^,:]+?)\s*::/g;
+  for (let match = matcher.exec(value); match; match = matcher.exec(value)) {
+    const tag = `artist: ${match[2].trim()}`;
+    const key = tag.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key); artists.push({ id: `saved-${id()}`, tag, weight: normalizeArtistWeight(Number(match[1])) });
+  }
+  return artists;
+}
+
+function captureLibraryFormDraft(): void {
+  if (!libraryModalMode || libraryModalMode === 'delete') return;
+  libraryFormName = document.querySelector<HTMLInputElement>('#saved-library-name')?.value ?? libraryFormName;
+  libraryFormDescription = document.querySelector<HTMLTextAreaElement>('#saved-library-description')?.value ?? libraryFormDescription;
+  libraryFormPrompt = {
+    ...libraryFormPrompt,
+    positive: document.querySelector<HTMLTextAreaElement>('#saved-library-positive')?.value ?? libraryFormPrompt.positive,
+    negative: document.querySelector<HTMLTextAreaElement>('#saved-library-negative')?.value ?? libraryFormPrompt.negative,
+    characters: libraryFormPrompt.characters.map((character, index) => ({
+      ...character,
+      label: document.querySelector<HTMLInputElement>(`[data-library-character-label="${index}"]`)?.value ?? character.label,
+      positive: document.querySelector<HTMLTextAreaElement>(`[data-library-character-positive="${index}"]`)?.value ?? character.positive,
+      negative: document.querySelector<HTMLTextAreaElement>(`[data-library-character-negative="${index}"]`)?.value ?? character.negative
+    }))
+  };
+  libraryFormMix = { ...libraryFormMix, serializedPrompt: document.querySelector<HTMLTextAreaElement>('#saved-library-mix-prompt')?.value ?? libraryFormMix.serializedPrompt };
+  libraryFormScrollTop = document.querySelector<HTMLElement>('[data-library-form-scroll]')?.scrollTop ?? libraryFormScrollTop;
+}
+
+function openLibrarySaveModal(kind: 'prompt' | 'artist-mix', source: SavedLibraryItem['source'] = 'manual'): void {
   libraryModalMode = kind === 'artist-mix' ? 'save-mix' : 'save-prompt';
   libraryModalItemId = null;
   libraryCoverBytes = null;
@@ -798,20 +914,33 @@ function openLibrarySaveModal(kind: 'prompt' | 'artist-mix'): void {
   libraryCoverName = '';
   libraryCoverError = '';
   libraryCoverRemoved = false;
+  libraryFormSource = source;
+  libraryFormName = '';
+  libraryFormDescription = '';
+  libraryFormScrollTop = 0;
+  libraryFormPrompt = kind === 'prompt' && source === 'prompt-builder' ? promptDataFromBuilder() : { positive: '', negative: '', characters: [] };
+  libraryFormMix = kind === 'artist-mix' && source === 'artist-mix' ? mixDataFromBuilder() : { artists: [], serializedPrompt: '' };
   modal = 'saved-library';
   render();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#saved-library-name')?.focus(), 0);
 }
 
 function openLibraryEditModal(itemId: string): void {
-  if (!savedLibrary.some(item => item.id === itemId)) return;
+  const item = savedLibrary.find(value => value.id === itemId);
+  if (!item) return;
+  libraryFormSource = item.source ?? 'legacy';
+  libraryFormName = item.name;
+  libraryFormDescription = item.description ?? '';
+  libraryFormScrollTop = 0;
+  libraryFormPrompt = item.kind === 'prompt' ? JSON.parse(JSON.stringify(item.data ?? { positive: item.prompt, negative: '', characters: [] })) : { positive: '', negative: '', characters: [] };
+  libraryFormMix = item.kind === 'artist-mix' ? JSON.parse(JSON.stringify(item.data ?? { artists: [], serializedPrompt: item.prompt })) : { artists: [], serializedPrompt: '' };
   libraryModalMode = 'edit'; libraryModalItemId = itemId; libraryCoverBytes = null; libraryCoverMime = undefined; libraryCoverName = ''; libraryCoverError = ''; libraryCoverRemoved = false; modal = 'saved-library'; render();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#saved-library-name')?.focus(), 0);
 }
 
-function openLibraryConfirmation(mode: 'restore' | 'delete', itemId: string): void {
+function openLibraryConfirmation(mode: 'delete', itemId: string): void {
   const item = savedLibrary.find(value => value.id === itemId);
-  if (!item || (mode === 'restore' && item.kind === 'prompt' && item.legacy)) return;
+  if (!item) return;
   libraryModalMode = mode; libraryModalItemId = itemId; modal = 'saved-library'; render();
 }
 
@@ -824,6 +953,7 @@ function libraryCoverMimeFromBytes(bytes: Uint8Array): SavedLibraryItem['mime'] 
 
 async function readLibraryCover(file?: File): Promise<void> {
   if (!file) return;
+  captureLibraryFormDraft();
   try {
     if (file.size > 20 * 1024 * 1024) throw new Error('Cover images must be 20 MiB or smaller.');
     const bytes = new Uint8Array(await file.arrayBuffer());
@@ -833,12 +963,14 @@ async function readLibraryCover(file?: File): Promise<void> {
     revokeSavedLibraryImageUrl('__draft__');
     savedLibraryImageUrls.set('__draft__', URL.createObjectURL(new Blob([bytes], { type: mime })));
   } catch (error) { libraryCoverError = error instanceof Error ? error.message : 'The cover image could not be read.'; }
+  captureLibraryFormDraft();
   render();
 }
 
 async function saveLibraryItemFromForm(): Promise<void> {
-  if (!libraryModalMode || libraryModalMode === 'restore' || libraryModalMode === 'delete') return;
-  const name = document.querySelector<HTMLInputElement>('#saved-library-name')?.value.trim().replace(/\s+/g, ' ').slice(0, 120) ?? '';
+  if (!libraryModalMode || libraryModalMode === 'delete') return;
+  captureLibraryFormDraft();
+  const name = libraryFormName.trim().replace(/\s+/g, ' ').slice(0, 120);
   if (!name) { libraryCoverError = 'Enter a name for this saved item.'; render(); return; }
   const existing = libraryModalItemId ? savedLibrary.find(item => item.id === libraryModalItemId) : undefined;
   const now = new Date().toISOString();
@@ -854,11 +986,11 @@ async function saveLibraryItemFromForm(): Promise<void> {
       if (existing.imageAsset) await deleteLibraryImage(existing.imageAsset);
       imageAsset = undefined; mime = undefined; originalName = undefined;
     }
-    const item: SavedLibraryItem = existing
-      ? { ...existing, name, ...(imageAsset ? { imageAsset, mime, originalName } : {}), ...(!imageAsset ? { imageAsset: undefined, mime: undefined, originalName: undefined } : {}), updatedAt: now }
-      : libraryModalMode === 'save-mix'
-        ? { id: id(), kind: 'artist-mix', name, prompt: buildArtistsPrompt(mixArtists()), snapshot: currentSavedMixSnapshot(), createdAt: now, updatedAt: now, ...(imageAsset ? { imageAsset, mime, originalName } : {}) }
-        : { id: id(), kind: 'prompt', name, prompt: buildBasePrompt(base), snapshot: currentSavedPromptSnapshot(), createdAt: now, updatedAt: now, ...(imageAsset ? { imageAsset, mime, originalName } : {}) };
+    const description = libraryFormDescription.trim().slice(0, 2000);
+    const common = { version: 4 as const, id: existing?.id ?? id(), kind: libraryModalMode === 'save-mix' || existing?.kind === 'artist-mix' ? 'artist-mix' as const : 'prompt' as const, source: existing?.source ?? libraryFormSource, name, ...(description ? { description } : {}), createdAt: existing?.createdAt ?? now, updatedAt: now, ...(imageAsset ? { imageAsset, mime, originalName } : {}) };
+    const item: SavedLibraryItem = common.kind === 'artist-mix'
+      ? (() => { const serializedPrompt = libraryFormMix.serializedPrompt; return { ...common, kind: 'artist-mix' as const, prompt: serializedPrompt, data: { ...libraryFormMix, artists: libraryFormMix.artists.length ? libraryFormMix.artists : structuredArtistsFromPrompt(serializedPrompt), serializedPrompt }, snapshot: existing?.kind === 'artist-mix' ? existing.snapshot : normalizeArtistMix({ anchors: [], companions: [] }) }; })()
+      : { ...common, kind: 'prompt', prompt: libraryFormPrompt.positive, data: { ...libraryFormPrompt, characters: libraryFormPrompt.characters.map(character => ({ ...character })) }, ...(existing?.kind === 'prompt' && existing.snapshot ? { snapshot: existing.snapshot } : {}) };
     savedLibrary = [item, ...savedLibrary.filter(value => value.id !== item.id)];
     saveSavedLibrary(savedLibrary);
     closeLibraryModal();
@@ -868,22 +1000,6 @@ async function saveLibraryItemFromForm(): Promise<void> {
   }
 }
 
-function restoreLibraryItem(item: SavedLibraryItem): void {
-  if (item.kind === 'prompt' && item.snapshot) {
-    const snapshot = item.snapshot;
-    base = JSON.parse(JSON.stringify(snapshot.base)) as BasePrompt;
-    characters = JSON.parse(JSON.stringify(snapshot.characters));
-    randomRange = normalizeRange(snapshot.randomRange);
-    saveDraft(currentDraft());
-    activeWorkspace = 'prompt';
-  } else if (item.kind === 'artist-mix') {
-    artistMix = normalizeArtistMix(JSON.parse(JSON.stringify(item.snapshot)));
-    saveArtistMix(artistMix);
-    activeWorkspace = 'artist-mix';
-  }
-  closeLibraryModal();
-}
-
 async function deleteLibraryItem(item: SavedLibraryItem): Promise<void> {
   if (item.imageAsset) await deleteLibraryImage(item.imageAsset);
   savedLibrary = savedLibrary.filter(value => value.id !== item.id);
@@ -891,22 +1007,86 @@ async function deleteLibraryItem(item: SavedLibraryItem): Promise<void> {
   closeLibraryModal();
 }
 
+async function saveMetadataToLibrary(kind: MetadataSaveKind, payload: MetadataSavePayload): Promise<boolean> {
+  const now = new Date().toISOString();
+  const idValue = id();
+  const cover = await saveLibraryImage({ id: idValue, mime: payload.preview.mime, originalName: payload.preview.originalName }, payload.preview.bytes);
+  const filenameName = payload.filename.replace(/\.[^.]+$/, '').trim() || (kind === 'artist-mix' ? 'Artist Mix' : 'Metadata prompt');
+  const item: SavedLibraryItem = kind === 'artist-mix' && payload.artistMix
+    ? { version: 4, id: idValue, kind: 'artist-mix', source: 'metadata', name: filenameName, prompt: payload.artistMix.serializedPrompt, data: payload.artistMix, snapshot: normalizeArtistMix({ anchors: [], companions: [] }), createdAt: now, updatedAt: now, ...cover }
+    : { version: 4, id: idValue, kind: 'prompt', source: 'metadata', name: filenameName, prompt: payload.prompt.positive, data: payload.prompt, createdAt: now, updatedAt: now, ...cover };
+  savedLibrary = [item, ...savedLibrary];
+  saveSavedLibrary(savedLibrary);
+  return true;
+}
+
+function libraryPromptSide(item: SavedLibraryItem, index: number, polarity: 'positive' | 'negative'): string {
+  if (item.kind !== 'prompt') return '';
+  if (index < 0) return polarity === 'positive' ? item.data?.positive ?? item.prompt : item.data?.negative ?? '';
+  return item.data?.characters[index]?.[polarity] ?? '';
+}
+
+function patchLibraryPromptBlock(button: HTMLButtonElement): void {
+  const item = savedLibrary.find(value => value.id === button.dataset.libraryPolarity);
+  if (!item || item.kind !== 'prompt') return;
+  const index = Number(button.dataset.libraryIndex);
+  const polarity = button.dataset.polarity === 'negative' ? 'negative' : 'positive';
+  const state = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: item.data?.characters.map(() => 'positive' as const) ?? [] };
+  if (index < 0) state.base = polarity; else state.characters[index] = polarity;
+  libraryPolarities.set(item.id, state);
+  const block = button.closest<HTMLElement>('[data-library-block]');
+  if (!block) return;
+  block.querySelectorAll<HTMLButtonElement>('[data-library-polarity]').forEach(toggle => {
+    const on = toggle.dataset.polarity === polarity;
+    toggle.classList.toggle('on', on);
+    toggle.setAttribute('aria-pressed', String(on));
+  });
+  const value = libraryPromptSide(item, index, polarity);
+  const pre = block.querySelector<HTMLElement>('pre');
+  if (pre) pre.textContent = value || '(No prompt recorded for this side.)';
+  const copyButton = block.querySelector<HTMLButtonElement>('[data-library-copy]');
+  if (copyButton) {
+    const label = index < 0 ? 'Base prompt' : item.data?.characters[index]?.label ?? `Character ${index + 1}`;
+    const copyLabel = `Copy ${label} ${polarity} prompt`;
+    copyButton.disabled = !value;
+    copyButton.setAttribute('aria-label', copyLabel);
+    copyButton.title = copyLabel;
+  }
+}
+
+function removeLibraryCharacter(characterId: string): void {
+  captureLibraryFormDraft();
+  const index = libraryFormPrompt.characters.findIndex(character => character.id === characterId);
+  if (index < 0) return;
+  const characters = libraryFormPrompt.characters.filter(character => character.id !== characterId);
+  const focusId = characters[Math.min(index, Math.max(0, characters.length - 1))]?.id;
+  libraryFormPrompt = { ...libraryFormPrompt, characters };
+  render();
+  window.setTimeout(() => {
+    const removeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-remove-library-character]')];
+    const target = focusId ? removeButtons.find(button => button.dataset.removeLibraryCharacter === focusId) : document.querySelector<HTMLButtonElement>('#add-library-character');
+    target?.focus({ preventScroll: true });
+    const scroll = document.querySelector<HTMLElement>('[data-library-form-scroll]');
+    if (scroll) scroll.scrollTop = libraryFormScrollTop;
+  }, 0);
+}
+
 function bindSavedLibraryEvents(): void {
   document.querySelector('#saved-library-tab')?.addEventListener('click', () => switchWorkspace('saved-library'));
-  document.querySelector('#save-set')?.addEventListener('click', () => openLibrarySaveModal('prompt'));
-  document.querySelector('#open-saved-library-menu')?.addEventListener('click', () => switchWorkspace('saved-library'));
-  document.querySelector('#save-library-prompt')?.addEventListener('click', () => openLibrarySaveModal('prompt'));
-  document.querySelector('#save-library-mix')?.addEventListener('click', () => openLibrarySaveModal('artist-mix'));
-  document.querySelector('#save-library-empty')?.addEventListener('click', () => openLibrarySaveModal('prompt'));
+  document.querySelector('#save-library-prompt')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
+  document.querySelector('#save-library-mix')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'manual'));
+  document.querySelector('#save-library-empty')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
   document.querySelector('#saved-library-search')?.addEventListener('input', event => { savedLibrarySearch = (event.target as HTMLInputElement).value; render(); });
   document.querySelectorAll<HTMLButtonElement>('[data-library-filter]').forEach(button => button.addEventListener('click', () => { savedLibraryFilter = button.dataset.libraryFilter as typeof savedLibraryFilter; render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-copy-library],[data-copy-library-card]').forEach(button => button.addEventListener('click', () => {
-    const item = savedLibrary.find(value => value.id === (button.dataset.copyLibrary ?? button.dataset.copyLibraryCard));
+  document.querySelectorAll<HTMLButtonElement>('[data-library-copy]').forEach(button => button.addEventListener('click', () => {
+    const item = savedLibrary.find(value => value.id === button.dataset.libraryCopy);
     if (!item) return;
-    const value = item.kind === 'prompt' && item.snapshot ? buildBasePrompt(item.snapshot.base) : item.prompt;
-    void copy(value, `[data-copy-library-card="${item.id}"],[data-copy-library="${item.id}"]`);
+    const index = Number(button.dataset.libraryIndex);
+    const polarity = index < 0 ? libraryPolarities.get(item.id)?.base ?? 'positive' : libraryPolarities.get(item.id)?.characters[index] ?? 'positive';
+    const value = libraryPromptSide(item, index, polarity);
+    if (value) void copy(value, `[data-library-copy="${item.id}"][data-library-index="${index}"]`);
   }));
-  document.querySelectorAll<HTMLButtonElement>('[data-restore-library]').forEach(button => button.addEventListener('click', () => openLibraryConfirmation('restore', button.dataset.restoreLibrary!)));
+  document.querySelectorAll<HTMLButtonElement>('[data-library-polarity]').forEach(button => button.addEventListener('click', () => patchLibraryPromptBlock(button)));
   document.querySelectorAll<HTMLButtonElement>('[data-edit-library]').forEach(button => button.addEventListener('click', () => openLibraryEditModal(button.dataset.editLibrary!)));
   document.querySelectorAll<HTMLButtonElement>('[data-delete-library]').forEach(button => button.addEventListener('click', () => openLibraryConfirmation('delete', button.dataset.deleteLibrary!)));
   if (!libraryModalMode) return;
@@ -920,8 +1100,12 @@ function bindSavedLibraryEvents(): void {
   for (const eventName of ['dragenter', 'dragover']) drop?.addEventListener(eventName, event => { event.preventDefault(); drop.classList.add('is-dragging'); });
   for (const eventName of ['dragleave', 'drop']) drop?.addEventListener(eventName, event => { event.preventDefault(); drop.classList.remove('is-dragging'); });
   drop?.addEventListener('drop', event => void readLibraryCover((event as DragEvent).dataTransfer?.files[0]));
-  document.querySelector('#remove-library-cover')?.addEventListener('click', () => { libraryCoverRemoved = true; libraryCoverBytes = null; libraryCoverMime = undefined; revokeSavedLibraryImageUrl('__draft__'); render(); });
-  document.querySelector('#confirm-library-action')?.addEventListener('click', () => { const item = libraryModalItemId ? savedLibrary.find(value => value.id === libraryModalItemId) : undefined; if (!item) return; if (libraryModalMode === 'restore') restoreLibraryItem(item); else void deleteLibraryItem(item); });
+  document.querySelector('#remove-library-cover')?.addEventListener('click', () => { captureLibraryFormDraft(); libraryCoverRemoved = true; libraryCoverBytes = null; libraryCoverMime = undefined; revokeSavedLibraryImageUrl('__draft__'); render(); });
+  document.querySelector('#add-library-character')?.addEventListener('click', () => { captureLibraryFormDraft(); libraryFormPrompt = { ...libraryFormPrompt, characters: [...libraryFormPrompt.characters, { id: id(), label: `Character ${libraryFormPrompt.characters.length + 1}`, positive: '', negative: '' }] }; render(); });
+  document.querySelectorAll<HTMLButtonElement>('[data-remove-library-character]').forEach(button => button.addEventListener('click', () => removeLibraryCharacter(button.dataset.removeLibraryCharacter!)));
+  document.querySelector('#confirm-library-action')?.addEventListener('click', () => { const item = libraryModalItemId ? savedLibrary.find(value => value.id === libraryModalItemId) : undefined; if (item) void deleteLibraryItem(item); });
+  const formScroll = document.querySelector<HTMLElement>('[data-library-form-scroll]');
+  if (formScroll) formScroll.scrollTop = libraryFormScrollTop;
 }
 
 function bindEvents(): void {
@@ -940,6 +1124,7 @@ function bindEvents(): void {
     if (zone && zone in accordionOpenState) accordionOpenState[zone] = details.open;
   }));
   document.querySelector('#copy-prompt')?.addEventListener('click', () => void copy(prompt(), '#copy-prompt'));
+  document.querySelector('#save-prompt-library')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'prompt-builder'));
   document.querySelector('#copy-artists')?.addEventListener('click', () => void copy(buildArtistsPrompt(base.artists), '#copy-artists'));
   document.querySelector('#reset')?.addEventListener('click', resetPrompt);
   document.querySelector<HTMLSelectElement>('#animation-mode')?.addEventListener('change', event => {
@@ -1510,7 +1695,7 @@ function bindArtistMixEvents(): void {
   document.querySelector('#mix-artists')?.addEventListener('click', randomizeMix);
   document.querySelector('#mix-reroll-companion-weights')?.addEventListener('click', rerollMixCompanionWeights);
   document.querySelector('#copy-mix-prompt')?.addEventListener('click', () => void copy(buildArtistsPrompt(mixArtists()), '#copy-mix-prompt'));
-  document.querySelector('#save-mix-library')?.addEventListener('click', () => openLibrarySaveModal('artist-mix'));
+  document.querySelector('#save-mix-library')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'artist-mix'));
   document.querySelector('#open-mix-primary-picker')?.addEventListener('click', event => openMixPicker('primary', event.currentTarget as HTMLElement));
   document.querySelector('#open-mix-primary-picker-empty')?.addEventListener('click', event => openMixPicker('primary', event.currentTarget as HTMLElement));
   document.querySelector('#open-mix-companion-picker')?.addEventListener('click', event => openMixPicker('companion', event.currentTarget as HTMLElement));
@@ -1592,13 +1777,17 @@ function bindSettingsEvents(): void {
   });
   document.querySelector<HTMLSelectElement>('#studio-theme')?.addEventListener('change', event => {
     const value = (event.target as HTMLSelectElement).value;
-    settings = { ...settings, theme: value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' ? value : 'arcane-gold' };
+    settings = { ...settings, theme: studioThemes.some(theme => theme.id === value) ? value as AppSettings['theme'] : 'arcane-gold' };
     applyTheme(); saveSettings(settings);
   });
   document.querySelector<HTMLInputElement>('#startup-catalog-update')?.addEventListener('change', event => { settings = { ...settings, updateCatalogOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
   document.querySelector<HTMLInputElement>('#startup-app-update')?.addEventListener('change', event => { settings = { ...settings, checkAppUpdatesOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
   document.querySelector('#replay-guide')?.addEventListener('click', () => { startGuide(true); render(); });
   document.querySelector('#check-app-update')?.addEventListener('click', () => void checkAppUpdate(true));
+  document.querySelector('#download-app-update')?.addEventListener('click', () => void downloadAppUpdate());
+  document.querySelector('#resume-app-update')?.addEventListener('click', () => void downloadAppUpdate());
+  document.querySelector('#cancel-app-update')?.addEventListener('click', () => void cancelAppUpdate());
+  document.querySelector('#install-app-update')?.addEventListener('click', () => void installAppUpdate());
   document.querySelector('#download-missing-v5')?.addEventListener('click', () => void startCatalogUpdate());
   document.querySelector('#cancel-v5-update')?.addEventListener('click', () => void window.naiCatalog?.cancel());
   if (!catalogUpdateUnsubscribe && window.naiCatalog) {
@@ -1613,18 +1802,65 @@ function bindSettingsEvents(): void {
     });
   }
 }
+function updateAppProgressDom(): void {
+  const status = document.querySelector<HTMLElement>('#app-update-status');
+  if (status) status.textContent = appUpdatePhaseCopy();
+  const progress = document.querySelector<HTMLElement>('#app-update-progress');
+  const track = progress?.querySelector<HTMLElement>('.progress-track span');
+  if (track) track.style.width = `${appUpdateProgress.percent}%`;
+  const bar = progress?.querySelector<HTMLElement>('.progress-track');
+  if (bar) bar.setAttribute('aria-valuenow', String(appUpdateProgress.percent));
+  const label = document.querySelector<HTMLElement>('#app-update-progress-label');
+  if (label) label.textContent = `Download ${appUpdateProgress.percent}% complete, ${formatUpdateBytes(appUpdateProgress.completed)} of ${formatUpdateBytes(appUpdateProgress.total)}.${appUpdateProgress.message ? ` ${appUpdateProgress.message}` : ''}`;
+}
+function bindAppUpdateProgress(): void {
+  if (appUpdateUnsubscribe || !window.naiUpdater) return;
+  appUpdateUnsubscribe = window.naiUpdater.onProgress(event => {
+    appUpdateProgress = { ...event };
+    if (event.phase === 'downloading') appUpdatePhase = 'downloading';
+    else if (event.phase === 'verifying') appUpdatePhase = 'verifying';
+    else if (event.phase === 'paused') appUpdatePhase = 'paused';
+    else if (event.phase === 'ready') appUpdatePhase = 'ready';
+    else if (event.phase === 'error') { appUpdatePhase = 'error'; appUpdateMessage = event.message || 'The update download failed.'; }
+    updateAppProgressDom();
+  });
+}
 async function checkAppUpdate(interactive = false): Promise<void> {
-  if (!window.naiUpdater) return;
-  appUpdateStatus = 'Checking GitHub releases...'; if (interactive) render();
+  if (!window.naiUpdater || appUpdatePhase === 'downloading' || appUpdatePhase === 'verifying' || appUpdatePhase === 'installing') return;
+  appUpdatePhase = 'checking'; appUpdateMessage = ''; if (interactive && activeWorkspace === 'settings') render();
   try {
     const result = await window.naiUpdater.check();
-    if (!result.available) appUpdateStatus = 'NAI Prompt Studio is up to date.';
-    else {
-      appUpdateStatus = `Version ${result.version} is available.`;
-      await window.naiUpdater.downloadAndInstall(result);
-    }
-  } catch (error) { appUpdateStatus = error instanceof Error ? error.message : 'The update check failed.'; }
+    if (appUpdatePhase !== 'checking') return;
+    appUpdateManifest = result.available ? result : null;
+    appUpdatePhase = result.available ? 'available' : 'up-to-date';
+  } catch (error) {
+    if (appUpdatePhase !== 'checking') return;
+    appUpdatePhase = 'error'; appUpdateMessage = error instanceof Error ? error.message : 'The update check failed.';
+  }
   if (activeWorkspace === 'settings') render();
+}
+async function downloadAppUpdate(): Promise<void> {
+  if (!window.naiUpdater || !appUpdateManifest || appUpdatePhase === 'downloading' || appUpdatePhase === 'verifying') return;
+  appUpdatePhase = 'downloading'; appUpdateMessage = ''; appUpdateProgress = { ...appUpdateProgress, phase: 'starting', completed: 0, total: appUpdateManifest.size ?? 0, percent: 0 }; render();
+  try {
+    const result = await window.naiUpdater.download(appUpdateManifest);
+    if (result.state === 'ready') appUpdatePhase = 'ready';
+    else if (result.state === 'cancelled') appUpdatePhase = 'paused';
+    else appUpdatePhase = 'up-to-date';
+  } catch (error) { appUpdatePhase = 'error'; appUpdateMessage = error instanceof Error ? error.message : 'The update download failed.'; }
+  if (activeWorkspace === 'settings') render();
+}
+async function cancelAppUpdate(): Promise<void> {
+  if (!window.naiUpdater) return;
+  await window.naiUpdater.cancel();
+  appUpdatePhase = 'paused';
+  updateAppProgressDom();
+  if (activeWorkspace === 'settings') render();
+}
+async function installAppUpdate(): Promise<void> {
+  if (!window.naiUpdater || !appUpdateManifest || appUpdatePhase !== 'ready') return;
+  appUpdatePhase = 'installing'; appUpdateMessage = ''; render();
+  try { await window.naiUpdater.install(appUpdateManifest); } catch (error) { appUpdatePhase = 'error'; appUpdateMessage = error instanceof Error ? error.message : 'The update could not be installed.'; if (activeWorkspace === 'settings') render(); }
 }
 async function startCatalogUpdate(): Promise<void> {
   if (!window.naiCatalog || catalogUpdateBusy) return;
@@ -1724,7 +1960,11 @@ function resetPrompt(): void { base = emptyBase(); characters = []; randomRange 
 async function copy(value: string, selector: string): Promise<void> {
   try { await navigator.clipboard.writeText(value); } catch { /* clipboard permissions are optional */ }
   const button = document.querySelector<HTMLButtonElement>(selector);
-  if (button) { const initial = button.textContent; button.textContent = 'Copied'; window.setTimeout(() => { button.textContent = initial; }, 900); }
+  if (button?.classList.contains('library-copy-icon')) {
+    const label = button.getAttribute('aria-label') ?? 'Copy prompt';
+    button.dataset.copied = 'true'; button.setAttribute('aria-label', 'Copied'); button.title = 'Copied';
+    window.setTimeout(() => { delete button.dataset.copied; button.setAttribute('aria-label', label); button.title = label; }, 900);
+  } else if (button) { const initial = button.textContent; button.textContent = 'Copied'; window.setTimeout(() => { button.textContent = initial; }, 900); }
 }
 function saveCurrentSet(): void {
   openLibrarySaveModal('prompt');
@@ -1780,24 +2020,24 @@ async function loadGuide(): Promise<void> {
 }
 
 function startupMarkup(): string {
-  const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : 0;
+  const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : startupReady ? 100 : 0;
   const error = !startupBusy && startupError ? `<div class="startup-error" role="alert"><b>Catalog startup could not finish.</b><p>${escapeHtml(startupError)}</p><button class="secondary" id="startup-retry" type="button">Retry</button><button class="tiny-copy" id="startup-continue" type="button">Continue to app</button></div>` : '';
   const failure = !startupBusy && startupFailures.length ? `<div class="startup-failure" role="status"><b>${startupFailures.length} preview${startupFailures.length === 1 ? '' : 's'} failed.</b><p>The catalog is ready. You can retry failed previews or continue.</p><button class="secondary" id="startup-retry-failed" type="button">Retry failed</button><button class="tiny-copy" id="startup-continue-failed" type="button">Continue</button></div>` : '';
-  return `<main class="startup-shell"><section class="startup-panel" aria-labelledby="startup-title"><img class="startup-mark startup-icon" src="./app-icon.png" alt=""><p class="eyebrow">NAI PROMPT STUDIO</p><h1 id="startup-title">Waking the V5 constellation</h1><p class="startup-copy">${escapeHtml(startupPhase)}. Preview data stays on this device.</p><div class="startup-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${startupTotal || 1}" aria-valuenow="${startupCompleted}" aria-label="Loading card previews"><div class="progress-track"><span style="width:${progress}%"></span></div><b>${startupCompleted.toLocaleString()} / ${startupTotal.toLocaleString()}</b></div>${error}${failure}</section></main>`;
+  return `<main class="startup-shell"><section class="startup-panel" aria-labelledby="startup-title"><img class="startup-mark startup-icon" src="./app-icon.png" alt=""><p class="eyebrow">NAI PROMPT STUDIO</p><h1 id="startup-title">Waking the V5 constellation</h1><p class="startup-copy">${escapeHtml(startupPhase)}. Preview data stays on this device.</p><div class="startup-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-label="Loading card previews"><div class="progress-track"><span style="width:${progress}%"></span></div><b>${progress}%</b></div>${error}${failure}</section></main>`;
 }
 function renderStartup(): void {
   const app = document.querySelector<HTMLDivElement>('#app');
   if (!app) return;
   if (app.querySelector('.startup-shell')) {
-    const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : 0;
+    const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : startupReady ? 100 : 0;
     const track = app.querySelector<HTMLElement>('.startup-progress .progress-track span');
     if (track) track.style.width = `${progress}%`;
     const value = app.querySelector<HTMLElement>('.startup-progress b');
-    if (value) value.textContent = `${startupCompleted.toLocaleString()} / ${startupTotal.toLocaleString()}`;
+    if (value) value.textContent = `${progress}%`;
     const copy = app.querySelector<HTMLElement>('.startup-copy');
     if (copy) copy.textContent = `${startupPhase}. Preview data stays on this device.`;
     const bar = app.querySelector<HTMLElement>('.startup-progress');
-    bar?.setAttribute('aria-valuenow', String(startupCompleted));
+    bar?.setAttribute('aria-valuenow', String(progress));
     if (!startupFailures.length && !startupError && !app.querySelector('.startup-error, .startup-failure')) return;
   }
   app.innerHTML = startupMarkup();
@@ -1826,12 +2066,11 @@ async function decodePreview(card: CatalogCard): Promise<boolean> {
 }
 async function preloadCards(cards: CatalogCard[], phase: string): Promise<CatalogCard[]> {
   startupPhase = phase;
-  startupCompleted = 0;
-  startupTotal = cards.length;
+  const completedBeforePhase = startupCompleted;
   const retryIds = new Set(cards.map(card => card.catalogId ?? card.id));
   startupFailedCards = startupFailedCards.filter(card => !retryIds.has(card.catalogId ?? card.id));
   renderStartup();
-  const result = await decodePreviews(cards, decodePreview, 6, (completed) => { startupCompleted = completed; renderStartup(); });
+  const result = await decodePreviews(cards, decodePreview, 6, (completed) => { startupCompleted = completedBeforePhase + completed; renderStartup(); });
   startupFailedCards = [...startupFailedCards, ...result.failed];
   startupFailures = startupFailedCards.map(card => card.tag);
   renderStartup();
@@ -1841,6 +2080,9 @@ async function retryStartupFailures(): Promise<void> {
   const failed = [...startupFailedCards];
   if (!failed.length) return;
   startupBusy = true;
+  startupCompleted = 0;
+  startupTotal = failed.length;
+  startupReady = failed.length === 0;
   await preloadCards(failed, 'Retrying failed previews');
   startupBusy = false;
   if (!startupFailedCards.length) {
@@ -1861,12 +2103,16 @@ async function bootApp(): Promise<void> {
   startupPhase = 'Loading catalog';
   startupCompleted = 0;
   startupTotal = 0;
+  startupReady = false;
   renderStartup();
   await Promise.all([loadCatalog(), loadGuide()]);
   if (catalogState !== 'ready') { startupError = catalogError || 'The V5 catalog could not be loaded.'; startupBusy = false; renderStartup(); return; }
+  startupTotal = catalog.artists.length + (settings.preloadCharacterPreviews ? catalog.characters.length : 0);
+  if (!startupTotal) { startupReady = true; startupPhase = 'Opening studio'; startupBusy = false; renderStartup(); openStudioAfterStartup(); return; }
   await preloadCards(catalog.artists, 'Preparing V5 artist previews');
   if (settings.preloadCharacterPreviews && catalog.characters.length) await preloadCards(catalog.characters, 'Preparing character previews');
   startupBusy = false;
+  startupReady = true;
   if (startupFailedCards.length) { startupPhase = 'Preview loading paused'; startupFailures = startupFailedCards.map(card => card.tag); renderStartup(); return; }
   startupPhase = 'Opening studio';
   openStudioAfterStartup();
@@ -1874,6 +2120,7 @@ async function bootApp(): Promise<void> {
 
 applyAnimationMode(animationMode);
 applyTheme();
+bindAppUpdateProgress();
 renderStartup();
 void bootApp();
 window.addEventListener('resize', scheduleMixOrbitThreads);
