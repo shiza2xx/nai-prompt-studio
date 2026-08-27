@@ -1,7 +1,7 @@
 export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 
 export type AnimationMode = 'auto' | 'on' | 'off';
-export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir' | 'celestial-light' | 'ember-peach' | 'gothic-ivory';
+export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir' | 'celestial-light' | 'ember-peach' | 'gothic-ivory' | 'galaxy';
 
 export interface WeightedTag {
   id: string;
@@ -124,6 +124,8 @@ export interface ArtistMixDraft {
   companions: WeightedTag[];
   randomRange: { min: number; max: number };
   favoritesOnly: boolean;
+  /** Whether Mix and strength rerolls leave anchor weights unchanged. */
+  anchorWeightsLocked: boolean;
 }
 
 export interface GuideExample {

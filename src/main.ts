@@ -18,7 +18,7 @@ type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 's
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.0';
+const APP_VERSION = '0.6.1';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -84,7 +84,12 @@ let onboardingOpen = false;
 let onboardingSteps: Array<{ id: string; title: string; copy: string }> = [];
 let onboardingIndex = 0;
 let mixThreadFrame: number | undefined;
-let mixPickerMode: 'primary' | 'companion' = 'primary';
+let mixPickerMode: 'primary' | 'companion' | 'replace-anchor' = 'primary';
+let mixPickerReplaceTarget: string | null = null;
+let mixTransitionActive = false;
+let mixTransitionToken = 0;
+let mixTransitionTimer: number | undefined;
+let mixTransitionRevealFrame: number | undefined;
 let constructorZone: ConstructorZone | null = null;
 let constructorTrigger: HTMLElement | null = null;
 let constructorSearch = '';
@@ -212,7 +217,7 @@ function applyAnimationMode(mode: AnimationMode): void {
 function applyTheme(): void { document.documentElement.dataset.theme = settings.theme; }
 const studioThemes: Array<{ id: AppSettings['theme']; label: string }> = [
   { id: 'arcane-gold', label: 'Arcane Gold' }, { id: 'midnight-blue', label: 'Midnight Blue' }, { id: 'raspberry-rose', label: 'Raspberry Rose' }, { id: 'noir', label: 'Noir' },
-  { id: 'celestial-light', label: 'Celestial Light' }, { id: 'ember-peach', label: 'Ember Peach' }, { id: 'gothic-ivory', label: 'Gothic' }
+  { id: 'celestial-light', label: 'Celestial Light' }, { id: 'ember-peach', label: 'Ember Peach' }, { id: 'gothic-ivory', label: 'Gothic' }, { id: 'galaxy', label: 'Galaxy' }
 ];
 function themeOptions(): string { return studioThemes.map(theme => `<option value="${theme.id}"${settings.theme === theme.id ? ' selected' : ''}>${theme.label}</option>`).join(''); }
 function onboardingMarkup(): string {
@@ -231,7 +236,7 @@ function startGuide(replay = false): void {
     { id: 'overview-metadata', title: 'Image Metadata', copy: 'Drop a PNG or WebP image to inspect and copy its NovelAI generation data.' },
     { id: 'overview-settings', title: 'Settings', copy: 'Choose a theme, control motion and manage catalog or application updates.' }
   ];
-  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings includes studio themes, catalog refresh controls and secure GitHub update checks.' }, { id: 'v050-saved-library', title: 'Saved Library', copy: 'Save complete prompt and Artist Mix records, then edit or copy them from one library.' }, { id: 'v060-themes', title: 'Seven studio themes', copy: 'Choose a theme now. Your selection applies immediately and stays on this device.' }];
+  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings includes studio themes, catalog refresh controls and secure GitHub update checks.' }, { id: 'v050-saved-library', title: 'Saved Library', copy: 'Save complete prompt and Artist Mix records, then edit or copy them from one library.' }, { id: 'v060-themes', title: 'Eight studio themes', copy: 'Choose a theme now. Your selection applies immediately and stays on this device.' }];
   const candidates = replay || !existingProfileAtStartup ? overview : update;
   onboardingSteps = replay ? candidates : candidates.filter(step => !settings.seenGuideIds.includes(step.id));
   onboardingIndex = 0; onboardingOpen = onboardingSteps.length > 0;
@@ -239,12 +244,69 @@ function startGuide(replay = false): void {
 }
 function finishGuide(): void { settings = { ...settings, seenGuideIds: [...new Set([...settings.seenGuideIds, ...onboardingSteps.map(step => step.id)])], lastSeenVersion: APP_VERSION }; saveSettings(settings); onboardingOpen = false; render(); }
 
+function mixMotionEnabled(): boolean {
+  if (animationMode === 'off') return false;
+  if (animationMode === 'auto' && typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return false;
+  return true;
+}
+
+function syncMixTransitionButton(): void {
+  const button = document.querySelector<HTMLButtonElement>('#mix-artists');
+  if (!button) return;
+  button.disabled = mixTransitionActive;
+  button.setAttribute('aria-busy', String(mixTransitionActive));
+  button.textContent = mixTransitionActive ? 'Mixing artists...' : 'Mix artists';
+}
+
+function revealMixCompanionSlots(token: number): void {
+  if (mixTransitionRevealFrame !== undefined) window.cancelAnimationFrame(mixTransitionRevealFrame);
+  mixTransitionRevealFrame = window.requestAnimationFrame(() => {
+    mixTransitionRevealFrame = undefined;
+    if (!mixTransitionActive || token !== mixTransitionToken) return;
+    layoutMixOrbitThreads();
+    window.requestAnimationFrame(() => {
+      if (!mixTransitionActive || token !== mixTransitionToken) return;
+      document.querySelectorAll<HTMLElement>('.mix-orbit-slot.is-mix-entering').forEach(slot => slot.classList.remove('is-mix-entering'));
+      mixTransitionActive = false;
+      syncMixTransitionButton();
+    });
+  });
+}
+
 function commitArtistMix(nextMix: ArtistMixDraft, notice: string): void {
+  const oldCompanions = document.querySelectorAll<HTMLElement>('.mix-orbit-slot').length;
+  const shouldAnimate = mixMotionEnabled() && activeWorkspace === 'artist-mix' && Boolean(document.querySelector('.mix-orbit'));
+  if (mixTransitionTimer !== undefined) window.clearTimeout(mixTransitionTimer);
+  if (mixTransitionRevealFrame !== undefined) window.cancelAnimationFrame(mixTransitionRevealFrame);
+  mixTransitionTimer = undefined;
+  mixTransitionRevealFrame = undefined;
+  mixTransitionToken += 1;
+  const token = mixTransitionToken;
   artistMix = nextMix;
   mixNotice = notice;
   saveArtistMixSoon();
   clearArtistCardPreview();
-  render();
+  if (!shouldAnimate) {
+    mixTransitionActive = false;
+    render();
+    if (activeWorkspace === 'artist-mix' && document.querySelector('.mix-orbit')) layoutMixOrbitThreads();
+    return;
+  }
+  mixTransitionActive = true;
+  document.querySelectorAll<HTMLElement>('.mix-orbit-slot').forEach(slot => slot.classList.add('is-mix-exiting'));
+  syncMixTransitionButton();
+  const noticeElement = document.querySelector<HTMLElement>('#mix-notice');
+  if (noticeElement) { noticeElement.textContent = mixNotice; noticeElement.hidden = !mixNotice; }
+  const finish = (): void => {
+    mixTransitionTimer = undefined;
+    if (!mixTransitionActive || token !== mixTransitionToken) return;
+    if (activeWorkspace !== 'artist-mix') { mixTransitionActive = false; return; }
+    render();
+    revealMixCompanionSlots(token);
+  };
+  // The exit phase is short enough to keep the old companions readable while
+  // the next state is prepared, and the zero-companion case commits at once.
+  mixTransitionTimer = window.setTimeout(finish, oldCompanions ? 150 : 0);
 }
 
 function currentDraft(): PromptDraft {
@@ -311,7 +373,7 @@ function promptArtistPickerPage(): ReturnType<typeof paginateArtists> {
 }
 
 function currentMixArtistPickerPage(): ReturnType<typeof paginateArtists> {
-  const useFavorites = mixPickerMode === 'companion' && artistMix.favoritesOnly;
+  const useFavorites = artistMix.favoritesOnly;
   const page = paginateArtists(catalog.artists, { query: artistSearch, favoritesOnly: useFavorites, favoriteIds: artistFavorites, page: mixArtistPage });
   mixArtistPage = page.page;
   return page;
@@ -360,7 +422,12 @@ function mixArtistCardMarkup(item: WeightedTag, anchor: boolean): string {
   const value = normalizeArtistWeight(item.weight);
   const image = artistImage(item);
   const label = item.tag.replace(/^artist:\s*/i, '');
-  return `<article class="selected-artist mix-artist-card ${anchor ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>${anchor ? 'ANCHOR ARTIST' : 'COMPANION ARTIST'}</small><b>${escapeHtml(label)}</b><div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(label)}"><input class="mix-weight-number" type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(label)}"><button class="tiny-copy reroll-weight" type="button" data-mix-reroll="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(label)}">Reroll</button></div></div>${!anchor || artistMix.anchors.length > 1 ? `<button class="mix-pin ${anchor ? 'is-pinned' : ''}" type="button" data-mix-pin="${escapeHtml(item.id)}" aria-pressed="${anchor}" aria-label="${anchor ? 'Unpin' : 'Pin'} ${escapeHtml(label)}">${anchor ? '◆' : '◇'}</button>` : ''}<button class="icon-button" type="button" data-mix-remove="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(label)}">×</button></article>`;
+  const weightControls = `<div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(label)}"><input class="mix-weight-number" type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(label)}"><button class="tiny-copy reroll-weight" type="button" data-mix-reroll="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(label)}">Reroll</button></div>`;
+  const articleAttrs = `class="selected-artist mix-artist-card ${anchor ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"`;
+  const actions = `${!anchor || artistMix.anchors.length > 1 ? `<button class="mix-pin ${anchor ? 'is-pinned' : ''}" type="button" data-mix-pin="${escapeHtml(item.id)}" aria-pressed="${anchor}" aria-label="${anchor ? 'Unpin' : 'Pin'} ${escapeHtml(label)}">${anchor ? '◆' : '◇'}</button>` : ''}<button class="icon-button" type="button" data-mix-remove="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(label)}">×</button>`;
+  if (!anchor) return `<article ${articleAttrs}><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>COMPANION ARTIST</small><b>${escapeHtml(label)}</b>${weightControls}</div>${actions}</article>`;
+  const identity = `<button class="mix-anchor-replace-trigger" type="button" data-mix-replace-anchor="${escapeHtml(item.id)}" aria-label="Replace anchor ${escapeHtml(label)}"><span class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></span><span class="selected-artist-copy"><small>ANCHOR ARTIST</small><b>${escapeHtml(label)}</b></span></button>`;
+  return `<article ${articleAttrs}><div class="mix-anchor-identity">${identity}${weightControls}</div>${actions}</article>`;
 }
 function mixOrbitMarkup(): string {
   const anchors = artistMix.anchors;
@@ -369,12 +436,13 @@ function mixOrbitMarkup(): string {
   const satellites = companions.map((item, index) => {
     const scale = mixCompanionScale(item.weight);
     const fallback = fallbackLayout.placements[index] ?? { x: 50, y: 50, row: 'top' as const };
-    return `<div class="mix-orbit-slot" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-row="${fallback.row}" style="--mix-weight-scale:${scale};--orbit-x:${fallback.x}%;--orbit-y:${fallback.y}%"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
+    const transitionClass = mixTransitionActive ? ' is-mix-entering' : '';
+    return `<div class="mix-orbit-slot${transitionClass}" role="listitem" data-mix-orbit-id="${escapeHtml(item.id)}" data-orbit-row="${fallback.row}" style="--mix-slot-index:${index};--mix-weight-scale:${scale};--orbit-x:${fallback.x}%;--orbit-y:${fallback.y}%"><div class="mix-orbit-carrier"><div class="mix-orbit-connector" aria-hidden="true"></div><div class="mix-orbit-upright"><div class="mix-orbit-card-shell">${mixArtistCardMarkup(item, false)}</div></div></div></div>`;
   }).join('');
   const center = anchors.length
-    ? `<div class="mix-orbit-primary mix-anchor-group" role="group" aria-label="Pinned anchor artists">${anchors.map(item => mixArtistCardMarkup(item, true)).join('')}</div>`
+    ? `<div class="mix-orbit-primary mix-anchor-group ${anchors.length > 1 ? 'is-multi-anchor' : 'is-single-anchor'}" data-anchor-count="${anchors.length}" role="group" aria-label="Pinned anchor artists">${anchors.map(item => mixArtistCardMarkup(item, true)).join('')}</div>`
     : '<div class="mix-orbit-primary" role="listitem"><button class="empty-artist-card mix-orbit-empty" id="open-mix-primary-picker-empty" type="button"><img src="./plus.png" alt=""><b>Choose anchor artist</b><small>Your fixed center for this mix</small></button></div>';
-  return `<div class="mix-orbit" role="list" aria-label="Primary artist surrounded by companion artists" data-layout-ready="true"><div class="mix-orbit-ring mix-orbit-ring-inner" aria-hidden="true"></div><div class="mix-orbit-ring mix-orbit-ring-outer" aria-hidden="true"></div>${center}${satellites}</div>`;
+  return `<div class="mix-orbit" role="list" aria-label="Primary artist surrounded by companion artists" data-layout-ready="true" data-anchor-count="${anchors.length}"><div class="mix-orbit-ring mix-orbit-ring-inner" aria-hidden="true"></div><div class="mix-orbit-ring mix-orbit-ring-outer" aria-hidden="true"></div>${center}${satellites}</div>`;
 }
 
 function rectangleEdge(rect: DOMRect, targetX: number, targetY: number): { x: number; y: number } {
@@ -465,9 +533,9 @@ function artistMixWorkspace(): string {
   const range = { min: Math.min(maxTotal, Math.max(requiredMin, normalizedRange.min)), max: Math.min(maxTotal, Math.max(requiredMin, normalizedRange.max)) };
   const total = mixArtists();
   const poolSize = mixPool().length;
-  const status = mixNotice ? `<p class="random-notice" role="status">${escapeHtml(mixNotice)}</p>` : '';
+  const status = `<p class="random-notice" id="mix-notice" role="status"${mixNotice ? '' : ' hidden'}>${escapeHtml(mixNotice)}</p>`;
   const panelLabel = focusMode ? 'aria-label="Artist Mix"' : 'aria-labelledby="artist-mix-tab"';
-  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><div class="mix-actions"><button class="primary" id="mix-artists" type="button">Mix artists</button><button class="secondary" id="mix-reroll-companion-weights" type="button">Reroll companions</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div>${status}</section><section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
+  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><div class="mix-behavior-toggles" role="group" aria-label="Mix behavior"><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><button class="chip mix-lock-toggle ${artistMix.anchorWeightsLocked ? 'on' : ''}" id="mix-anchor-weights-lock" type="button" aria-pressed="${artistMix.anchorWeightsLocked}"><span class="mix-lock-switch" aria-hidden="true"></span>Lock anchor strength</button></div><div class="mix-actions"><button class="primary" id="mix-artists" type="button" ${mixTransitionActive ? 'disabled aria-busy="true"' : ''}>${mixTransitionActive ? 'Mixing artists...' : 'Mix artists'}</button><button class="secondary" id="mix-reroll-strength" type="button">Reroll strength</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div>${status}</section><section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
 }
 
 function mixPickerMarkup(): string {
@@ -1608,13 +1676,70 @@ function addArtist(cardId: string): void {
 }
 
 function saveArtistMixSoon(): void { saveArtistMix(artistMix); }
+function syncMixWeightState(nextMix: ArtistMixDraft, changedIds: ReadonlySet<string> | readonly string[], focusTarget?: HTMLElement | null, notice = mixNotice): void {
+  artistMix = nextMix;
+  mixNotice = notice;
+  const ids = changedIds instanceof Set ? changedIds : new Set(changedIds);
+  if (ids.size) document.querySelectorAll<HTMLInputElement>('[data-mix-weight],[data-mix-weight-range]').forEach(control => {
+    const target = control.dataset.mixWeight ?? control.dataset.mixWeightRange;
+    if (!target || !ids.has(target)) return;
+    const current = mixArtists().find(item => item.id === target);
+    if (current) control.value = current.weight.toFixed(1);
+  });
+  if (ids.size) document.querySelectorAll<HTMLElement>('.mix-orbit-slot').forEach(slot => {
+    const target = slot.dataset.mixOrbitId;
+    if (!target || !ids.has(target)) return;
+    const companion = artistMix.companions.find(item => item.id === target);
+    if (companion) slot.style.setProperty('--mix-weight-scale', String(mixCompanionScale(companion.weight)));
+  });
+  document.querySelector('#mix-prompt-output')?.replaceChildren(document.createTextNode(buildArtistsPrompt(mixArtists())));
+  const noticeElement = document.querySelector<HTMLElement>('#mix-notice');
+  if (noticeElement) { noticeElement.textContent = mixNotice; noticeElement.hidden = !mixNotice; }
+  saveArtistMixSoon();
+  if (typeof document !== 'undefined') scheduleMixOrbitThreads();
+  if (focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
+}
+function syncMixBehaviorControls(): void {
+  const favoritesButton = document.querySelector<HTMLButtonElement>('#mix-favorites-only');
+  if (favoritesButton) {
+    favoritesButton.classList.toggle('on', artistMix.favoritesOnly);
+    favoritesButton.setAttribute('aria-pressed', String(artistMix.favoritesOnly));
+    favoritesButton.textContent = `★ Favorites (${mixPool().length})`;
+  }
+  const lockButton = document.querySelector<HTMLButtonElement>('#mix-anchor-weights-lock');
+  if (lockButton) {
+    lockButton.classList.toggle('on', artistMix.anchorWeightsLocked);
+    lockButton.setAttribute('aria-pressed', String(artistMix.anchorWeightsLocked));
+  }
+  const noticeElement = document.querySelector<HTMLElement>('#mix-notice');
+  if (noticeElement) { noticeElement.textContent = mixNotice; noticeElement.hidden = !mixNotice; }
+}
+function replaceMixAnchor(card: CatalogCard): void {
+  if (mixTransitionActive) return;
+  const targetId = mixPickerReplaceTarget;
+  const target = targetId ? artistMix.anchors.find(item => item.id === targetId) : undefined;
+  if (!target) { closeMixPicker(); return; }
+  const stableId = card.catalogId ?? card.id;
+  const targetStableId = target.catalogId ?? target.id;
+  if (stableId === targetStableId) { closeMixPicker(); return; }
+  const duplicateAnchor = artistMix.anchors.some(item => item.id !== target.id && (item.catalogId ?? item.id) === stableId);
+  if (duplicateAnchor) return;
+  const duplicateCompanion = artistMix.companions.some(item => (item.catalogId ?? item.id) === stableId);
+  const anchors = artistMix.anchors.map(item => item.id === target.id ? { ...weighted(card, target.weight), id: target.id } : item);
+  const companions = artistMix.companions.filter(item => !duplicateCompanion || (item.catalogId ?? item.id) !== stableId);
+  artistMix = { ...artistMix, anchors, companions };
+  mixNotice = 'Anchor replaced. Its strength was preserved.';
+  saveArtistMixSoon();
+  closeMixPicker();
+  render();
+}
 function setMixPrimary(card: CatalogCard): void {
   const stableId = card.catalogId ?? card.id;
   if (artistMix.anchors.some(item => (item.catalogId ?? item.id) === stableId)) { closeMixPicker(); return; }
   if (artistMix.anchors.length >= 4) { mixNotice = 'Artist Mix supports up to 4 anchors.'; closeMixPicker(); render(); return; }
   const existing = artistMix.companions.find(item => (item.catalogId ?? item.id) === stableId);
   artistMix = { ...artistMix, anchors: [...artistMix.anchors, existing ?? weighted(card)], companions: artistMix.companions.filter(item => (item.catalogId ?? item.id) !== stableId) };
-  mixNotice = 'Anchor added. It will stay fixed during Mix and companion rerolls.';
+  mixNotice = 'Anchor added. Its strength follows the lock setting.';
   saveArtistMixSoon();
   closeMixPicker();
   render();
@@ -1628,8 +1753,9 @@ function addMixCompanion(card: CatalogCard): void {
   render();
 }
 function randomizeMix(): void {
+  if (mixTransitionActive) return;
   if (!catalog.artists.length) { mixNotice = 'The V5 catalog is still loading.'; render(); return; }
-  const anchors = artistMix.anchors;
+  const anchors = artistMix.anchorWeightsLocked ? artistMix.anchors : rerollArtistWeights(artistMix.anchors);
   if (!anchors.length) { mixNotice = 'Choose an anchor artist first.'; render(); return; }
   const anchorIds = new Set(anchors.map(item => item.catalogId ?? item.id));
   const availablePool = catalog.artists.filter(card => !anchorIds.has(card.catalogId ?? card.id) && (!artistMix.favoritesOnly || artistFavorites.has(card.catalogId ?? card.id)));
@@ -1641,14 +1767,28 @@ function randomizeMix(): void {
   const total = randomCount(range.min, range.max);
   const companions = randomArtistSelection(availablePool, Math.max(0, total - anchors.length)).map(({ card, weight }) => weighted(card, weight));
   const nextMix: ArtistMixDraft = { ...artistMix, anchors, companions, randomRange: { min: range.min, max: range.max } };
-  const notice = `Mixed ${total} artists. ${anchors.length} anchor${anchors.length === 1 ? '' : 's'} stayed fixed.`;
+  const notice = artistMix.anchorWeightsLocked
+    ? `Mixed ${total} artists. Anchor strengths stayed fixed. Companion strengths changed.`
+    : `Mixed ${total} artists. Anchor and companion strengths changed.`;
   commitArtistMix(nextMix, notice);
 }
-function rerollMixCompanionWeights(): void {
-  artistMix = { ...artistMix, companions: rerollArtistWeights(artistMix.companions) };
-  mixNotice = artistMix.companions.length ? 'Rerolled companion weights. Anchors stayed unchanged.' : 'Add a companion before rerolling companion weights.';
-  saveArtistMixSoon();
-  render();
+function rerollMixStrength(): void {
+  if (mixTransitionActive) return;
+  const changed = artistMix.anchorWeightsLocked ? artistMix.companions : [...artistMix.anchors, ...artistMix.companions];
+  const changedIds = new Set(changed.map(item => item.id));
+  if (!changed.length) {
+    syncMixWeightState(artistMix, changedIds, document.activeElement as HTMLElement | null, artistMix.anchorWeightsLocked ? 'Add a companion before rerolling strength. Anchor strengths stayed fixed.' : 'Add an artist before rerolling strength. No strengths changed.');
+    return;
+  }
+  const nextMix: ArtistMixDraft = {
+    ...artistMix,
+    anchors: artistMix.anchorWeightsLocked ? artistMix.anchors : rerollArtistWeights(artistMix.anchors),
+    companions: rerollArtistWeights(artistMix.companions)
+  };
+  const notice = artistMix.anchorWeightsLocked
+    ? 'Rerolled companion strengths. Anchor strengths stayed fixed.'
+    : 'Rerolled anchor and companion strengths. No strengths stayed fixed.';
+  syncMixWeightState(nextMix, changedIds, document.activeElement as HTMLElement | null, notice);
 }
 function closeMixPicker(): void {
   const picker = document.querySelector<HTMLElement>('#mix-picker-backdrop');
@@ -1657,12 +1797,16 @@ function closeMixPicker(): void {
   clearArtistCardPreview();
   const trigger = mixPickerTrigger;
   mixPickerTrigger = null;
+  mixPickerReplaceTarget = null;
+  mixPickerMode = 'primary';
   if (trigger?.isConnected) trigger.focus();
 }
-function openMixPicker(mode: 'primary' | 'companion' = 'primary', trigger?: HTMLElement): void {
+function openMixPicker(mode: 'primary' | 'companion' | 'replace-anchor' = 'primary', trigger?: HTMLElement, replaceTarget?: string): void {
+  if (mixTransitionActive) return;
   const picker = document.querySelector<HTMLElement>('#mix-picker-backdrop');
   if (!picker) return;
   mixPickerMode = mode;
+  mixPickerReplaceTarget = mode === 'replace-anchor' ? replaceTarget ?? null : null;
   mixArtistPage = 1;
   mixPickerTrigger = trigger ?? document.activeElement as HTMLElement;
   modal = 'artists';
@@ -1674,7 +1818,9 @@ function refreshMixPicker(): void {
   const grid = document.querySelector<HTMLElement>('#mix-artist-grid');
   if (!grid) return;
   const page = currentMixArtistPickerPage();
-  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"><span class="card-image"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
+  const replaceTarget = mixPickerReplaceTarget ? artistMix.anchors.find(item => item.id === mixPickerReplaceTarget) : undefined;
+  const replaceTargetStableId = replaceTarget ? replaceTarget.catalogId ?? replaceTarget.id : null;
+  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
   grid.scrollTop = 0;
   document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
   const pageStatus = document.querySelector<HTMLElement>('#mix-artist-page-status');
@@ -1686,27 +1832,35 @@ function refreshMixPicker(): void {
   const favoritesButton = document.querySelector<HTMLButtonElement>('#mix-picker-favorites');
   favoritesButton?.classList.toggle('on', artistMix.favoritesOnly);
   favoritesButton?.setAttribute('aria-pressed', String(artistMix.favoritesOnly));
-  grid.querySelectorAll<HTMLButtonElement>('[data-mix-pick]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.mixPick); if (card) mixPickerMode === 'companion' ? addMixCompanion(card) : setMixPrimary(card); }));
+  grid.querySelectorAll<HTMLButtonElement>('[data-mix-pick]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.mixPick); if (card) mixPickerMode === 'companion' ? addMixCompanion(card) : mixPickerMode === 'replace-anchor' ? replaceMixAnchor(card) : setMixPrimary(card); }));
   bindArtistCardPreview();
 }
 function bindArtistMixEvents(): void {
   document.querySelector('#enter-mix-focus')?.addEventListener('click', () => { focusMode = true; render(); });
   document.querySelector('#exit-mix-focus')?.addEventListener('click', () => { focusMode = false; render(); });
   document.querySelector('#mix-artists')?.addEventListener('click', randomizeMix);
-  document.querySelector('#mix-reroll-companion-weights')?.addEventListener('click', rerollMixCompanionWeights);
+  document.querySelector('#mix-reroll-strength')?.addEventListener('click', rerollMixStrength);
   document.querySelector('#copy-mix-prompt')?.addEventListener('click', () => void copy(buildArtistsPrompt(mixArtists()), '#copy-mix-prompt'));
   document.querySelector('#save-mix-library')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'artist-mix'));
   document.querySelector('#open-mix-primary-picker')?.addEventListener('click', event => openMixPicker('primary', event.currentTarget as HTMLElement));
   document.querySelector('#open-mix-primary-picker-empty')?.addEventListener('click', event => openMixPicker('primary', event.currentTarget as HTMLElement));
   document.querySelector('#open-mix-companion-picker')?.addEventListener('click', event => openMixPicker('companion', event.currentTarget as HTMLElement));
+  document.querySelectorAll<HTMLButtonElement>('[data-mix-replace-anchor]').forEach(button => button.addEventListener('click', event => openMixPicker('replace-anchor', event.currentTarget as HTMLElement, button.dataset.mixReplaceAnchor)));
   document.querySelector('#close-mix-picker')?.addEventListener('click', closeMixPicker);
   document.querySelector('#mix-picker-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeMixPicker(); });
   document.querySelector('#mix-artist-search')?.addEventListener('input', event => { artistSearch = (event.target as HTMLInputElement).value; mixArtistPage = 1; refreshMixPicker(); });
   document.querySelector('#mix-picker-favorites')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; mixArtistPage = 1; saveArtistMixSoon(); refreshMixPicker(); });
   document.querySelector('#mix-artist-previous')?.addEventListener('click', () => { mixArtistPage -= 1; refreshMixPicker(); });
   document.querySelector('#mix-artist-next')?.addEventListener('click', () => { mixArtistPage += 1; refreshMixPicker(); });
-  document.querySelector('#mix-favorites-only')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; saveArtistMixSoon(); render(); });
+  document.querySelector('#mix-favorites-only')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; saveArtistMixSoon(); syncMixBehaviorControls(); });
+  document.querySelector('#mix-anchor-weights-lock')?.addEventListener('click', () => {
+    artistMix = { ...artistMix, anchorWeightsLocked: !artistMix.anchorWeightsLocked };
+    mixNotice = artistMix.anchorWeightsLocked ? 'Anchor strengths are locked. Reroll strength changes companions only.' : 'Anchor strengths are unlocked. Reroll strength changes anchors and companions.';
+    saveArtistMixSoon();
+    syncMixBehaviorControls();
+  });
   document.querySelectorAll<HTMLInputElement>('#mix-random-min,#mix-random-max').forEach(input => input.addEventListener('input', () => {
+    if (mixTransitionActive) return;
     const maxTotal = artistMix.anchors.length + mixCompanionCapacity(artistMix.anchors.length);
     const requiredMin = Math.min(maxTotal, Math.max(2, artistMix.anchors.length + (artistMix.anchors.length > 1 ? 1 : 0)));
     const min = Math.max(requiredMin, Number(document.querySelector<HTMLInputElement>('#mix-random-min')?.value) || 2);
@@ -1715,6 +1869,7 @@ function bindArtistMixEvents(): void {
     saveArtistMixSoon();
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-mix-remove]').forEach(button => button.addEventListener('click', () => {
+    if (mixTransitionActive) return;
     const target = button.dataset.mixRemove;
     const isAnchor = artistMix.anchors.some(item => item.id === target);
     if (isAnchor && artistMix.anchors.length === 1 && !artistMix.companions.length) { mixNotice = 'Artist Mix always keeps one anchor. Add another artist first.'; render(); return; }
@@ -1725,6 +1880,7 @@ function bindArtistMixEvents(): void {
     saveArtistMixSoon(); render();
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-mix-pin]').forEach(button => button.addEventListener('click', () => {
+    if (mixTransitionActive) return;
     const target = button.dataset.mixPin;
     const anchor = artistMix.anchors.find(item => item.id === target);
     if (anchor) {
@@ -1743,21 +1899,20 @@ function bindArtistMixEvents(): void {
     saveArtistMixSoon(); render();
   }));
   document.querySelectorAll<HTMLInputElement>('[data-mix-weight],[data-mix-weight-range]').forEach(input => input.addEventListener('input', () => {
+    if (mixTransitionActive) return;
     const target = input.dataset.mixWeight ?? input.dataset.mixWeightRange;
-    const update = (item: WeightedTag): WeightedTag => item.id === target ? { ...item, weight: normalizeArtistWeight(input.value) } : item;
-    artistMix = { ...artistMix, anchors: artistMix.anchors.map(update), companions: artistMix.companions.map(update) };
-    const current = mixArtists().find(item => item.id === target);
-    document.querySelectorAll<HTMLInputElement>(`[data-mix-weight="${target}"],[data-mix-weight-range="${target}"]`).forEach(control => { control.value = String(current?.weight ?? 1); });
-    const companion = artistMix.companions.find(item => item.id === target);
-    const orbitSlot = input.closest<HTMLElement>('.mix-orbit-slot');
-    if (companion && orbitSlot) orbitSlot.style.setProperty('--mix-weight-scale', String(mixCompanionScale(companion.weight)));
-    document.querySelector('#mix-prompt-output')?.replaceChildren(document.createTextNode(buildArtistsPrompt(mixArtists())));
-    saveArtistMixSoon();
+    if (!target) return;
+    const weight = normalizeArtistWeight(input.value);
+    const update = (item: WeightedTag): WeightedTag => item.id === target ? { ...item, weight } : item;
+    syncMixWeightState({ ...artistMix, anchors: artistMix.anchors.map(update), companions: artistMix.companions.map(update) }, [target], input);
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-mix-reroll]').forEach(button => button.addEventListener('click', () => {
     const target = button.dataset.mixReroll;
-    artistMix = { ...artistMix, anchors: artistMix.anchors.map(item => item.id === target ? rerollArtistWeight(item) : item), companions: artistMix.companions.map(item => item.id === target ? rerollArtistWeight(item) : item) };
-    saveArtistMixSoon(); render();
+    if (!target) return;
+    const anchor = artistMix.anchors.some(item => item.id === target);
+    const update = (item: WeightedTag): WeightedTag => item.id === target ? rerollArtistWeight(item) : item;
+    const notice = `Rerolled ${anchor ? 'anchor' : 'companion'} strength. Other strengths stayed fixed.`;
+    syncMixWeightState({ ...artistMix, anchors: artistMix.anchors.map(update), companions: artistMix.companions.map(update) }, [target], button, notice);
   }));
 }
 

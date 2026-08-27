@@ -38,6 +38,7 @@ assert.equal(normalizedSavedPrompt?.kind === 'prompt' ? Object.prototype.hasOwnP
 const normalizedSavedMix = normalizeSavedLibraryItem({ id: 'mix-one', kind: 'artist-mix', name: 'Mix one', prompt: 'artist: alpha', snapshot: { anchors: [{ id: 'a', catalogId: 'artist-v5-a', tag: 'artist: alpha', weight: 1 }], companions: [], randomRange: { min: 2, max: 4 }, favoritesOnly: true } });
 assert.equal(normalizedSavedMix?.kind, 'artist-mix');
 assert.equal(normalizedSavedMix?.kind === 'artist-mix' ? normalizedSavedMix.snapshot.anchors.length : undefined, 1);
+assert.equal(normalizedSavedMix?.kind === 'artist-mix' ? normalizedSavedMix.snapshot.anchorWeightsLocked : undefined, true);
 const cappedMix = normalizeArtistMix({ anchors: Array.from({ length: 3 }, (_, index) => ({ id: `anchor-${index}`, catalogId: `artist-v5-anchor-${index}`, tag: `artist: anchor ${index}`, weight: 1 })), companions: Array.from({ length: 9 }, (_, index) => ({ id: `companion-${index}`, catalogId: `artist-v5-companion-${index}`, tag: `artist: companion ${index}`, weight: 1 })) });
 assert.equal(cappedMix.anchors.length, 3);
 assert.equal(cappedMix.companions.length, 9);
@@ -56,6 +57,7 @@ assert.equal(normalizeTheme('unsupported'), 'arcane-gold');
 assert.equal(normalizeTheme('celestial-light'), 'celestial-light');
 assert.equal(normalizeTheme('ember-peach'), 'ember-peach');
 assert.equal(normalizeTheme('gothic-ivory'), 'gothic-ivory');
+assert.equal(normalizeTheme('galaxy'), 'galaxy');
 const v4SavedPrompt = normalizeSavedLibraryItem({ id: 'v4-prompt', version: 4, kind: 'prompt', source: 'manual', name: 'Independent', description: 'A complete local record', prompt: 'base positive', imageAsset: 'v4-prompt.webp', mime: 'image/webp', createdAt: '2026-08-26T00:00:00.000Z', updatedAt: '2026-08-26T00:00:00.000Z', data: { model: 'nai-diffusion-4', steps: '28', sampler: 'k_euler', width: '832', height: '1216', cfg: '5', positive: 'base positive', negative: 'base negative', characters: [{ id: 'one', label: 'Hero', positive: 'hero positive', negative: 'hero negative' }] } });
 assert.equal(v4SavedPrompt?.kind === 'prompt' ? v4SavedPrompt.data?.characters[0].negative : '', 'hero negative');
 assert.equal(v4SavedPrompt?.imageAsset, 'v4-prompt.webp');
@@ -627,6 +629,9 @@ assert.equal(normalizedMix.anchors[0]?.catalogId, 'artist-v5-primary');
 assert.deepEqual(normalizedMix.companions.map(item => item.catalogId), ['artist-v5-companion']);
 assert.deepEqual(normalizedMix.randomRange, { min: 2, max: 2 });
 assert.equal(normalizedMix.favoritesOnly, true);
+assert.equal(normalizedMix.anchorWeightsLocked, true);
+assert.equal(normalizeArtistMix({ anchorWeightsLocked: false }).anchorWeightsLocked, false);
+assert.equal(normalizeArtistMix({ anchorWeightsLocked: true }).anchorWeightsLocked, true);
 assert.equal(migrated?.version, 2);
 assert.equal(migrated?.animationMode, 'auto');
 const motionOn = normalizeDraft({ ...migrated, animationMode: 'on' });
@@ -1102,7 +1107,11 @@ assert.match(uiSource, /function layoutMixOrbitThreads\(\)/);
 assert.match(uiSource, /rectangleEdge\(anchorRect, cardCenter\.x, cardCenter\.y\)/);
 assert.match(uiSource, /function commitArtistMix\(/);
 assert.match(uiSource, /commitArtistMix\(nextMix, notice\);/);
-assert.doesNotMatch(uiSource, /mixTransition|mixMotionEnabled|orbit-duration|orbit-direction|orbit-delay/);
+assert.match(uiSource, /function mixMotionEnabled\(\)/);
+assert.match(uiSource, /mixTransitionActive/);
+assert.match(uiSource, /mixTransitionTimer/);
+assert.match(uiSource, /disabled aria-busy="true"/);
+assert.match(uiSource, /--mix-slot-index/);
 assert.match(uiSource, /character-search/);
 assert.match(uiSource, /classList\.toggle\('on', characterFavoritesOnly\)/);
 assert.match(uiSource, /setAttribute\('aria-pressed', String\(characterFavoritesOnly\)\)/);
@@ -1170,10 +1179,10 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.6.0');
+assert.equal(packageSource.version, '0.6.1');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
-assert.match(uiSource, /const APP_VERSION = '0\.6\.0'/);
+assert.match(uiSource, /const APP_VERSION = '0\.6\.1'/);
 assert.match(uiSource, /type AppUpdatePhase = 'idle' \| 'checking' \| 'available' \| 'downloading' \| 'paused' \| 'verifying' \| 'ready' \| 'installing' \| 'up-to-date' \| 'error'/);
 assert.match(uiSource, /role="progressbar"/);
 assert.match(uiSource, /Download update/);
@@ -1325,14 +1334,28 @@ assert.match(metadataWorkspaceSource, /Add to Saved Library/);
 assert.match(metadataWorkspaceSource, /Save Artist Mix/);
 assert.match(metadataWorkspaceSource, /extractMetadataArtists\(this\.result\.base\.positive/);
 assert.doesNotMatch(metadataWorkspaceSource.match(/getSavePayload\(\)[\s\S]*?\n  \}/)?.[0] ?? '', /sourceObjectUrl/);
-assert.match(uiSource, /celestial-light[\s\S]*ember-peach[\s\S]*id: 'gothic-ivory', label: 'Gothic'/);
+assert.match(uiSource, /celestial-light[\s\S]*ember-peach[\s\S]*id: 'gothic-ivory', label: 'Gothic'[\s\S]*id: 'galaxy', label: 'Galaxy'/);
 assert.doesNotMatch(uiSource, /Gothic Ivory/);
-assert.match(indexSource, /celestial-light','ember-peach','gothic-ivory/);
+assert.match(indexSource, /celestial-light','ember-peach','gothic-ivory','galaxy/);
 assert.match(indexSource, /name="theme-color" content="#000000"/);
 assert.match(electronSource, /backgroundColor: '#000000'/);
 assert.match(uiSource, /v060-themes/);
 assert.match(styleSource, /\[data-theme="celestial-light"\][\s\S]*color-scheme: light/);
 assert.match(styleSource, /\[data-theme="ember-peach"\]/);
+const galaxyThemeTokens = styleSource.match(/\[data-theme="galaxy"\]\s*\{([^}]*)\}/)?.[1] ?? '';
+assert.ok(galaxyThemeTokens, 'Galaxy theme token block is present');
+for (const token of ['--bg-deep: #0e0812', '--panel: #211322', '--ink: #f8edf5', '--accent: #e15b87']) assert.match(galaxyThemeTokens, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+assert.match(styleSource, /\[data-theme="galaxy"\] body::before[\s\S]*animation: galaxy-nebula-drift/);
+assert.match(styleSource, /\[data-theme="galaxy"\] body::after[\s\S]*animation: galaxy-starfield-drift/);
+assert.match(styleSource, /@keyframes galaxy-nebula-drift[\s\S]*transform[\s\S]*opacity/);
+assert.match(styleSource, /@keyframes galaxy-starfield-drift[\s\S]*transform[\s\S]*opacity/);
+assert.match(styleSource, /:root\[data-theme="galaxy"\]\[data-animation-mode="off"\] body::before,[\s\S]*body::after \{ animation: none/);
+assert.match(styleSource, /@media \(prefers-reduced-motion: reduce\)[\s\S]*:root\[data-theme="galaxy"\]\[data-animation-mode="auto"\] body::before,[\s\S]*body::after \{ animation: none/);
+assert.doesNotMatch(styleSource, /:root:not\(\[data-animation-mode="on"\]\) body::before/);
+assert.doesNotMatch(styleSource, /:root\[data-animation-mode="auto"\][^\n{]*body::before \{ animation: none/);
+assert.doesNotMatch(styleSource, /:root\[data-theme="galaxy"\]\[data-animation-mode="on"\] body::before \{ animation: none/);
+assert.doesNotMatch(galaxyThemeTokens, /#82b6e6|#070711|#111126/);
+assert.match(styleSource, /\[data-theme-swatch="galaxy"\]/);
 const gothicThemeTokens = styleSource.match(/\[data-theme="gothic-ivory"\]\s*\{([^}]*)\}/)?.[1] ?? '';
 assert.ok(gothicThemeTokens, 'Gothic theme token block is present');
 for (const token of ['--bg-deep: #000', '--panel: #151515', '--panel-raised: #222', '--accent: #fff', '--accent-bright: #fff', '--accent-rgb: 255 255 255', '--accent-bright-rgb: 255 255 255']) assert.match(gothicThemeTokens, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -1356,7 +1379,7 @@ for (const width of [720, 784, 896, 1024, 1400]) {
   const orbitWidth = width - 32;
   for (const height of [360, 390, 420, 450]) for (const anchorCount of [1, 2, 3, 4]) {
     const companionCount = mixCompanionCapacity(anchorCount);
-    const anchorWidth = anchorCount === 1 ? 160 : Math.min(560, anchorCount * 96 + (anchorCount - 1) * 4);
+    const anchorWidth = anchorCount === 1 ? 160 : Math.min(560, anchorCount * 116 + (anchorCount - 1) * 8);
     const measured = mixOrbitLayout(companionCount, anchorCount, { width: orbitWidth, height, companionWidth: Math.min(140, Math.max(120, width * 0.12)), companionHeight: 156, anchorWidth, anchorHeight: anchorCount === 1 ? 286 : 190 });
     assert.equal(measured.placements.length, companionCount);
     assert.equal(measured.height, height);
@@ -1373,12 +1396,32 @@ for (const width of [720, 784, 896, 1024, 1400]) {
     }
   }
 }
-// A compact multi-anchor reflow is measured again after CSS collapses the
-// anchor cards to their horizontal 64px form; even the shortest supported
+// A compact multi-anchor reflow keeps the vertical anchor group while the
+// companion cards use their compact silhouette; even the shortest supported
 // orbit must then expose every companion.
-const compactSecondPass = mixOrbitLayout(9, 3, { width: 600, height: 300, companionWidth: 164, companionHeight: 198, anchorWidth: 296, anchorHeight: 64 });
+const compactOrbitWidth = 895; // 980px window minus shell, stage border, and padding.
+const compactOrbitHeight = 300; // Conservative stage row after controls and prompt output at 980x700.
+const compactAnchor = { left: (compactOrbitWidth - 364) / 2, top: (compactOrbitHeight - 190) / 2, width: 364, height: 190 }; // 3 × 116px cards plus 2 × 8px gaps.
+const compactSecondPass = mixOrbitLayout(9, 3, { width: compactOrbitWidth, height: compactOrbitHeight, companionWidth: 164, companionHeight: 198, anchorWidth: compactAnchor.width, anchorHeight: compactAnchor.height });
 assert.equal(compactSecondPass.density, 'compact');
 assert.equal(compactSecondPass.placements.length, 9);
+const boxesOverlap = (a, b) => !(a.left + a.width <= b.left || b.left + b.width <= a.left || a.top + a.height <= b.top || b.top + b.height <= a.top);
+for (let index = 0; index < compactSecondPass.placements.length; index += 1) {
+  const box = compactSecondPass.placements[index].box;
+  assert.ok(box.left >= 0 && box.top >= 0 && box.left + box.width <= compactOrbitWidth && box.top + box.height <= compactOrbitHeight);
+  assert.equal(boxesOverlap(box, compactAnchor), false);
+  for (const peer of compactSecondPass.placements.slice(index + 1)) assert.equal(boxesOverlap(box, peer.box), false);
+}
+const fourAnchor = { left: (compactOrbitWidth - 488) / 2, top: (compactOrbitHeight - 190) / 2, width: 488, height: 190 }; // 4 × 116px cards plus 3 × 8px gaps.
+const fourAnchorSecondPass = mixOrbitLayout(mixCompanionCapacity(4), 4, { width: compactOrbitWidth, height: compactOrbitHeight, companionWidth: 164, companionHeight: 198, anchorWidth: fourAnchor.width, anchorHeight: fourAnchor.height });
+assert.equal(fourAnchorSecondPass.density, 'compact');
+assert.equal(fourAnchorSecondPass.placements.length, mixCompanionCapacity(4));
+for (let index = 0; index < fourAnchorSecondPass.placements.length; index += 1) {
+  const box = fourAnchorSecondPass.placements[index].box;
+  assert.ok(box.left >= 0 && box.top >= 0 && box.left + box.width <= compactOrbitWidth && box.top + box.height <= compactOrbitHeight);
+  assert.equal(boxesOverlap(box, fourAnchor), false);
+  for (const peer of fourAnchorSecondPass.placements.slice(index + 1)) assert.equal(boxesOverlap(box, peer.box), false);
+}
 assert.doesNotMatch(styleSource, /\.mix-stage \{[^}]*overflow: visible/);
 assert.match(uiSource, /data-layout-ready="true"/);
 assert.doesNotMatch(styleSource, /\.mix-orbit\[data-layout-ready="false"\] \.mix-orbit-slot \{ visibility: hidden; \}/);
@@ -1448,4 +1491,58 @@ assert.match(electronSource, /app\.setAppUserModelId\(APP_USER_MODEL_ID\)/);
 assert.match(electronSource, /APP_ICON/);
 assert.match(installerLauncherSource, /CanonicalApplicationExecutable/);
 assert.match(installerLauncherSource, /NAISETUPV0600000/);
+
+// V0.6.1 Artist Mix, persistence, and Galaxy regressions.
+assert.match(typesSource, /interface ArtistMixDraft[\s\S]*?anchorWeightsLocked: boolean/);
+assert.match(storageSource, /anchorWeightsLocked: source\.anchorWeightsLocked !== false/);
+assert.match(uiSource, /function currentMixArtistPickerPage\(\):[\s\S]*?const useFavorites = artistMix\.favoritesOnly/);
+assert.match(uiSource, /id="mix-anchor-weights-lock"[\s\S]*?aria-pressed="\$\{artistMix\.anchorWeightsLocked\}"[\s\S]*?Lock anchor strength/);
+assert.match(uiSource, /id="mix-reroll-strength"[\s\S]*?>Reroll strength</);
+assert.match(uiSource, /function rerollMixStrength\(\)/);
+assert.match(uiSource, /function randomizeMix\(\)[\s\S]*?artistMix\.anchorWeightsLocked \? artistMix\.anchors : rerollArtistWeights\(artistMix\.anchors\)/);
+assert.match(uiSource, /function syncMixBehaviorControls\(\)[\s\S]*?classList\.toggle\('on', artistMix\.favoritesOnly\)[\s\S]*?setAttribute\('aria-pressed', String\(artistMix\.favoritesOnly\)\)[\s\S]*?Favorites \(\$\{mixPool\(\)\.length\}\)/);
+const mixFavoritesHandler = uiSource.match(/document\.querySelector\('#mix-favorites-only'\)[\s\S]*?\);/)?.[0] ?? '';
+assert.doesNotMatch(mixFavoritesHandler, /render\(\)|scheduleMixOrbitThreads\(\)/);
+const mixLockHandler = uiSource.match(/document\.querySelector\('#mix-anchor-weights-lock'\)[\s\S]*?\n  \}\);/)?.[0] ?? '';
+assert.doesNotMatch(mixLockHandler, /render\(\)|scheduleMixOrbitThreads\(\)/);
+assert.match(uiSource, /mixPickerMode: 'primary' \| 'companion' \| 'replace-anchor'/);
+assert.match(uiSource, /mixPickerReplaceTarget/);
+assert.match(uiSource, /data-mix-replace-anchor/);
+assert.match(uiSource, /openMixPicker\('replace-anchor',[\s\S]*?button\.dataset\.mixReplaceAnchor/);
+assert.match(uiSource, /function replaceMixAnchor\(card: CatalogCard\)[\s\S]*?target\.weight[\s\S]*?companions = artistMix\.companions\.filter/);
+const replaceAnchorSource = uiSource.match(/function replaceMixAnchor\(card: CatalogCard\)[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(replaceAnchorSource, /if \(duplicateAnchor\) return;/);
+assert.doesNotMatch(replaceAnchorSource, /anchors = duplicateAnchor[\s\S]*?filter\(item => item\.id !== target\.id\)/);
+assert.match(uiSource, /mixPickerMode === 'replace-anchor' \? replaceMixAnchor\(card\)/);
+const instantMixSource = uiSource.match(/if \(!shouldAnimate\) \{[\s\S]*?\n  \}/)?.[0] ?? '';
+assert.ok(instantMixSource.indexOf('render();') < instantMixSource.indexOf('layoutMixOrbitThreads();'), 'instant Artist Mix commits must lay out synchronously after render');
+assert.match(uiSource, /function syncMixWeightState\([\s\S]*?saveArtistMixSoon\(\);[\s\S]*?scheduleMixOrbitThreads\(\);[\s\S]*?focusTarget\.focus/);
+const syncMixWeightSource = uiSource.match(/function syncMixWeightState\([\s\S]*?\n\}/)?.[0] ?? '';
+assert.doesNotMatch(syncMixWeightSource, /render\(\)/);
+assert.match(uiSource, /syncMixWeightState\(\{ \.\.\.artistMix, anchors: artistMix\.anchors\.map\(update\), companions: artistMix\.companions\.map\(update\) \}, \[target\], input\)/);
+assert.match(uiSource, /syncMixWeightState\(\{ \.\.\.artistMix, anchors: artistMix\.anchors\.map\(update\), companions: artistMix\.companions\.map\(update\) \}, \[target\], button, notice\)/);
+assert.match(uiSource, /class="mix-orbit-primary mix-anchor-group \$\{anchors\.length > 1 \? 'is-multi-anchor' : 'is-single-anchor'\}"/);
+assert.match(uiSource, /class="mix-orbit-slot\$\{transitionClass\}"/);
+assert.match(uiSource, /--mix-slot-index:\$\{index\}/);
+assert.match(styleSource, /\.mix-orbit-slot\.is-mix-exiting[\s\S]*?opacity: 0/);
+assert.match(styleSource, /\.mix-orbit-slot\.is-mix-entering[\s\S]*?transition-delay: calc\(var\(--mix-slot-index/);
+const mixEnterMotion = styleSource.match(/\.mix-orbit-slot\.is-mix-entering \.mix-orbit-upright,[\s\S]*?transition-delay: calc\(var\(--mix-slot-index[^}]+\}/)?.[0] ?? '';
+const mixExitMotion = styleSource.match(/\.mix-orbit-slot\.is-mix-exiting \.mix-orbit-upright,[\s\S]*?transition-delay: 0ms;/)?.[0] ?? '';
+assert.match(mixEnterMotion, /transition-delay: calc\(var\(--mix-slot-index/);
+assert.match(mixExitMotion, /transition-delay: 0ms/);
+assert.doesNotMatch(mixExitMotion, /--mix-slot-index/);
+assert.match(styleSource, /\.mix-anchor-replace-trigger/);
+assert.match(uiSource, /<div class="mix-anchor-identity">/);
+assert.match(styleSource, /\.mix-anchor-identity \{ min-width: 0; \}/);
+assert.doesNotMatch(styleSource, /\.mix-artist-identity \{ min-width: 0; \}/);
+assert.match(styleSource, /\.artist-catalog-picker \.artist-catalog-grid \{[\s\S]*align-content: start;[\s\S]*align-items: start;[\s\S]*grid-auto-rows: max-content/);
+assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*width: clamp\(116px, 11vw, 128px\)/);
+assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-column: 1 \/ -1/);
+assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-template-rows: 18px 21px/);
+assert.match(styleSource, /\.mix-orbit-primary\.mix-anchor-group\.is-multi-anchor \{ max-width: min\(560px, calc\(100% - 20px\)\); \}/);
+assert.doesNotMatch(styleSource.match(/\.mix-orbit\[data-layout-density="compact"\] \.mix-anchor-group\.is-multi-anchor[\s\S]*?\n\}/)?.[0] ?? '', /width: 96px|height: 64px/);
+assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Eight interface themes/);
+assert.equal(packageSource.version, '0.6.1');
+assert.equal(lockSource.version, packageSource.version);
+assert.equal(lockSource.packages[''].version, packageSource.version);
 console.log(`Tests passed: page discovery, atomic replacement/failure recovery, WebP validation, prompt serialization, migration, random uniqueness, and exact catalog assets (${catalog.artists.length} V5 artists / ${catalog.characters.length} characters).`);

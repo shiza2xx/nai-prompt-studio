@@ -277,7 +277,7 @@ export function normalizeAnimationMode(value: unknown): AnimationMode {
   return value === 'on' || value === 'off' ? value : 'auto';
 }
 export function normalizeTheme(value: unknown): StudioTheme {
-  return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' || value === 'celestial-light' || value === 'ember-peach' || value === 'gothic-ivory' ? value : 'arcane-gold';
+  return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' || value === 'celestial-light' || value === 'ember-peach' || value === 'gothic-ivory' || value === 'galaxy' ? value : 'arcane-gold';
 }
 
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {
@@ -334,7 +334,7 @@ export function normalizeArtistMix(value: unknown): ArtistMixDraft {
     if (item && key && !seen.has(key) && companions.length < companionLimit) { seen.add(key); companions.push(item); }
   }
   if (!anchors.length && companions.length) anchors.push(companions.shift()!);
-  return { version: 2, anchors, companions, randomRange: { min: Math.min(12, range.min), max: Math.min(12, range.max) }, favoritesOnly: source.favoritesOnly === true };
+  return { version: 2, anchors, companions, randomRange: { min: Math.min(12, range.min), max: Math.min(12, range.max) }, favoritesOnly: source.favoritesOnly === true, anchorWeightsLocked: source.anchorWeightsLocked !== false };
 }
 
 export function loadArtistMix(): ArtistMixDraft {

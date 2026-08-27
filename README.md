@@ -13,7 +13,7 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 - Local NovelAI image metadata inspection for PNG and WebP files, including model, generation settings, base prompts, character prompts, artist highlighting, preview cards, and direct Saved Library actions
 - Manual and optional startup checks for additions to the exact NAX V5 artist catalog, with live catalog refresh after downloading
 - App-local settings, caches, catalog data, logs, and verified GitHub update downloads
-- Seven interface themes: Arcane Gold, Midnight Blue, Raspberry Rose, Noir, Celestial Light, Ember Peach, and Gothic
+- Eight interface themes: Arcane Gold, Midnight Blue, Raspberry Rose, Noir, Celestial Light, Ember Peach, Gothic, and Galaxy
 - First-run guide, percentage-based startup loading screen, configurable interface animations, and hover previews for visual cards
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
