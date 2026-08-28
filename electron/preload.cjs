@@ -12,6 +12,17 @@ contextBridge.exposeInMainWorld('naiStorage', {
 
 contextBridge.exposeInMainWorld('naiCatalog', {
   load: () => ipcRenderer.invoke('catalog:load'),
+  mode: () => ipcRenderer.invoke('catalog:mode'),
+  components: () => ipcRenderer.invoke('catalog:components'),
+  ensureSelected: () => ipcRenderer.invoke('catalog:ensure-selected'),
+  downloadComponent: (id, repair = false) => ipcRenderer.invoke('catalog:component-download', id, repair),
+  repairComponent: id => ipcRenderer.invoke('catalog:component-repair', id),
+  cancelComponent: () => ipcRenderer.invoke('catalog:component-cancel'),
+  onComponentProgress: listener => {
+    const handler = (_event, value) => listener(value);
+    ipcRenderer.on('catalog:component-progress', handler);
+    return () => ipcRenderer.removeListener('catalog:component-progress', handler);
+  },
   update: () => ipcRenderer.invoke('catalog:update'),
   cancel: () => ipcRenderer.invoke('catalog:cancel'),
   onProgress: listener => {

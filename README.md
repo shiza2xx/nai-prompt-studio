@@ -18,6 +18,8 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
 
+v0.6.3 uses a lightweight installer. During installation, V5 artist and Prompt Builder components are selected by default, while the optional V4.5 character catalog is off by default; selected missing components download when the application first launches. Upgrades preserve installed data and catalogs, while the v0.6.2 legacy pack is migrated. The V5 artist component contains exactly 4,198 cards; after downloading, refresh additions manually from Settings or enable the optional startup check.
+
 ## Saved Library and updates
 
 Saved Library keeps independent prompt records, Artist Mix records, metadata-derived prompts, and optional cover images in the local application profile. Each prompt section can be inspected and copied separately. Nothing is uploaded automatically.
@@ -30,10 +32,10 @@ The Settings workspace can check for a newer public release, show download progr
 
 ## Source-only clones and catalog hydration
 
-The Git repository contains application code, tests and build tooling only. Download the V5 artists, characters and constructor-guide packs from the matching GitHub Release, then hydrate a development checkout:
+The Git repository contains application code, tests and build tooling only. Download the V5 artists, characters and constructor-guide ASAR components from the matching GitHub Release, then hydrate a development checkout:
 
 ```powershell
-npm run catalog:hydrate -- D:\Downloads\nai-v5-artists.zip D:\Downloads\nai-characters.zip D:\Downloads\nai-constructor-guide.zip
+npm run catalog:hydrate -- D:\Downloads\nai-v5-artists.asar D:\Downloads\nai-characters.asar D:\Downloads\nai-constructor-guide.asar
 ```
 
 The command extracts only into `public/catalog` in the current checkout. Release maintainers can create the three assets with `npm run release:catalog-packs`; every pack is checked against GitHub's 2 GiB asset limit.

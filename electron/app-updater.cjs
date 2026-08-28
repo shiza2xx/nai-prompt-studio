@@ -26,7 +26,7 @@ function validateManifest(raw, currentVersion) {
   if (!/^NAI-Prompt-Studio-V5-Setup-\d+\.\d+\.\d+\.exe$/.test(asset) || path.basename(url.pathname) !== asset) throw new Error('Update installer asset name is invalid.');
   if (!Number.isSafeInteger(size) || size < 1024 || size > 2 * 1024 * 1024 * 1024) throw new Error('Update installer size is invalid.');
   if (!/^[a-f0-9]{128}$/.test(sha512)) throw new Error('Update installer SHA-512 is invalid.');
-  return { available: true, schemaVersion: 1, version: String(raw.version), asset, url: url.toString(), size, sha512, releaseNotes: String(raw.releaseNotes || '') };
+  return { available: true, schemaVersion: 1, version: String(raw.version), asset, url: url.toString(), size, sha512, releaseNotes: String(raw.releaseNotes || ''), catalogs: Array.isArray(raw.catalogs) ? raw.catalogs : [] };
 }
 function trustedUrl(value) { const parsed = new URL(String(value)); if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) throw new Error('Update redirect host is not trusted.'); return parsed; }
 

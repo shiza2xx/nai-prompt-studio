@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 
-const MAGIC = Buffer.from('NAISETUPV0600000', 'ascii');
+const MAGIC = Buffer.from('NAISETUPV0630000', 'ascii');
 export const FOOTER_SIZE = 96;
 
 async function appendFile(source, destination, hash) {

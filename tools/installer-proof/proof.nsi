@@ -1,4 +1,6 @@
 Unicode true
+!define NAI_INSTALLER_PROOF
+!include "${PROJECT_ROOT}\build\installer.nsh"
 Name "NAI D-temp proof"
 OutFile "D-temp-proof.payload.exe"
 RequestExecutionLevel user
@@ -6,6 +8,11 @@ SilentInstall silent
 InstallDir "C:\\installer-proof-must-not-use-default"
 
 Section
+  ReadEnvStr $1 "NAI_PROOF_INSTALL"
+  ${If} $1 != ""
+    StrCpy $INSTDIR $1
+  ${EndIf}
+  Call PreserveLegacyCatalog
   InitPluginsDir
   ReadEnvStr $2 "NAI_PROOF_RESULT"
   FileOpen $0 "$2" w

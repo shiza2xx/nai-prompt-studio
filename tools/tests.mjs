@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { once } from 'node:events';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
@@ -10,7 +10,7 @@ import { buildArtistsPrompt, buildBasePrompt, serializeTag } from '../src/prompt
 import { MetadataArtistHighlighter, decodeCatalogEntities, escapeMetadataHtml, extractMetadataArtists, serializeMetadataArtists } from '../src/metadata-artist-highlight.ts';
 import { normalizeAnimationMode, normalizeArtistMix, normalizeCustomTag, normalizeCustomTagPresetId, normalizeCustomTagPresets, normalizeDraft, normalizeRandomRange, normalizeSavedLibrary, normalizeSavedLibraryItem, normalizeTheme, normalizeSettings } from '../src/storage.ts';
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from '../src/custom-tag-presets.ts';
-import { commitSnapshot, discoverCards, GALLERY_URL, isWebp, makeCatalog, parseGalleryPage, seedStageFromLive, stableAssetFilename, stableCatalogId } from './update-v5-catalog.mjs';
+import { commitSnapshot, discoverCards, EXPECTED_CARD_COUNT, GALLERY_URL, isWebp, makeCatalog, parseGalleryPage, seedStageFromLive, stableAssetFilename, stableCatalogId } from './update-v5-catalog.mjs';
 import { normalizeArtistWeight, pickUniqueCards, randomArtistSelection, randomCount, randomWeight, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from '../src/random.ts';
 import { decodePreviews } from '../src/preview-loader.ts';
 import { ARTIST_PAGE_SIZE, CHARACTER_PAGE_SIZE, filterCharacters, paginateArtists, paginateCharacters } from '../src/catalog-browser.ts';
@@ -18,12 +18,20 @@ import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from '../src/
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from '../src/artist-catalog.ts';
 import { decodeStealthPayload, extractImageMetadata, normalizeMetadata, parseMetadataJson, parsePngTextChunks, parseWebpExifUserComment } from '../src/image-metadata.ts';
 import { BUILTIN_CONSTRUCTOR_FOLDER_ID, canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, guideVisualCount, hasPromptTag, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTag, togglePromptTagGroup } from '../src/prompt-constructor.ts';
+import { buildWarmupPlan, scheduleIdleWarmup } from '../src/catalog-warmup.ts';
 
 const require = createRequire(import.meta.url);
+const nativeFs = require('node:fs');
+const { createPackage, createPackageFromFiles, extractFile, listPackage } = require('@electron/asar');
 const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../electron/app-paths.cjs');
 const { containedAsset, hasValidMagic, validateImagePayload } = require('../electron/custom-tag-assets.cjs');
 const { loadCatalog: loadRuntimeCatalog, parseGalleryPage: parseRuntimeGalleryPage, normalizeImageUrl: normalizeRuntimeImageUrl, runUpdate: runRuntimeCatalogUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('../electron/catalog-updater.cjs');
 const { compareVersions, validateManifest, readResponseJson, downloadInstaller, parseContentRange } = require('../electron/app-updater.cjs');
+const { COMPONENTS, componentFile, componentPaths, normalizeDescriptor, verifyComponent, loadState, saveState, activateComponent, resolveComponentAsset, ensureComponent, ensureSelectedComponents, validateLegacyArchive, downloadComponent, inspectComponent, statusForComponent, statuses, safeRelative } = require('../electron/catalog-components.cjs');
+
+const testTempRoot = join(process.cwd(), '.test-tmp-v063', String(process.pid));
+mkdirSync(testTempRoot, { recursive: true });
+const localTemp = prefix => mkdtempSync(join(testTempRoot, `${prefix}-`));
 
 const legacySaved = normalizeSavedLibraryItem({ id: 'legacy-one', name: 'Legacy one', prompt: '1girl, soft light', createdAt: '2024-01-01T00:00:00.000Z' });
 assert.equal(legacySaved?.kind, 'prompt');
@@ -107,7 +115,7 @@ manifestAbort.complete = false;
 const manifestAbortPromise = readResponseJson(manifestAbort, 1024, { idleTimeoutMs: 1000, signal: manifestAbortController.signal });
 manifestAbortController.abort();
 await assert.rejects(manifestAbortPromise, error => error?.code === 'ABORT_ERR');
-const updateTemp = mkdtempSync(join(tmpdir(), 'nai-update-'));
+const updateTemp = localTemp('nai-update');
 const normalFixture = updateFixture();
 const normalProgress = [];
 const normalTarget = await downloadInstaller(normalFixture.manifest, updateTemp, { requestImpl: async () => mockedResponse([normalFixture.payload]), onProgress: event => normalProgress.push(event), retryDelayMs: 0 });
@@ -308,7 +316,7 @@ assert.equal(hasValidMagic(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 'imag
 assert.equal(hasValidMagic(Buffer.from('RIFFxxxxWEBP'), 'image/webp'), true);
 assert.throws(() => validateImagePayload(Buffer.from('not an image'), 'image/png'), /signature/i);
 assert.throws(() => containedAsset('D:/profile/custom-tags', '../outside.png'), /invalid|outside/i);
-const assetTemp = mkdtempSync(join(tmpdir(), 'nai-custom-assets-'));
+const assetTemp = localTemp('nai-custom-assets');
 const assetRoot = join(assetTemp, 'custom-tags');
 mkdirSync(assetRoot);
 const outsideAsset = join(assetTemp, 'outside.png');
@@ -373,6 +381,15 @@ function embeddedArtist({ tag, sourceUrl, catalogId, image = 'catalog/embedded.w
 async function runRuntimeFixture({ name, artists = [], body = fixture, onPage, onCard }) {
   const paths = runtimeRoot(name);
   writeFileSync(paths.embeddedPath, JSON.stringify({ version: 2, artists, characters: [], tags: ['girl'] }));
+  // Embedded metadata is only authoritative when its loose-development image
+  // actually exists and validates. Give fixture cards real WebP bytes so the
+  // exact-source pruning path is exercised explicitly.
+  for (const card of artists) {
+    if (card.runtime || typeof card.image !== 'string' || /^(?:nai-|blob:|data:|\/)/i.test(card.image)) continue;
+    const imagePath = join(paths.root, card.image);
+    mkdirSync(join(imagePath, '..'), { recursive: true });
+    writeFileSync(imagePath, runtimeWebp);
+  }
   const calls = { page: [], card: [] };
   const fetchImpl = async (url, options = {}) => {
     if (url.startsWith(GALLERY_URL)) {
@@ -397,17 +414,18 @@ assert.equal(exactRun.calls.card.filter(url => url.endsWith('/a.webp')).length, 
 assert.equal(exactRun.calls.card.filter(url => url.includes('b%2520artist.webp')).length, 1);
 const exactPointer = JSON.parse(readFileSync(join(exactRun.catalogDir, 'active.json'), 'utf8'));
 const exactOverlay = JSON.parse(readFileSync(join(exactRun.catalogDir, 'generations', exactPointer.generation, 'catalog.json'), 'utf8'));
-assert.deepEqual(exactOverlay.artists.map(card => card.catalogId), ['artist-v5-beta-artist-ae20ty']);
+assert.deepEqual(exactOverlay.artists.map(card => card.catalogId), ['artist-v5-beta-artist-qruygu']);
 assert.equal(exactRun.result.catalog.artists.some(card => card.catalogId === 'embedded-alpha'), true);
 
-// A unique normalized-tag match with a changed raw URL is an override: it
-// keeps the old identity, fetches once, and does not count as +N.
+// A changed raw URL is a genuinely new source even when the display tag is
+// unchanged; exact source identity is required for reuse and ID preservation.
 const changedEmbedded = embeddedArtist({ tag: 'Alpha artist', sourceUrl: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/alpha-old.webp', catalogId: 'embedded-alpha' });
 const alphaOnlyFixture = `<nav><a data-page="1">A</a></nav><figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/a.webp"><figurecaption class="imageText">Alpha artist</figurecaption></figure>`;
 const changedRun = await runRuntimeFixture({ name: 'tag-override', artists: [changedEmbedded], body: alphaOnlyFixture });
-assert.equal(changedRun.result.changed, 1);
-assert.equal(changedRun.result.added, 0);
-assert.equal(changedRun.result.catalog.artists.find(card => card.tag === 'Alpha artist')?.catalogId, 'embedded-alpha');
+assert.equal(changedRun.result.changed, 0);
+assert.equal(changedRun.result.added, 1);
+assert.equal(changedRun.result.catalog.artists.find(card => card.sourceUrl.endsWith('/a.webp'))?.catalogId, 'artist-v5-alpha-artist-mfwvfy');
+assert.equal(changedRun.result.catalog.artists.find(card => card.sourceUrl.endsWith('/a.webp'))?.runtime, true);
 assert.equal(changedRun.calls.card.filter(url => url.endsWith('/a.webp')).length, 1);
 
 // A clean runtime update adds both discovered identities.
@@ -447,8 +465,9 @@ assert.deepEqual(prunedOverlay.artists.map(card => card.tag), ['Alpha artist']);
 const revertEmbedded = embeddedArtist({ tag: 'Alpha artist', sourceUrl: 'https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/a.webp', catalogId: 'embedded-alpha' });
 const alphaChangedFixture = `<nav><a data-page="1">A</a></nav><figure class="imagePanel"><img src="https://cdn.zele.st/data/NAX/Images/danbooru-artist-tags-2-v5/alpha-new.webp"><figurecaption class="imageText">Alpha artist</figurecaption></figure>`;
 const revertInitial = await runRuntimeFixture({ name: 'override-reversion', artists: [revertEmbedded], body: alphaChangedFixture });
-assert.equal(revertInitial.result.changed, 1);
-assert.equal(revertInitial.result.catalog.artists.find(card => card.catalogId === 'embedded-alpha')?.runtime, true);
+assert.equal(revertInitial.result.changed, 0);
+assert.equal(revertInitial.result.added, 1);
+assert.equal(revertInitial.result.catalog.artists.find(card => card.sourceUrl.endsWith('/alpha-new.webp'))?.runtime, true);
 const revertResult = await runRuntimeCatalogUpdate({ catalogDir: revertInitial.catalogDir, embeddedPath: revertInitial.embeddedPath, fetchImpl: async url => {
   if (url.startsWith(GALLERY_URL)) return runtimeResponse(url, alphaOnlyFixture);
   throw new Error(`unexpected reversion card fetch: ${url}`);
@@ -788,12 +807,14 @@ assert.equal(stableAssetFilename(stableCard), stableAssetFilename(stableCard));
 assert.equal(makeCatalog([stableCard], { characters: [], danbooruTags: [] }).artists[0].image, `cards/artist/danbooru-artist-tags-2-v5/${stableAssetFilename(stableCard)}`);
 
 const catalog = JSON.parse(readFileSync(new URL('../public/catalog/catalog.json', import.meta.url), 'utf8'));
+assert.equal(EXPECTED_CARD_COUNT, 4198);
+assert.equal(catalog.artists.length, EXPECTED_CARD_COUNT);
 assert.equal(catalog.characters.length, 5457);
 assert.ok(catalog.artists.length > 0);
 assert.ok(catalog.artists.every(card => card.id.startsWith('artist-v5-') && card.gallery === 'danbooru-artist-tags-2-v5' && card.image.startsWith('cards/artist/danbooru-artist-tags-2-v5/') && card.image.endsWith('.webp')));
 assert.ok(catalog.characters.every(card => card.gallery === 'danbooru-character-tags-v4.5' && card.image.startsWith('cards/character/danbooru-character-tags-v4.5/')));
 assert.ok(catalog.tags.every(tag => !catalog.danbooruTags.some(item => item.category === 1 && item.tag === tag)));
-assert.equal(catalog.artists.filter(card => /[0-9]$/.test(card.tag)).length, 141);
+assert.equal(catalog.artists.filter(card => /[0-9]$/.test(card.tag)).length, 166);
 const highlightFixture = [
   { id: 'aogisa', tag: 'aogisa', gallery: 'v5', image: 'aogisa.webp', score: 0 },
   { id: 'aogisa88', tag: 'aogisa88', gallery: 'v5', image: 'aogisa88.webp', score: 0 },
@@ -869,13 +890,13 @@ assert.equal(lastCharacterPage.cards.at(-1)?.id, 'character-196');
 assert.equal(filterCharacters(browserFixture, 'beyond first page').length, 1);
 assert.equal(paginateCharacters(browserFixture, { query: 'beyond first page' }).cards[0].id, 'character-150');
 assert.equal(paginateCharacters(browserFixture, { favoritesOnly: true, favoriteIds: new Set(['character-150']) }).filteredCount, 1);
-const artistBrowserFixture = Array.from({ length: 3587 }, (_, index) => ({ id: `artist-v5-${index}`, catalogId: `artist-v5-${index}`, tag: index === 3410 ? 'Synthetic Artist Beyond First Page' : `Artist ${index}`, gallery: 'danbooru-artist-tags-2-v5', image: `cards/artist/${index}.webp`, score: 0 }));
+const artistBrowserFixture = Array.from({ length: 4198 }, (_, index) => ({ id: `artist-v5-${index}`, catalogId: `artist-v5-${index}`, tag: index === 3410 ? 'Synthetic Artist Beyond First Page' : `Artist ${index}`, gallery: 'danbooru-artist-tags-2-v5', image: `cards/artist/${index}.webp`, score: 0 }));
 const firstArtistPage = paginateArtists(artistBrowserFixture, { page: 1 });
 const lastArtistPage = paginateArtists(artistBrowserFixture, { page: 999 });
 assert.equal(ARTIST_PAGE_SIZE, 72);
 assert.equal(firstArtistPage.cards.length, 72);
-assert.equal(lastArtistPage.pageCount, 50);
-assert.equal(lastArtistPage.cards.length, 59);
+assert.equal(lastArtistPage.pageCount, 59);
+assert.equal(lastArtistPage.cards.length, 22);
 assert.equal(paginateArtists(artistBrowserFixture, { query: 'beyond first page' }).cards[0].id, 'artist-v5-3410');
 
 const uiSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
@@ -885,21 +906,25 @@ const previewSource = readFileSync(new URL('../src/artist-card-preview.ts', impo
 const storageSource = readFileSync(new URL('../src/storage.ts', import.meta.url), 'utf8');
 const metadataWorkspaceSource = readFileSync(new URL('../src/metadata-workspace.ts', import.meta.url), 'utf8');
 const electronSource = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+const catalogUpdaterSource = readFileSync(new URL('../electron/catalog-updater.cjs', import.meta.url), 'utf8');
 const preloadSource = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
 const appPathsSource = readFileSync(new URL('../electron/app-paths.cjs', import.meta.url), 'utf8');
 const indexSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const packageSource = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const lockSource = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
 const tsconfigSource = JSON.parse(readFileSync(new URL('../tsconfig.json', import.meta.url), 'utf8'));
-const optimizerSource = readFileSync(new URL('./optimize-desktop-catalog.ps1', import.meta.url), 'utf8');
 const localEnvSource = readFileSync(new URL('./local-env.mjs', import.meta.url), 'utf8');
 const localRunnerSource = readFileSync(new URL('./run-local.mjs', import.meta.url), 'utf8');
 const desktopBuildSource = readFileSync(new URL('./build-desktop.mjs', import.meta.url), 'utf8');
+const catalogPacksSource = readFileSync(new URL('./catalog-packs.mjs', import.meta.url), 'utf8');
+const thinCatalogSource = readFileSync(new URL('./thin-dist-catalog.ps1', import.meta.url), 'utf8');
+const releaseManifestSource = readFileSync(new URL('./generate-release-manifest.mjs', import.meta.url), 'utf8');
 const installerBuildSource = readFileSync(new URL('./build-installer.mjs', import.meta.url), 'utf8');
 const iconPreparationSource = readFileSync(new URL('./prepare-icon.mjs', import.meta.url), 'utf8');
 const iconResizeSource = readFileSync(new URL('./prepare-icon.ps1', import.meta.url), 'utf8');
 const installerLauncherSource = readFileSync(new URL('./installer-launcher/Program.cs', import.meta.url), 'utf8');
 const installerProofSource = readFileSync(new URL('./installer-proof/proof.nsi', import.meta.url), 'utf8');
+const installerProofRunnerSource = readFileSync(new URL('./installer-proof/build-and-run-proof.mjs', import.meta.url), 'utf8');
 const installerStorePatchSource = readFileSync(new URL('./electron-builder-nsis-store.mjs', import.meta.url), 'utf8');
 const nsisIncludeSource = readFileSync(new URL('../build/installer.nsh', import.meta.url), 'utf8');
 const npmrcSource = readFileSync(new URL('../.npmrc', import.meta.url), 'utf8');
@@ -1224,10 +1249,10 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.6.2');
+assert.equal(packageSource.version, '0.6.3');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
-assert.match(uiSource, /const APP_VERSION = '0\.6\.2'/);
+assert.match(uiSource, /const APP_VERSION = '0\.6\.3'/);
 assert.match(uiSource, /type AppUpdatePhase = 'idle' \| 'checking' \| 'available' \| 'downloading' \| 'paused' \| 'verifying' \| 'ready' \| 'installing' \| 'up-to-date' \| 'error'/);
 assert.match(uiSource, /role="progressbar"/);
 assert.match(uiSource, /Download update/);
@@ -1264,10 +1289,34 @@ for (const variable of ['TEMP', 'TMP', 'TMPDIR', 'ELECTRON_CACHE', 'ELECTRON_BUI
   assert.match(localEnvSource, new RegExp(variable));
 }
 assert.match(localRunnerSource, /createLocalEnvironment\(\)/);
-assert.match(desktopBuildSource, /optimize-desktop-catalog\.ps1/);
+assert.match(desktopBuildSource, /catalog-packs\.mjs/);
+assert.match(desktopBuildSource, /Catalog component packs are incomplete/);
+assert.doesNotMatch(desktopBuildSource, /optimize-desktop-catalog\.ps1/);
+assert.match(catalogPacksSource, /createPackageFromFiles/);
+assert.match(catalogPacksSource, /createReadStream/);
+assert.match(catalogPacksSource, /count: 281/);
+assert.match(catalogPacksSource, /extra: \['catalog\.json'\]/);
+assert.match(catalogPacksSource, /function guideImageInputs/);
+assert.match(catalogPacksSource, /filenames = \[\.\.\.guideInputs, 'guide\/manifest\.json'\]/);
+const guideManifestFixture = JSON.parse(readFileSync(new URL('../public/catalog/guide/manifest.json', import.meta.url), 'utf8'));
+const guideManifestEntries = Array.isArray(guideManifestFixture) ? guideManifestFixture : guideManifestFixture.entries;
+const uniqueGuideImages = new Set(guideManifestEntries.map(entry => String(entry.image).replaceAll('\\', '/')));
+const sourceGuidePngs = readdirSync(new URL('../public/catalog/guide', import.meta.url), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.png'));
+assert.equal(guideManifestEntries.length, 281);
+assert.equal(uniqueGuideImages.size, 277);
+assert.equal(sourceGuidePngs.length, 289);
+assert.ok(sourceGuidePngs.length > uniqueGuideImages.size);
+assert.doesNotMatch(catalogPacksSource, /catalog-pack-staging|cpSync/);
+assert.doesNotMatch(catalogPacksSource, /createHash\('sha512'\)\.update\(readFileSync/);
+assert.match(thinCatalogSource, /catalog\.json/);
+assert.match(thinCatalogSource, /manifest\.json/);
+assert.match(thinCatalogSource, /Remove-Item .*\$cards .*Recurse/);
+assert.match(releaseManifestSource, /Complete v0\.6\.3 catalog descriptors are required/);
 assert.match(desktopBuildSource, /build-installer\.mjs/);
 assert.match(installerBuildSource, /electron-builder/);
 assert.match(installerBuildSource, /\.payload/);
+const runtimeAssetResolverSource = catalogUpdaterSource.match(/function resolveActiveCatalogAsset[\s\S]*?function readJson/)?.[0] ?? '';
+assert.doesNotMatch(runtimeAssetResolverSource, /archiveEntries|hashFile/);
 assert.match(installerBuildSource, /patchInstallerStoreCopy/);
 assert.match(installerBuildSource, /restoreInstallerStoreCopy/);
 assert.match(installerStorePatchSource, /APP_INSTALLER_STORE_FILE/);
@@ -1290,16 +1339,8 @@ assert.match(nsisIncludeSource, /StrCmp \$9 "data" removeContinue/);
 assert.match(nsisIncludeSource, /!macro customUnInit/);
 assert.match(nsisIncludeSource, /ReadEnvStr \$7 "NAI_INSTALL_DIR"/);
 assert.equal(npmrcSource.trim().split(/\r?\n/)[0], 'cache=.local-cache/npm');
-assert.match(optimizerSource, /System\.Drawing/);
-assert.match(optimizerSource, /danbooru-character-tags-v4\.5/);
-assert.match(optimizerSource, /ExpectedCount = 5457/);
-assert.match(optimizerSource, /TargetWidth = 416/);
-assert.match(optimizerSource, /TargetHeight = 608/);
-assert.match(optimizerSource, /Quality = 82/);
-assert.doesNotMatch(optimizerSource, /public[\\/]catalog/);
-assert.match(optimizerSource, /\.jpg\.optimizing/);
 
-const temp = mkdtempSync(join(tmpdir(), 'nai-v5-atomic-'));
+const temp = localTemp('nai-v5-atomic');
 const liveCatalog = join(temp, 'catalog.json');
 const liveArtistDir = join(temp, 'live-artists');
 const stageCatalog = join(temp, 'stage-catalog.json');
@@ -1348,7 +1389,7 @@ assert.equal(packagedPaths.dataDir.replaceAll('\\', '/'), 'C:/Program Files/NAI/
 assert.match(devPaths.logsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/logs$/);
 assert.match(devPaths.crashDumpsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/crash-dumps$/);
 assert.match(devPaths.customTagsDir.replaceAll('\\', '/'), /D:\/workspace\/\.app-data\/custom-tags$/);
-const pathTemp = mkdtempSync(join(tmpdir(), 'nai-paths-'));
+const pathTemp = localTemp('nai-paths');
 const writablePaths = resolveAppPaths({ isPackaged: false, workspaceDir: pathTemp, executablePath: 'C:/Prompt Studio.exe' });
 ensureWritable(writablePaths);
 const legacy = join(pathTemp, 'legacy', 'workspace.json');
@@ -1514,7 +1555,7 @@ assert.match(nsisIncludeSource, /Function CloseExactStudioProcess[\s\S]*?!insert
 assert.match(nsisIncludeSource, /Function un\.CloseExactStudioProcess[\s\S]*?!insertmacro CloseExactStudioProcessBody[\s\S]*?FunctionEnd/);
 assert.match(nsisIncludeSource, /!ifndef BUILD_UNINSTALLER\s+Function LoadNAIShortcutPolicy[\s\S]*?Function NAIShortcutOptionsLeave[\s\S]*?FunctionEnd\s+!endif/);
 assert.match(nsisIncludeSource, /!ifdef BUILD_UNINSTALLER\s+!macro customUnWelcomePage[\s\S]*?Function un\.NAIPreserveDataLeave[\s\S]*?FunctionEnd\s+!endif/);
-assert.match(nsisIncludeSource, /!ifdef BUILD_UNINSTALLER\s+Var NAIPreserveData\s+Var NAIPreserveDataCheckbox\s+!else\s+Var NAIStartMenuShortcut[\s\S]*?Var NAIShortcutPolicyDirectory\s+!endif/);
+assert.match(nsisIncludeSource, /!ifdef BUILD_UNINSTALLER\s+Var NAIPreserveData\s+Var NAIPreserveDataCheckbox\s+!else\s+Var NAIStartMenuShortcut[\s\S]*?Var NAIShortcutPolicyDirectory[\s\S]*?Var NAICatalogOptionsFresh\s+!endif/);
 const customInstallSource = nsisIncludeSource.match(/!macro customInstall[\s\S]*?!macroend/)?.[0] ?? '';
 assert.doesNotMatch(customInstallSource, /ReadINIStr[\s\S]*installer-options\.ini/);
 // The assisted template inserts customUninstallPage after MUI_UNPAGE_INSTFILES;
@@ -1535,7 +1576,403 @@ assert.match(electronSource, /APP_USER_MODEL_ID/);
 assert.match(electronSource, /app\.setAppUserModelId\(APP_USER_MODEL_ID\)/);
 assert.match(electronSource, /APP_ICON/);
 assert.match(installerLauncherSource, /CanonicalApplicationExecutable/);
-assert.match(installerLauncherSource, /NAISETUPV0600000/);
+assert.match(installerLauncherSource, /NAISETUPV0630000/);
+
+// v0.6.3 thin component contracts. Fixtures stay under the workspace and use
+// an injected development inspector; packaged runtime uses native Electron fs.
+const componentInspector = { list: file => listPackage(file), read: (file, entry) => extractFile(file, entry) };
+async function awaitAsar(streamPromise) {
+  const stream = await streamPromise;
+  if (!stream?.writableFinished) await once(stream, 'finish');
+  if (stream?.path && !existsSync(stream.path)) await once(stream, 'close');
+}
+async function componentFixture(id, inner, payload = 'fixture') {
+  const root = localTemp(`component-source-${id}`);
+  const innerFile = join(root, ...inner.split('/'));
+  mkdirSync(join(innerFile, '..'), { recursive: true });
+  writeFileSync(innerFile, payload);
+  const metadata = { id, version: '0.6.3', expectedRoot: COMPONENTS[id].expectedRoot, count: COMPONENTS[id].count };
+  writeFileSync(join(root, 'catalog-component.json'), `${JSON.stringify(metadata)}\n`);
+  const archive = join(localTemp(`component-archive-${id}`), COMPONENTS[id].filename);
+  await awaitAsar(createPackage(root, archive));
+  const bytes = readFileSync(archive);
+  return { archive, descriptor: normalizeDescriptor({ ...COMPONENTS[id], size: bytes.length, sha512: createHash('sha512').update(bytes).digest('hex') }), root };
+}
+const artistComponent = await componentFixture('artists', 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp', 'RIFFxxxxWEBP');
+assert.equal((await verifyComponent(artistComponent.archive, artistComponent.descriptor, { archiveInspector: componentInspector })).status, 'Installed');
+const { url: _artistUrl, ...artistDescriptorWithoutUrl } = artistComponent.descriptor;
+assert.throws(() => normalizeDescriptor({ ...artistDescriptorWithoutUrl, trustedUrl: 'https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/other.asar' }), /URL is not trusted/i);
+// createPackageFromFiles resolves source filenames itself; the production pack
+// builder must provide absolute inputs so nested archive paths are retained.
+const directPackSource = localTemp('direct-pack-source');
+mkdirSync(join(directPackSource, 'cards/artist/example'), { recursive: true });
+writeFileSync(join(directPackSource, 'cards/artist/example/fixture.webp'), 'RIFFxxxxWEBP');
+writeFileSync(join(directPackSource, 'catalog.json'), '{}');
+const directPack = join(localTemp('direct-pack-output'), 'direct.asar');
+await awaitAsar(createPackageFromFiles(directPackSource, directPack, [join(directPackSource, 'cards/artist/example/fixture.webp'), join(directPackSource, 'catalog.json')]));
+assert.ok(listPackage(directPack).some(entry => String(entry).replace(/\\/g, '/') === '/cards/artist/example/fixture.webp'));
+assert.throws(() => safeRelative(localTemp('component-path'), '../escape'), /escaped/i);
+assert.throws(() => resolveComponentAsset(localTemp('component-path'), '../escape'), /invalid runtime catalog asset/i);
+
+const componentProfile = localTemp('component-profile');
+const componentStatePaths = componentPaths(join(componentProfile, 'catalog'));
+mkdirSync(componentProfile, { recursive: true });
+const componentBytes = readFileSync(artistComponent.archive);
+const activated = activateComponent(join(componentProfile, 'catalog'), await verifyComponent(artistComponent.archive, artistComponent.descriptor, { archiveInspector: componentInspector }));
+const activatedStat = statSync(activated.path);
+const componentState = loadState(join(componentProfile, 'catalog'));
+componentState.components.artists = { status: 'Installed', filename: artistComponent.descriptor.filename, size: activatedStat.size, sha512: artistComponent.descriptor.sha512, mtimeMs: activatedStat.mtimeMs, version: '0.6.3', expectedRoot: 'cards/artist', count: 4198 };
+saveState(join(componentProfile, 'catalog'), componentState);
+assert.match(resolveComponentAsset(join(componentProfile, 'catalog'), 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp'), /nai-v5-artists\.asar/);
+const changedDescriptor = normalizeDescriptor({ ...artistComponent.descriptor, size: artistComponent.descriptor.size + 1, sha512: 'b'.repeat(128) });
+assert.equal((await inspectComponent(join(componentProfile, 'catalog'), changedDescriptor)).status, 'Installed');
+let futureDescriptorRequest = false;
+const futureDescriptorResult = await ensureComponent({ catalogDir: join(componentProfile, 'catalog'), descriptor: changedDescriptor, request: async () => { futureDescriptorRequest = true; throw new Error('future descriptor must not auto-download'); }, retries: 0, archiveInspector: componentInspector });
+assert.equal(futureDescriptorResult.status, 'Installed');
+assert.equal(futureDescriptorRequest, false);
+await assert.rejects(downloadComponent({ catalogDir: join(componentProfile, 'catalog'), descriptor: changedDescriptor, request: async () => ({ status: 200, ok: true, body: componentBytes }), retries: 0, archiveInspector: componentInspector }), /size mismatch/i);
+assert.equal(loadState(join(componentProfile, 'catalog')).components.artists.status, 'Installed');
+assert.equal(resolveComponentAsset(join(componentProfile, 'catalog'), 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp').endsWith('fixture.webp'), true);
+assert.equal(readFileSync(activated.path).equals(componentBytes), true);
+const oldBytes = readFileSync(activated.path);
+assert.throws(() => activateComponent(join(componentProfile, 'catalog'), { ...artistComponent.descriptor, path: join(componentProfile, 'missing.partial') }));
+assert.equal(readFileSync(activated.path).equals(oldBytes), true);
+assert.equal(readdirSync(componentStatePaths.components).some(name => name.includes('.previous-')), false);
+
+// Component targets must reject symlinks before runtime resolution; retain a
+// deterministic skip only for hosts where creating a test symlink is denied.
+const symlinkComponentProfile = localTemp('component-symlink');
+const symlinkComponentCatalog = join(symlinkComponentProfile, 'catalog');
+const symlinkComponentPaths = componentPaths(symlinkComponentCatalog);
+mkdirSync(symlinkComponentPaths.components, { recursive: true });
+const symlinkOutside = join(symlinkComponentProfile, 'outside.asar');
+writeFileSync(symlinkOutside, componentBytes);
+let componentSymlinkCheckSkipped = false;
+try {
+  symlinkSync(symlinkOutside, componentFile(symlinkComponentCatalog, artistComponent.descriptor), 'file');
+  assert.equal(statusForComponent(symlinkComponentCatalog, artistComponent.descriptor).status, 'Damaged');
+  assert.throws(() => resolveComponentAsset(symlinkComponentCatalog, 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp'), /regular file|symbolic/i);
+} catch (error) {
+  if (error?.code === 'EPERM' || error?.code === 'EACCES' || error?.code === 'UNKNOWN') componentSymlinkCheckSkipped = true;
+  else throw error;
+}
+assert.equal(typeof componentSymlinkCheckSkipped, 'boolean');
+
+// A stale Installed record without its target must not be reported as
+// Installed; status consumers need a real Missing state to offer recovery.
+const missingStatusProfile = localTemp('component-missing-status');
+const missingStatusCatalog = join(missingStatusProfile, 'catalog');
+const missingStatusState = loadState(missingStatusCatalog);
+missingStatusState.components.artists = {
+  status: 'Installed',
+  filename: artistComponent.descriptor.filename,
+  size: artistComponent.descriptor.size,
+  sha512: artistComponent.descriptor.sha512,
+  mtimeMs: 1,
+  version: '0.6.3',
+  expectedRoot: 'cards/artist',
+  count: 4198
+};
+saveState(missingStatusCatalog, missingStatusState);
+assert.equal(statusForComponent(missingStatusCatalog, artistComponent.descriptor).status, 'Missing');
+
+const downloadProfile = localTemp('component-download');
+const partial = join(componentPaths(join(downloadProfile, 'catalog')).downloads, artistComponent.descriptor.filename + '.partial');
+mkdirSync(join(downloadProfile, 'catalog'), { recursive: true });
+const archiveBytes = componentBytes;
+const split = Math.floor(archiveBytes.length / 3);
+mkdirSync(componentPaths(join(downloadProfile, 'catalog')).downloads, { recursive: true });
+writeFileSync(partial, archiveBytes.subarray(0, split));
+const ranges = [];
+await downloadComponent({ catalogDir: join(downloadProfile, 'catalog'), descriptor: artistComponent.descriptor, request: async (_url, request) => { ranges.push(request.headers.Range || ''); return { status: 206, ok: true, headers: { 'content-range': `bytes ${split}-${archiveBytes.length - 1}/${archiveBytes.length}`, 'content-length': archiveBytes.length - split }, body: archiveBytes.subarray(split) }; }, retries: 0, archiveInspector: componentInspector });
+assert.deepEqual(ranges, [`bytes=${split}-`]);
+assert.equal(loadState(join(downloadProfile, 'catalog')).components.artists.size, archiveBytes.length);
+
+// A resumed 206 response without a matching Content-Range must fail before
+// appending. Otherwise a server can return an unrelated payload that happens
+// to complete the partial file and activate corrupt bytes.
+const invalidResumeProfile = localTemp('component-invalid-resume');
+const invalidResumeCatalog = join(invalidResumeProfile, 'catalog');
+const invalidResumePaths = componentPaths(invalidResumeCatalog);
+mkdirSync(invalidResumePaths.downloads, { recursive: true });
+const invalidResumeSplit = Math.floor(archiveBytes.length / 3);
+writeFileSync(join(invalidResumePaths.downloads, `${artistComponent.descriptor.filename}.partial`), archiveBytes.subarray(0, invalidResumeSplit));
+await assert.rejects(downloadComponent({
+  catalogDir: invalidResumeCatalog,
+  descriptor: artistComponent.descriptor,
+  request: async () => ({ status: 206, ok: true, body: archiveBytes.subarray(invalidResumeSplit) }),
+  retries: 0,
+  archiveInspector: componentInspector
+}), /content-range|resume/i);
+assert.equal(existsSync(componentFile(invalidResumeCatalog, artistComponent.descriptor)), false);
+
+// Non-success responses must release their response stream before the retry
+// path surfaces the HTTP error; leaving an IncomingMessage untouched leaks a
+// socket on every failed component transfer.
+const responseFailureProfile = localTemp('component-response-failure');
+let responseFailureDestroyed = false;
+let responseFailureResumed = false;
+const responseFailureBody = { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}), return: () => Promise.resolve({ done: true }) }) };
+await assert.rejects(downloadComponent({
+  catalogDir: join(responseFailureProfile, 'catalog'),
+  descriptor: artistComponent.descriptor,
+  request: async () => ({ status: 503, ok: false, body: responseFailureBody, destroy: () => { responseFailureDestroyed = true; }, resume: () => { responseFailureResumed = true; } }),
+  retries: 0,
+  archiveInspector: componentInspector
+}), /HTTP 503/i);
+assert.equal(responseFailureDestroyed || responseFailureResumed, true);
+
+// A stalled streamed body must be closed after the timeout; retaining a
+// pending iterator leaves an open source/write path and permits late writes.
+const stalledStreamProfile = localTemp('component-stalled-stream');
+let stalledNextCalls = 0;
+let stalledReturnCalls = 0;
+const stalledBody = {
+  [Symbol.asyncIterator]() {
+    return {
+      next() {
+        stalledNextCalls += 1;
+        if (stalledNextCalls === 1) return Promise.resolve({ done: false, value: Buffer.from('partial') });
+        return new Promise(() => {});
+      },
+      return() {
+        stalledReturnCalls += 1;
+        return Promise.resolve({ done: true });
+      }
+    };
+  }
+};
+await assert.rejects(downloadComponent({
+  catalogDir: join(stalledStreamProfile, 'catalog'),
+  descriptor: artistComponent.descriptor,
+  request: async () => ({ status: 200, ok: true, body: stalledBody }),
+  timeoutMs: 5,
+  retries: 0,
+  archiveInspector: componentInspector
+}), /stalled/i);
+assert.equal(stalledReturnCalls, 1);
+
+// Cancellation while the iterator is waiting for its next chunk must reject
+// promptly rather than waiting for the idle timeout and must close the body.
+const abortStreamProfile = localTemp('component-abort-stream');
+const abortStreamController = new AbortController();
+let abortStreamNextCalls = 0;
+let abortStreamReturnCalls = 0;
+const abortStreamBody = {
+  [Symbol.asyncIterator]() {
+    return {
+      next() {
+        abortStreamNextCalls += 1;
+        if (abortStreamNextCalls === 1) return Promise.resolve({ done: false, value: Buffer.from('partial') });
+        return new Promise(() => {});
+      },
+      return() {
+        abortStreamReturnCalls += 1;
+        return Promise.resolve({ done: true });
+      }
+    };
+  }
+};
+await assert.rejects(downloadComponent({
+  catalogDir: join(abortStreamProfile, 'catalog'),
+  descriptor: artistComponent.descriptor,
+  signal: abortStreamController.signal,
+  request: async () => ({ status: 200, ok: true, body: abortStreamBody }),
+  onProgress: event => { if (event.completed > 0) abortStreamController.abort(); },
+  timeoutMs: 20,
+  retries: 0,
+  archiveInspector: componentInspector
+}), error => error?.code === 'ABORT_ERR');
+assert.equal(abortStreamReturnCalls, 1);
+
+// A write callback failure must destroy the stream before surfacing the
+// failure, otherwise each retry can retain a live handle to the partial file.
+const writeFailureProfile = localTemp('component-write-failure');
+const originalCreateWriteStream = nativeFs.createWriteStream;
+let failedWriter;
+nativeFs.createWriteStream = () => {
+  failedWriter = {
+    destroyed: false,
+    write(_chunk, callback) { callback(new Error('fixture write failed')); },
+    destroy() { this.destroyed = true; },
+    end(callback) { callback?.(); }
+  };
+  return failedWriter;
+};
+try {
+  await assert.rejects(downloadComponent({
+    catalogDir: join(writeFailureProfile, 'catalog'),
+    descriptor: artistComponent.descriptor,
+    request: async () => ({ status: 200, ok: true, body: { [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: false, value: Buffer.from('partial') }), return: () => Promise.resolve({ done: true }) }) } }),
+    retries: 0,
+    archiveInspector: componentInspector
+  }), /fixture write failed/i);
+  assert.equal(failedWriter.destroyed, true);
+} finally {
+  nativeFs.createWriteStream = originalCreateWriteStream;
+}
+
+const cancelProfile = localTemp('component-cancel');
+const componentCancelController = new AbortController();
+componentCancelController.abort();
+await assert.rejects(downloadComponent({ catalogDir: join(cancelProfile, 'catalog'), descriptor: artistComponent.descriptor, signal: componentCancelController.signal, request: async () => { throw new Error('request must not start'); }, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(loadState(join(cancelProfile, 'catalog')).components.artists.status, 'Missing');
+const failedDownloadProfile = localTemp('component-failed-download');
+await assert.rejects(downloadComponent({ catalogDir: join(failedDownloadProfile, 'catalog'), descriptor: artistComponent.descriptor, request: async () => ({ status: 200, ok: true, body: Buffer.from('not-an-asar') }), retries: 0, archiveInspector: componentInspector }), /size mismatch|SHA-512/i);
+assert.equal(loadState(join(failedDownloadProfile, 'catalog')).components.artists.status, 'Missing');
+const corruptDownloadProfile = localTemp('component-corrupt-download');
+await assert.rejects(downloadComponent({ catalogDir: join(corruptDownloadProfile, 'catalog'), descriptor: artistComponent.descriptor, request: async () => ({ status: 200, ok: true, body: Buffer.alloc(archiveBytes.length, 0x63) }), retries: 0, archiveInspector: componentInspector }), /SHA-512/i);
+assert.equal(existsSync(componentFile(join(corruptDownloadProfile, 'catalog'), artistComponent.descriptor)), false);
+const oversizeDownloadProfile = localTemp('component-oversize-download');
+await assert.rejects(downloadComponent({ catalogDir: join(oversizeDownloadProfile, 'catalog'), descriptor: artistComponent.descriptor, request: async () => ({ status: 200, ok: true, body: Buffer.concat([archiveBytes, Buffer.from([0x63])]) }), retries: 0, archiveInspector: componentInspector }), /size mismatch/i);
+assert.equal(existsSync(componentFile(join(oversizeDownloadProfile, 'catalog'), artistComponent.descriptor)), false);
+
+const legacyRoot = localTemp('legacy-source');
+const legacyCatalog = { version: 2, artists: [{ image: 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp' }], characters: [{ image: 'cards/character/danbooru-character-tags-v4.5/fixture.jpg' }] };
+mkdirSync(join(legacyRoot, 'dist/catalog/cards/artist/danbooru-artist-tags-2-v5'), { recursive: true });
+mkdirSync(join(legacyRoot, 'dist/catalog/cards/character/danbooru-character-tags-v4.5'), { recursive: true });
+mkdirSync(join(legacyRoot, 'dist/catalog/guide'), { recursive: true });
+writeFileSync(join(legacyRoot, 'dist/catalog/catalog.json'), JSON.stringify(legacyCatalog));
+writeFileSync(join(legacyRoot, 'dist/catalog/cards/artist/danbooru-artist-tags-2-v5/fixture.webp'), 'RIFFxxxxWEBP');
+writeFileSync(join(legacyRoot, 'dist/catalog/cards/character/danbooru-character-tags-v4.5/fixture.jpg'), 'jpg');
+writeFileSync(join(legacyRoot, 'dist/catalog/guide/manifest.json'), JSON.stringify([{ image: 'fixture.png' }]));
+writeFileSync(join(legacyRoot, 'dist/catalog/guide/fixture.png'), 'png');
+const legacyArchive = join(localTemp('legacy-archive'), 'legacy-app.asar');
+await awaitAsar(createPackage(legacyRoot, legacyArchive));
+const legacyProfile = localTemp('legacy-profile');
+const legacyCatalogDir = join(legacyProfile, 'catalog');
+mkdirSync(componentPaths(legacyCatalogDir).legacy, { recursive: true });
+copyFileSync(legacyArchive, componentPaths(legacyCatalogDir).legacyPack);
+const legacyValidation = validateLegacyArchive(componentPaths(legacyCatalogDir).legacyPack, { inspector: componentInspector });
+assert.equal(legacyValidation.status, 'Migrated');
+assert.match(resolveComponentAsset(legacyCatalogDir, 'guide/fixture.png'), /legacy-app\.asar/);
+const optionsPath = join(legacyProfile, 'installer-options.ini');
+writeFileSync(optionsPath, '[catalogs]\nv5Artists=1\nbuilder=1\nv45Characters=0\n');
+const legacySnapshot = readFileSync(optionsPath, 'utf8');
+const legacyResults = await ensureSelectedComponents({ catalogDir: legacyCatalogDir, dataDir: legacyProfile, descriptors: [artistComponent.descriptor, { ...artistComponent.descriptor, id: 'guide', filename: COMPONENTS.guide.filename, expectedRoot: COMPONENTS.guide.expectedRoot, count: COMPONENTS.guide.count }, { ...artistComponent.descriptor, id: 'characters', filename: COMPONENTS.characters.filename, expectedRoot: COMPONENTS.characters.expectedRoot, count: COMPONENTS.characters.count }], request: async () => { throw new Error('legacy source must suppress downloads'); }, archiveInspector: componentInspector });
+assert.equal(legacyResults.migrated, true);
+assert.deepEqual(legacyResults.results.map(item => item.status), ['Migrated', 'Migrated']);
+assert.equal(readFileSync(optionsPath, 'utf8'), legacySnapshot);
+assert.equal(existsSync(join(legacyCatalogDir, 'active.json')), false);
+
+// An explicitly installed component takes status precedence over a retained
+// legacy ASAR, while components that have not been installed remain Migrated.
+const legacyArtistDescriptor = artistComponent.descriptor;
+const legacyArtistArchive = join(localTemp('legacy-artist-component'), legacyArtistDescriptor.filename);
+copyFileSync(activated.path, legacyArtistArchive);
+const legacyActivated = activateComponent(legacyCatalogDir, await verifyComponent(legacyArtistArchive, legacyArtistDescriptor, { archiveInspector: componentInspector }));
+const legacyActivatedStat = statSync(legacyActivated.path);
+const legacyInstalledState = loadState(legacyCatalogDir);
+legacyInstalledState.components.artists = {
+  status: 'Installed',
+  filename: legacyArtistDescriptor.filename,
+  size: legacyActivatedStat.size,
+  sha512: legacyArtistDescriptor.sha512,
+  mtimeMs: legacyActivatedStat.mtimeMs,
+  version: '0.6.3',
+  expectedRoot: legacyArtistDescriptor.expectedRoot,
+  count: legacyArtistDescriptor.count
+};
+saveState(legacyCatalogDir, legacyInstalledState);
+const legacyStatusDescriptors = [
+  legacyArtistDescriptor,
+  normalizeDescriptor({ ...COMPONENTS.guide, size: 1, sha512: '0'.repeat(128) }),
+  normalizeDescriptor({ ...COMPONENTS.characters, size: 1, sha512: '0'.repeat(128) })
+];
+const legacyStatuses = statuses(legacyCatalogDir, legacyStatusDescriptors, { archiveInspector: componentInspector });
+assert.deepEqual(legacyStatuses.map(item => item.status), ['Installed', 'Migrated', 'Migrated']);
+
+// A damaged regular component must not shadow a validated migrated archive;
+// runtime resolution should continue down the documented source precedence.
+writeFileSync(componentFile(legacyCatalogDir, legacyArtistDescriptor), 'damaged component');
+assert.match(resolveComponentAsset(legacyCatalogDir, 'cards/artist/danbooru-artist-tags-2-v5/fixture.webp'), /legacy-app\.asar/);
+
+const warmupCards = Array.from({ length: 8 }, (_, index) => ({ id: `warm-${index}`, catalogId: `warm-${index}`, tag: `Warm ${index}`, image: `cards/artist/${index}.webp` }));
+const warmupPlan = buildWarmupPlan(warmupCards, { selected: ['warm-3'], anchors: ['warm-2'], companions: ['warm-2', 'warm-1'], visible: ['warm-0'], initialLimit: warmupCards.length });
+assert.deepEqual(warmupPlan.slice(0, 5).map(item => item.id), ['warm-3', 'warm-2', 'warm-1', 'warm-0', 'warm-4']);
+let activeWarmups = 0; let maxWarmups = 0; const finishedWarmups = [];
+const warmupRun = scheduleIdleWarmup(warmupPlan, async item => { activeWarmups += 1; maxWarmups = Math.max(maxWarmups, activeWarmups); await new Promise(resolve => setTimeout(resolve, 1)); activeWarmups -= 1; finishedWarmups.push(item.id); return true; }, 0, callback => setTimeout(callback, 0), 2);
+warmupRun.startIdle();
+while (finishedWarmups.length < warmupPlan.length) await new Promise(resolve => setTimeout(resolve, 2));
+assert.ok(maxWarmups <= 2);
+assert.equal(new Set(finishedWarmups).size, warmupPlan.length);
+
+assert.doesNotMatch(preloadSource, /process\.isPackaged/);
+assert.match(uiSource, /async function loadCatalogMode/);
+assert.match(uiSource, /packagedCatalogMode/);
+assert.match(electronSource, /fs\.readFileSync\(target\)/);
+assert.match(uiSource.match(/async function bootApp\(\)[\s\S]*?\n\}/)?.[0] ?? '', /openStudioAfterStartup\(\);[\s\S]*?scheduleIdleWarmup/);
+assert.doesNotMatch(uiSource.match(/async function bootApp\(\)[\s\S]*?\n\}/)?.[0] ?? '', /await preloadCards\(initialWarmup/);
+assert.match(uiSource, /status\.status === 'Installed' \|\| status\.status === 'Migrated'/);
+assert.match(uiSource, /status\.status === 'Missing' && Boolean\(status\.error\)/);
+assert.doesNotMatch(uiSource.match(/function componentSettingsMarkup[\s\S]*?\n\}/)?.[0] ?? '', /Delete/);
+assert.match(nsisIncludeSource, /fsutil\.exe.*hardlink create/);
+assert.doesNotMatch(nsisIncludeSource, /CreateHardLink|67108864/);
+assert.match(nsisIncludeSource, /workspace\.json/);
+assert.match(nsisIncludeSource, /data\\catalog\\\*\.\*/);
+const checkOrder = nsisIncludeSource.match(/!macro customCheckAppRunning[\s\S]*?!macroend/)?.[0] ?? '';
+assert.ok(checkOrder.indexOf('Call CloseExactStudioProcess') < checkOrder.indexOf('Call PreserveLegacyCatalog'));
+// The no-prior-legacy branch must probe the existing v0.6.2 source ($src),
+// not the destination ($legacy) that is only created by the later copy.
+const preserveLegacySourceFlow = nsisIncludeSource.match(/preserveLegacySourceExists:[\s\S]*?Pop \$0/)?.[0] ?? '';
+assert.match(preserveLegacySourceFlow, /param\(\[string\]\$\$src,\[string\]\$\$dst\)/);
+assert.match(preserveLegacySourceFlow, /\$\$info=Get-Item -LiteralPath \$\$src/);
+assert.equal(preserveLegacySourceFlow.includes('$$info=Get-Item -LiteralPath $$legacy'), false);
+assert.match(preserveLegacySourceFlow, /\$\$env:SystemRoot/);
+assert.doesNotMatch(preserveLegacySourceFlow, /(?<!\$)\$env:SystemRoot/);
+
+// v0.6.3 installer migration commands must be parser-safe for paths with
+// spaces/apostrophes and must not inspect an arbitrary ASAR-header marker.
+const preserveLegacyFunctionSource = nsisIncludeSource.match(/Function PreserveLegacyCatalog[\s\S]*?FunctionEnd/)?.[0] ?? '';
+const preserveLegacyCommandSource = preserveLegacyFunctionSource.match(/preserveLegacySourceExists:[\s\S]*?nsExec::Exec[\s\S]*?Pop \$0/)?.[0] ?? '';
+assert.equal((nsisIncludeSource.match(/nsExec::Exec/g) ?? []).length, 3);
+assert.equal(nsisIncludeSource.includes('ExecToStack'), false);
+assert.equal(nsisIncludeSource.includes("''"), false);
+assert.doesNotMatch(preserveLegacyFunctionSource, /catalog\.json|dist\/catalog|ASCII|8388608|buffer/);
+assert.match(preserveLegacyFunctionSource, /param\(\[string\]\$\$legacy\)/);
+assert.match(preserveLegacyFunctionSource, /param\(\[string\]\$\$src,\[string\]\$\$dst\)/);
+assert.match(preserveLegacyFunctionSource, /268435456/);
+assert.match(preserveLegacyFunctionSource, /\$\$partial=/);
+assert.match(preserveLegacyFunctionSource, /Test-Path -LiteralPath \$\$partial -PathType Leaf/);
+assert.doesNotMatch(preserveLegacyFunctionSource, /Get-FileHash/);
+assert.match(preserveLegacyFunctionSource, /\[Security\.Cryptography\.SHA512\]::Create\(\)/);
+assert.match(preserveLegacyFunctionSource, /\$\$hashFile=\{ param\(\[string\]\$\$path\)/);
+assert.match(preserveLegacyFunctionSource, /\[IO\.File\]::OpenRead\(\$\$path\)/);
+assert.match(preserveLegacyFunctionSource, /\$\$srcHash=& \$\$hashFile \$\$src/);
+assert.match(preserveLegacyFunctionSource, /\$\$partialHash=& \$\$hashFile \$\$partial/);
+assert.match(preserveLegacyFunctionSource, /\$\$sha512\.ComputeHash\(\$\$hashStream\)/);
+assert.match(preserveLegacyFunctionSource, /\[BitConverter\]::ToString/);
+assert.match(preserveLegacyFunctionSource, /\$\$hashStream\.Dispose\(\)/);
+assert.match(preserveLegacyFunctionSource, /\$\$sha512\.Dispose\(\)/);
+assert.match(preserveLegacyFunctionSource, /\[IO\.File\]::Replace\(\$\$partial,\$\$dst/);
+assert.match(preserveLegacyFunctionSource, /\[IO\.File\]::Move\(\$\$partial,\$\$dst\)/);
+assert.match(preserveLegacyFunctionSource, /catch \{ if\(\$\$partial\)\{Remove-Item -LiteralPath \$\$partial/);
+assert.equal((preserveLegacyCommandSource.match(/Pop \$0/g) ?? []).length, 1);
+assert.ok(preserveLegacyCommandSource.indexOf('Remove-Item -LiteralPath $$partial') < preserveLegacyCommandSource.indexOf('$$fsutil=Join-Path'));
+assert.ok(preserveLegacyCommandSource.indexOf('$$fsutil=Join-Path') < preserveLegacyCommandSource.indexOf('Copy-Item -LiteralPath $$src'));
+assert.ok(preserveLegacyCommandSource.indexOf('Copy-Item -LiteralPath $$src') < preserveLegacyCommandSource.indexOf('$$staged=Get-Item'));
+assert.ok(preserveLegacyCommandSource.indexOf('$$srcHash=') < preserveLegacyCommandSource.indexOf('[IO.File]::Replace'));
+assert.doesNotMatch(preserveLegacyFunctionSource, /(?<!\$)\$env:SystemRoot/);
+assert.doesNotMatch(preserveLegacyFunctionSource, /C:\\|PLUGINSDIR|\$TEMP|NAI_PROOF_ENV_RESULT/);
+assert.match(nsisIncludeSource, /Legacy catalog preservation skipped:[^\n]*fat v0\.6\.2/);
+assert.match(nsisIncludeSource, /Legacy catalog preservation failed before the previous application was removed/);
+const preserveFailureMessageSource = preserveLegacyFunctionSource.match(/DetailPrint "Legacy catalog preservation failed[\s\S]*?Abort/)?.[0] ?? '';
+assert.match(preserveFailureMessageSource, /!ifndef NAI_INSTALLER_PROOF[\s\S]*MessageBox MB_ICONSTOP[\s\S]*!endif/);
+assert.doesNotMatch(nsisIncludeSource, /NAI_PROOF_ENV_RESULT/);
+assert.match(installerProofSource, /!define NAI_INSTALLER_PROOF/);
+assert.doesNotMatch(installerProofSource, /NAI_PROOF_TEST|NAI_PROBE_VALUE|NAI_PROOF_ENV_RESULT/);
+assert.doesNotMatch(installerProofSource, /ExecToStack|DEBUG|debug|;\s*Call PreserveLegacyCatalog/);
+assert.match(installerProofRunnerSource, /timeout: 120000/);
+assert.match(installerProofRunnerSource, /stdio: \['ignore', 'pipe', 'pipe'\]/);
+assert.match(installerProofRunnerSource, /maxBuffer: 1024 \* 1024/);
+assert.match(installerProofRunnerSource, /const fallbackInstall = join\(proofDir, [\"']copy fallback install path with spaces and apostrophe/);
+assert.match(installerProofRunnerSource, /SystemRoot: join\(proofDir, ['"]missing-system-root['"]\)/);
+assert.match(installerProofRunnerSource, /Copy fallback did not atomically produce a complete destination/);
+
+const closeExactCommandSource = closeExactStudioProcessSource.match(/nsExec::Exec[\s\S]*?Pop \$0/)?.[0] ?? '';
+assert.match(closeExactCommandSource, /param\(\[string\]\$\$target\)/);
+assert.equal((closeExactCommandSource.match(/Pop \$0/g) ?? []).length, 1);
+assert.doesNotMatch(closeExactCommandSource, /''|(?<!\$)\$(?:target|self|p|closed|x|q)(?!\$)/);
 
 // V0.6.1 Artist Mix, persistence, and Galaxy regressions.
 assert.match(typesSource, /interface ArtistMixDraft[\s\S]*?anchorWeightsLocked: boolean/);
@@ -1587,7 +2024,8 @@ assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-templa
 assert.match(styleSource, /\.mix-orbit-primary\.mix-anchor-group\.is-multi-anchor \{ max-width: min\(560px, calc\(100% - 20px\)\); \}/);
 assert.doesNotMatch(styleSource.match(/\.mix-orbit\[data-layout-density="compact"\] \.mix-anchor-group\.is-multi-anchor[\s\S]*?\n\}/)?.[0] ?? '', /width: 96px|height: 64px/);
 assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Eight interface themes/);
-assert.equal(packageSource.version, '0.6.2');
+assert.equal(packageSource.version, '0.6.3');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
+rmSync(testTempRoot, { recursive: true, force: true });
 console.log(`Tests passed: page discovery, atomic replacement/failure recovery, WebP validation, prompt serialization, migration, random uniqueness, and exact catalog assets (${catalog.artists.length} V5 artists / ${catalog.characters.length} characters).`);

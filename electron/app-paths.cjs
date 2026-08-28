@@ -13,6 +13,9 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
   const customTagsDir = path.join(dataDir, 'custom-tags');
   const savedLibraryDir = path.join(dataDir, 'saved-library');
   const catalogDir = path.join(dataDir, 'catalog');
+  const catalogComponentsDir = path.join(catalogDir, 'components');
+  const catalogDownloadsDir = path.join(catalogDir, 'downloads');
+  const catalogLegacyDir = path.join(catalogDir, 'legacy');
   const tempDir = path.join(dataDir, 'temp');
   const cacheDir = path.join(dataDir, 'cache');
   const updatesDir = path.join(dataDir, 'updates');
@@ -23,7 +26,7 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
     logsDir,
     crashDumpsDir,
     customTagsDir, savedLibraryDir,
-    catalogDir, tempDir, cacheDir, updatesDir,
+    catalogDir, catalogComponentsDir, catalogDownloadsDir, catalogLegacyDir, tempDir, cacheDir, updatesDir,
     workspaceFile: path.join(dataDir, 'workspace.json')
   };
 }
@@ -37,6 +40,9 @@ function ensureWritable(paths) {
     fs.mkdirSync(paths.customTagsDir, { recursive: true });
     fs.mkdirSync(paths.savedLibraryDir, { recursive: true });
     fs.mkdirSync(paths.catalogDir, { recursive: true });
+    fs.mkdirSync(paths.catalogComponentsDir, { recursive: true });
+    fs.mkdirSync(paths.catalogDownloadsDir, { recursive: true });
+    fs.mkdirSync(paths.catalogLegacyDir, { recursive: true });
     fs.mkdirSync(paths.tempDir, { recursive: true });
     fs.mkdirSync(paths.cacheDir, { recursive: true });
     fs.mkdirSync(paths.updatesDir, { recursive: true });

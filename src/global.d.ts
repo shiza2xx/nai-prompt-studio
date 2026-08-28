@@ -48,10 +48,22 @@ export interface NAIUpdaterBridge {
 }
 
 export interface NAICatalogBridge {
+  packaged?: boolean;
   load(): Promise<OfflineCatalog>;
+  mode?(): Promise<{ packaged: boolean }>;
+  components?(): Promise<{ descriptors: CatalogComponentDescriptor[]; components: CatalogComponentStatus[]; selected: Record<string, boolean>; state: unknown }>;
+  ensureSelected?(): Promise<{ selected: Record<string, boolean>; results: CatalogComponentStatus[]; total: number; missingManifest?: boolean }>;
+  downloadComponent?(id: string, repair?: boolean): Promise<CatalogComponentStatus>;
+  repairComponent?(id: string): Promise<CatalogComponentStatus>;
+  cancelComponent?(): Promise<boolean>;
+  onComponentProgress?(listener: (event: CatalogComponentProgress) => void): () => void;
   update(): Promise<{ catalog: OfflineCatalog; added: number; changed: number }>;
   cancel(): Promise<boolean>;
   onProgress(listener: (event: { phase: string; completed: number; total: number; added?: number; message?: string }) => void): () => void;
 }
+
+export interface CatalogComponentDescriptor { id: 'artists' | 'characters' | 'guide' | string; filename: string; url: string; size: number; sha512: string; expectedRoot: string; count: number; version: string; }
+export interface CatalogComponentStatus extends CatalogComponentDescriptor { path?: string; status: 'Installed' | 'Migrated' | 'Missing' | 'Downloading' | 'Damaged' | string; error?: string; }
+export interface CatalogComponentProgress { id: string; phase: 'Checking' | 'Downloading' | 'Verifying' | 'Opening' | 'Retrying' | string; completed: number; total: number; percent: number; attempt?: number; message?: string; }
 
 export {};

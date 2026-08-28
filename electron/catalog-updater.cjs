@@ -6,14 +6,24 @@ const GALLERY = 'danbooru-artist-tags-2-v5';
 const GALLERY_URL = `https://nax.moe/?gallery=${GALLERY}`;
 const CDN_PREFIX = `https://cdn.zele.st/data/NAX/Images/${GALLERY}/`;
 
-function decodeHtml(value) { return String(value || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>'); }
+function decodeHtml(value) {
+  return String(value ?? '')
+    .replace(/&#(?:x([0-9a-f]+)|([0-9]+));?/gi, (entity, hexadecimal, decimal) => {
+      const codePoint = Number.parseInt(hexadecimal || decimal, hexadecimal ? 16 : 10);
+      if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return entity;
+      try { return String.fromCodePoint(codePoint); } catch { return entity; }
+    })
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
 function normalizeTag(value) { return decodeHtml(value).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim(); }
 function normalizeImageUrl(value) {
   const raw = decodeHtml(value).trim();
   try {
     const url = new URL(raw);
     if (url.protocol !== 'https:' || url.hostname !== 'cdn.zele.st' || !url.pathname.startsWith(`/data/NAX/Images/${GALLERY}/`) || !url.pathname.endsWith('.webp')) return null;
-    return raw;
+    // Match the build updater's URL canonicalization so genuinely new cards
+    // receive the same FNV-derived identity in both environments.
+    return url.href;
   } catch { return null; }
 }
 function parseGalleryPage(html) {
@@ -25,8 +35,8 @@ function parseGalleryPage(html) {
     const image = normalizeImageUrl(block.match(/<img[^>]+src="([^"]+)"/i)?.[1]);
     const tag = normalizeTag(block.match(/<figurecaption[^>]*class="[^"]*imageText[^"]*"[^>]*>([\s\S]*?)<\/figurecaption>/i)?.[1]);
     if (!image || !tag) continue;
-    // Keep the raw URL as the identity.  Lowercasing or decoding here would
-    // merge distinct CDN keys (notably URLs containing %2520).
+    // Preserve encoded path segments in the canonical URL. Lowercasing or
+    // decoding the path would merge distinct CDN keys (notably %2520).
     const key = image;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -37,8 +47,9 @@ function parseGalleryPage(html) {
 function isWebp(buffer) { return Buffer.isBuffer(buffer) && buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP'; }
 function stableCatalogId(card) {
   const slug = String(card.tag || 'artist').toLocaleLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'artist';
-  const hash = crypto.createHash('sha1').update(String(card.sourceUrl || '')).digest('hex').slice(0, 10);
-  return `artist-v5-${slug}-${parseInt(hash.slice(0, 8), 16).toString(36)}`;
+  let hash = 2166136261;
+  for (const character of String(card.sourceUrl ?? card.image ?? '')) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  return `artist-v5-${slug}-${(hash >>> 0).toString(36)}`;
 }
 function safeFilename(id) { return `${id}.webp`; }
 function contained(base, relative) {
@@ -62,6 +73,13 @@ function validGeneration(value) { return typeof value === 'string' && /^[a-zA-Z0
 function validCardAsset(relative) {
   return typeof relative === 'string' && new RegExp(`^cards/artist/${GALLERY}/[a-zA-Z0-9._-]+\\.webp$`).test(relative);
 }
+function validCharacterAsset(relative) {
+  return typeof relative === 'string' && /^cards\/character\/danbooru-character-tags-v4\.5\/[a-zA-Z0-9._-]+\.jpg$/.test(relative);
+}
+function validGuideAsset(relative) {
+  return typeof relative === 'string' && /^guide\/[a-zA-Z0-9._-]+\.png$/.test(relative);
+}
+function validCatalogAsset(relative) { return validCardAsset(relative) || validCharacterAsset(relative) || validGuideAsset(relative); }
 function catalogAssetFromProtocolUrl(value) {
   const parsed = new URL(String(value || ''));
   if (parsed.protocol !== 'nai-catalog:') throw new Error('Invalid runtime catalog protocol');
@@ -74,7 +92,7 @@ function catalogAssetFromProtocolUrl(value) {
     : parsed.hostname === 'cards'
       ? `cards${pathname ? `/${pathname}` : ''}`
       : '';
-  if (!validCardAsset(asset)) throw new Error('Invalid runtime catalog card asset');
+  if (!validCatalogAsset(asset)) throw new Error('Invalid runtime catalog card asset or guide asset');
   return asset;
 }
 function activeGeneration(catalogDir) {
@@ -103,18 +121,95 @@ function activeGeneration(catalogDir) {
   }
   return { generation: pointer.generation, directory };
 }
-function resolveActiveCatalogAsset(catalogDir, relative) {
-  if (!validCardAsset(relative)) throw new Error('Invalid runtime catalog card asset');
+function resolveActiveCatalogAsset(catalogDir, relative, { embeddedPath } = {}) {
+  if (!validCatalogAsset(relative)) throw new Error('Invalid runtime catalog card asset or guide asset');
+  if (!validCardAsset(relative)) {
+    const { resolveComponentAsset } = require('./catalog-components.cjs');
+    return resolveComponentAsset(catalogDir, relative);
+  }
   const active = activeGeneration(catalogDir);
-  if (!active) throw new Error('No active runtime catalog generation');
-  return containedCatalogAsset(active.directory, relative);
+  if (active) {
+    const overlayAsset = containedCatalogAsset(active.directory, relative);
+    if (fs.existsSync(overlayAsset)) return overlayAsset;
+  }
+  if (embeddedPath) {
+    const looseAsset = resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative });
+    if (looseAsset) return looseAsset;
+  }
+  const { resolveComponentAsset } = require('./catalog-components.cjs');
+  return resolveComponentAsset(catalogDir, relative);
 }
 function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } }
-function mergedCatalog(embedded, overlay) {
+function validWebpFile(file) {
+  try {
+    const stat = fs.lstatSync(file);
+    return stat.isFile() && !stat.isSymbolicLink() && isWebp(fs.readFileSync(file));
+  } catch { return false; }
+}
+function resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative }) {
+  const looseRelative = typeof relative === 'string' && relative.toLowerCase().endsWith('.webp') && !relative.includes('\\') && !relative.split('/').some(segment => segment === '.' || segment === '..');
+  if (!validCardAsset(relative) && !looseRelative) return null;
+  if (embeddedPath) {
+    try {
+      const loose = contained(path.dirname(embeddedPath), relative);
+      if (validWebpFile(loose)) return loose;
+    } catch { /* packaged/component fallback below */ }
+  }
+  if (!validCardAsset(relative)) return null;
+  try {
+    const { resolveComponentAsset } = require('./catalog-components.cjs');
+    const componentAsset = resolveComponentAsset(catalogDir, relative);
+    if (validWebpFile(componentAsset)) return componentAsset;
+  } catch { /* missing or damaged component is not a usable base */ }
+  return null;
+}
+function cardId(card) { return String(card?.catalogId ?? card?.id ?? ''); }
+function cardSource(card) { return String(card?.sourceUrl ?? ''); }
+function overlayHasAsset(card, activeDirectory) {
+  if (!activeDirectory || !validCardAsset(card?.image)) return false;
+  try { return validWebpFile(contained(activeDirectory, card.image)); } catch { return false; }
+}
+function mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory } = {}) {
   if (!overlay || !Array.isArray(overlay.artists)) return embedded;
-  const byId = new Map((embedded.artists || []).map(card => [card.catalogId || card.id, card]));
-  for (const card of overlay.artists) byId.set(card.catalogId || card.id, card);
-  return { ...embedded, ...overlay, artists: [...byId.values()], characters: embedded.characters || [], tags: overlay.tags || embedded.tags || [] };
+  const cards = [];
+  const byId = new Map();
+  const bySource = new Map();
+  const remove = card => {
+    const index = cards.indexOf(card);
+    if (index >= 0) cards.splice(index, 1);
+    if (cardId(card) && byId.get(cardId(card)) === card) byId.delete(cardId(card));
+    if (cardSource(card) && bySource.get(cardSource(card)) === card) bySource.delete(cardSource(card));
+  };
+  const add = card => {
+    const id = cardId(card);
+    const source = cardSource(card);
+    const idMatch = id ? byId.get(id) : null;
+    const sourceMatch = source ? bySource.get(source) : null;
+    if (idMatch) remove(idMatch);
+    if (sourceMatch && sourceMatch !== idMatch) remove(sourceMatch);
+    cards.push(card);
+    if (id) byId.set(id, card);
+    if (source) bySource.set(source, card);
+  };
+  for (const card of (embedded.artists || [])) add(card);
+  for (const card of overlay.artists) {
+    const id = cardId(card);
+    const source = cardSource(card);
+    const idMatch = id ? byId.get(id) : null;
+    const sourceMatch = source ? bySource.get(source) : null;
+    const sameBaseIdentity = Boolean(idMatch && sourceMatch && idMatch === sourceMatch && cardId(idMatch) === id && cardSource(idMatch) === source);
+    const baseAvailable = sameBaseIdentity && Boolean(resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: idMatch.image }));
+    const ownsAsset = overlayHasAsset(card, activeDirectory);
+    // An embedded card may replace a runtime card only after its bytes have
+    // been resolved and validated. Metadata alone is never proof of a base.
+    if (sameBaseIdentity && baseAvailable) continue;
+    // If the overlay has no usable bytes but the same-source base does, keep
+    // the working base card. A valid overlay wins when it owns the asset.
+    if (idMatch && !ownsAsset && resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: idMatch.image })) continue;
+    if (sourceMatch && !ownsAsset && resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: sourceMatch.image })) continue;
+    add(card);
+  }
+  return { ...embedded, ...overlay, artists: cards, characters: embedded.characters || [], tags: overlay.tags || embedded.tags || [] };
 }
 function loadCatalog({ embeddedPath, catalogDir }) {
   const embedded = readJson(embeddedPath, { version: 2, artists: [], characters: [], tags: [] });
@@ -126,7 +221,7 @@ function loadCatalog({ embeddedPath, catalogDir }) {
     catch { throw new Error('Invalid active catalog generation catalog'); }
     if (!overlay || typeof overlay !== 'object' || !Array.isArray(overlay.artists)) throw new Error('Invalid active catalog generation catalog');
   }
-  return mergedCatalog(embedded, overlay);
+  return mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory: active?.directory });
 }
 async function discoverCards(fetchImpl = fetch, signal, progress = () => {}) {
   const get = async page => {
@@ -160,11 +255,10 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
   const old = loadCatalog({ embeddedPath, catalogDir });
   const discovered = await discoverCards(fetchImpl, signal, onProgress);
   assertNotCancelled(signal);
-  const existingByTag = new Map();
+  const existingBySource = new Map();
   for (const card of old.artists || []) {
-    const key = normalizeTag(card.tag).toLocaleLowerCase();
-    if (!existingByTag.has(key)) existingByTag.set(key, []);
-    existingByTag.get(key).push(card);
+    const source = cardSource(card);
+    if (source && !existingBySource.has(source)) existingBySource.set(source, card);
   }
   const active = activeGeneration(catalogDir);
   const activeOverlay = active ? readJson(contained(active.directory, 'catalog.json'), null) : null;
@@ -187,10 +281,11 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       if (!previous?.runtime) continue;
       const previousImage = String(previous.image || '');
       if (!discoveredSources.has(String(previous.sourceUrl || ''))) continue;
-      if (!validCardAsset(previousImage)) throw new Error(`Invalid runtime catalog asset for ${previous.tag || previous.id || 'artist'}`);
-      const source = resolveActiveCatalogAsset(catalogDir, previousImage);
+      if (!validCardAsset(previousImage)) continue;
+      let source;
+      try { source = resolveActiveCatalogAsset(catalogDir, previousImage); } catch { continue; }
       const destination = contained(stage, previousImage);
-      if (!fs.existsSync(source) || !isWebp(fs.readFileSync(source))) throw new Error(`Runtime catalog asset is missing for ${previous.tag || previous.id || 'artist'}`);
+      if (!validWebpFile(source)) continue;
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.copyFileSync(source, destination);
       runtimeArtists.set(previous.catalogId || previous.id, { ...previous, runtime: true });
@@ -199,27 +294,33 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
     for (let index = 0; index < discovered.length; index += 1) {
       assertNotCancelled(signal);
       const source = discovered[index];
-      // Exact raw identity is authoritative.  A source URL change can only be
-      // classified by the unique normalized tag fallback below.
-      const exact = (old.artists || []).find(card => String(card.sourceUrl || '') === source.sourceUrl);
-      const tagMatches = existingByTag.get(normalizeTag(source.tag).toLocaleLowerCase()) || [];
-      const existing = exact || (tagMatches.length === 1 ? tagMatches[0] : null);
-      const embeddedExact = (embedded.artists || []).find(card => String(card.sourceUrl || '') === source.sourceUrl);
-      const isEmbeddedExact = Boolean(embeddedExact || (exact && !exact.runtime && exact.sourceUrl === source.sourceUrl));
-      if (isEmbeddedExact) {
-        const embeddedId = embeddedExact?.catalogId || embeddedExact?.id;
-        const runtimeId = exact?.runtime ? (exact.catalogId || exact.id) : null;
+      // Exact raw source URL is the only reuse identity. A changed URL is a
+      // genuinely new card even when its display tag stayed the same.
+      const exact = existingBySource.get(source.sourceUrl) || null;
+      const embeddedExact = (embedded.artists || []).find(card => cardSource(card) === source.sourceUrl) || null;
+      const embeddedId = cardId(embeddedExact);
+      const runtimeId = exact?.runtime ? cardId(exact) : '';
+      const embeddedBaseAvailable = embeddedExact
+        ? Boolean(resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: embeddedExact.image }))
+        : false;
+      const canPruneRuntime = Boolean(embeddedExact && embeddedBaseAvailable && (!runtimeId || runtimeId === embeddedId));
+      if (embeddedExact && canPruneRuntime) {
         if (embeddedId) { runtimeArtists.delete(embeddedId); currentRuntimeIds.delete(embeddedId); }
         if (runtimeId) { runtimeArtists.delete(runtimeId); currentRuntimeIds.delete(runtimeId); }
         onProgress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: `${source.tag} already embedded` });
         continue;
       }
-
-      const catalogId = existing?.catalogId || existing?.id || stableCatalogId(source);
-      const filename = safeFilename(catalogId);
-      const relative = `cards/artist/${GALLERY}/${filename}`;
+      // If the embedded metadata is present but its bytes are unavailable, or
+      // an older runtime identity differs, retain the runtime card and its
+      // image/favorites. The seeded stage will reuse it; a missing asset is
+      // repaired by the normal source download path below.
+      const existing = exact;
+      const catalogId = cardId(existing) || stableCatalogId(source);
+      const priorImage = validCardAsset(existing?.image) ? String(existing.image) : '';
+      const filename = priorImage ? priorImage.split('/').pop() : safeFilename(catalogId);
+      const relative = priorImage || `cards/artist/${GALLERY}/${filename}`;
       const target = contained(stage, relative);
-      const sameRuntimeSource = Boolean(exact?.runtime && exact.sourceUrl === source.sourceUrl);
+      const sameRuntimeSource = Boolean(exact?.runtime && cardSource(exact) === source.sourceUrl);
       let reused = false;
       if (sameRuntimeSource) {
         const seeded = runtimeArtists.get(catalogId);
@@ -228,7 +329,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
           if (fs.existsSync(seededPath) && isWebp(fs.readFileSync(seededPath))) {
             // Keep the previous path when it is already valid.  This avoids a
             // needless fetch and preserves a stable overlay asset.
-            runtimeArtists.set(catalogId, { ...seeded, tag: source.tag, score: source.score, sourceUrl: source.sourceUrl });
+            runtimeArtists.set(catalogId, { ...seeded, id: existing.id || catalogId, catalogId: existing.catalogId || catalogId, tag: source.tag, score: source.score, sourceUrl: source.sourceUrl });
             currentRuntimeIds.add(catalogId);
             reused = true;
           }
@@ -242,7 +343,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
         fs.writeFileSync(target, bytes);
         if (existing) changed += 1; else added += 1;
       }
-      runtimeArtists.set(catalogId, { id: catalogId, catalogId, tag: source.tag, gallery: GALLERY, image: relative, sourceUrl: source.sourceUrl, score: source.score, runtime: true });
+      runtimeArtists.set(catalogId, { id: existing?.id || catalogId, catalogId: existing?.catalogId || catalogId, tag: source.tag, gallery: GALLERY, image: relative, sourceUrl: source.sourceUrl, score: source.score, runtime: true });
       currentRuntimeIds.add(catalogId);
       onProgress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: source.tag });
     }
@@ -251,12 +352,16 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
     const overlay = { version: 2, catalogId: 'nai-v5-runtime', generatedAt: new Date().toISOString(), artists, characters: [], tags: embedded.tags || [] };
     onProgress({ phase: 'validation', completed: 0, total: artists.length, added, changed, message: 'Validating staged catalog' });
     const ids = new Set();
+    const sources = new Set();
     for (let index = 0; index < artists.length; index += 1) {
       assertNotCancelled(signal);
       const card = artists[index];
       const cardId = card.catalogId || card.id;
       if (!cardId || ids.has(cardId)) throw new Error(`Duplicate runtime catalog identity: ${cardId || 'missing id'}`);
       ids.add(cardId);
+      const source = String(card.sourceUrl || '');
+      if (!source || sources.has(source)) throw new Error(`Duplicate runtime catalog source: ${source || 'missing source'}`);
+      sources.add(source);
       if (!validCardAsset(card.image)) throw new Error(`Invalid runtime catalog asset for ${card.tag || cardId}`);
       const asset = containedCatalogAsset(stage, card.image);
       if (!fs.existsSync(asset) || !isWebp(fs.readFileSync(asset))) throw new Error(`Invalid staged WebP for ${card.tag || cardId}`);
@@ -290,4 +395,4 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
   }
 }
 
-module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAsset };
+module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAsset, validCardAsset, validCharacterAsset, validGuideAsset, validCatalogAsset };

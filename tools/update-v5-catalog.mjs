@@ -12,10 +12,17 @@ import { pathToFileURL } from 'node:url';
 
 export const GALLERY = 'danbooru-artist-tags-2-v5';
 export const GALLERY_URL = `https://nax.moe/?gallery=${GALLERY}`;
+export const EXPECTED_CARD_COUNT = 4198;
 const root = resolve(import.meta.dirname, '..');
 
 function decodeHtml(value) {
-  return value.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  return String(value ?? '')
+    .replace(/&#(?:x([0-9a-f]+)|([0-9]+));?/gi, (entity, hexadecimal, decimal) => {
+      const codePoint = Number.parseInt(hexadecimal || decimal, hexadecimal ? 16 : 10);
+      if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return entity;
+      try { return String.fromCodePoint(codePoint); } catch { return entity; }
+    })
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 }
 function normalizeTag(value) { return decodeHtml(value).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim(); }
 function normalizeImageUrl(value) {
@@ -37,7 +44,7 @@ export function parseGalleryPage(html) {
     const image = normalizeImageUrl(block.match(/<img[^>]+src="([^"]+)"/i)?.[1] ?? '');
     const tag = normalizeTag(block.match(/<figurecaption[^>]*class="[^"]*imageText[^"]*"[^>]*>([\s\S]*?)<\/figurecaption>/i)?.[1] ?? '');
     if (!image || !tag) continue;
-    const dedupe = image.toLocaleLowerCase();
+    const dedupe = image;
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
     cards.push({ tag, image, score: Number(block.match(/data-score="(-?\d+)"/i)?.[1] ?? 0) });
@@ -63,7 +70,7 @@ export async function discoverCards(fetchImpl = fetch) {
   const results = await Promise.all(pages.filter(page => page !== 1).map(async page => parseGalleryPage(await fetchPage(page, fetchImpl))));
   const allCards = [firstParsed, ...results].flatMap(result => result.cards);
   const seen = new Set();
-  return allCards.filter(card => { const key = card.image.toLocaleLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
+  return allCards.filter(card => { const key = card.image; if (seen.has(key)) return false; seen.add(key); return true; });
 }
 
 function loadDanbooruTags(existing) {
@@ -77,9 +84,9 @@ function loadDanbooruTags(existing) {
 }
 
 export function stableCatalogId(card) {
-  const slug = card.tag.toLocaleLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'artist';
+  const slug = String(card.tag ?? 'artist').toLocaleLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'artist';
   let hash = 2166136261;
-  for (const character of card.image) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  for (const character of String(card.sourceUrl ?? card.image ?? '')) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
   return `artist-v5-${slug}-${(hash >>> 0).toString(36)}`;
 }
 
@@ -88,48 +95,90 @@ export function stableAssetFilename(card) {
 }
 
 export function makeCatalog(cards, existing) {
+  const existingBySource = new Map();
+  for (const previous of (existing?.artists ?? [])) {
+    const source = String(previous?.sourceUrl ?? '');
+    if (source && !existingBySource.has(source)) existingBySource.set(source, previous);
+  }
   const artists = cards.map(card => {
-    const catalogId = stableCatalogId(card);
-    return { id: catalogId, catalogId, tag: card.tag, gallery: GALLERY, image: `cards/artist/${GALLERY}/${stableAssetFilename(card)}`, sourceUrl: card.image, score: card.score };
+    const sourceUrl = String(card.sourceUrl ?? card.image ?? '');
+    const previous = existingBySource.get(sourceUrl);
+    const catalogId = String(previous?.catalogId ?? previous?.id ?? stableCatalogId({ ...card, sourceUrl }));
+    const id = String(previous?.id ?? catalogId);
+    const priorImage = String(previous?.image ?? '');
+    const priorFilename = priorImage.split(/[\\/]/).pop();
+    const image = priorFilename && /^[a-zA-Z0-9._-]+\.webp$/i.test(priorFilename)
+      ? `cards/artist/${GALLERY}/${priorFilename}`
+      : `cards/artist/${GALLERY}/${stableAssetFilename({ ...card, sourceUrl })}`;
+    return { id, catalogId, tag: card.tag, gallery: GALLERY, image, sourceUrl, score: card.score };
   });
   const danbooruTags = loadDanbooruTags(existing);
   return { version: 2, catalogId: 'nai-v5', generatedAt: new Date().toISOString(), sources: { nax: { url: GALLERY_URL, license: 'CC BY 4.0', gallery: GALLERY }, danbooru: { url: 'https://huggingface.co/datasets/SpadeA/danbooru-tag-csv', license: 'MIT' } }, artists, characters: existing?.characters ?? [], tags: [...new Set(danbooruTags.filter(item => item.category !== 1).map(item => item.tag))], danbooruTags };
 }
 
 function oldCardFor(card, existingArtists) {
-  const stableId = stableCatalogId(card);
-  const source = card.image.toLocaleLowerCase();
-  return existingArtists.find(previous => previous.catalogId === stableId || previous.id === stableId || String(previous.sourceUrl ?? '').toLocaleLowerCase() === source);
+  const source = String(card.sourceUrl ?? card.image ?? '');
+  return existingArtists.find(previous => String(previous?.sourceUrl ?? '') === source);
+}
+
+function loadStageState(stageStateFile) {
+  try {
+    const value = JSON.parse(readFileSync(stageStateFile, 'utf8'));
+    return value && typeof value === 'object' && value.entries && typeof value.entries === 'object' ? value : { entries: {} };
+  } catch { return { entries: {} }; }
+}
+
+function saveStageState(stageStateFile, state) {
+  if (stageStateFile) writeFileSync(stageStateFile, JSON.stringify(state, null, 2));
 }
 
 /** Seed a stable stage from validated live assets before touching the network. */
-export function seedStageFromLive(cards, existingArtists, stageArtistDir, liveArtistDir) {
+export function seedStageFromLive(cards, existingArtists, stageArtistDir, liveArtistDir, stageStateFile = null) {
   let reused = 0;
+  const state = loadStageState(stageStateFile);
+  state.entries ??= {};
   for (const card of cards) {
-    const target = join(stageArtistDir, stableAssetFilename(card));
-    if (existsSync(target)) {
+    const cardImage = String(card.image ?? '');
+    const filename = /^https?:\/\//i.test(cardImage)
+      ? stableAssetFilename(card)
+      : cardImage.split(/[\\/]/).pop();
+    if (!filename || !/^[a-zA-Z0-9._-]+\.webp$/i.test(filename)) continue;
+    const sourceUrl = String(card.sourceUrl ?? card.image ?? '');
+    const catalogId = String(card.catalogId ?? card.id ?? '');
+    const target = join(stageArtistDir, filename);
+    const staged = state.entries[filename];
+    if (existsSync(target) && staged?.sourceUrl === sourceUrl && staged?.catalogId === catalogId) {
       try { if (isWebp(readFileSync(target))) { reused += 1; continue; } } catch { /* redownload below */ }
     }
     const previous = oldCardFor(card, existingArtists);
-    if (!previous || !previous.image) continue;
-    const sourceName = String(previous.image).split(/[\\/]/).pop();
-    const source = sourceName ? join(liveArtistDir, sourceName) : '';
-    if (!existsSync(source)) continue;
-    try {
-      const buffer = readFileSync(source);
-      if (!isWebp(buffer)) continue;
-      mkdirSync(dirname(target), { recursive: true });
-      copyFileSync(source, target);
-      reused += 1;
-    } catch { /* the downloader will report a useful source error */ }
+    const candidates = [filename, String(previous?.image ?? '').split(/[\\/]/).pop()].filter(Boolean);
+    let copied = false;
+    for (const candidate of candidates) {
+      const source = join(liveArtistDir, candidate);
+      if (!existsSync(source)) continue;
+      try {
+        const buffer = readFileSync(source);
+        if (!isWebp(buffer)) continue;
+        mkdirSync(dirname(target), { recursive: true });
+        copyFileSync(source, target);
+        state.entries[filename] = { sourceUrl, catalogId };
+        reused += 1;
+        copied = true;
+        break;
+      } catch { /* the downloader will report a useful source error */ }
+    }
+    if (!copied) delete state.entries[filename];
   }
+  saveStageState(stageStateFile, state);
   return reused;
 }
 
 async function downloadCards(cards, stageRoot, fetchImpl) {
   const statePath = join(stageRoot, 'v5-download-state.json');
   const targetRoot = join(stageRoot, 'catalog');
-  const state = { completed: 0, total: cards.length, downloaded: 0, reused: 0, failed: [], updatedAt: new Date().toISOString() };
+  let prior = {};
+  try { prior = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first run */ }
+  const state = { completed: 0, total: cards.length, downloaded: 0, reused: 0, failed: [], entries: prior.entries && typeof prior.entries === 'object' ? prior.entries : {}, updatedAt: new Date().toISOString() };
   const queue = [...cards];
   const concurrency = 6;
   const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
@@ -140,7 +189,11 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
       const part = `${target}.part`;
       mkdirSync(dirname(target), { recursive: true });
       let complete = false;
-      if (existsSync(target)) {
+      const filename = String(card.image).split(/[\\/]/).pop();
+      const sourceUrl = String(card.sourceUrl ?? '');
+      const catalogId = String(card.catalogId ?? card.id ?? '');
+      const staged = state.entries[filename];
+      if (existsSync(target) && staged?.sourceUrl === sourceUrl && staged?.catalogId === catalogId) {
         try { complete = isWebp(readFileSync(target)); } catch { complete = false; }
       }
       if (complete) state.reused += 1;
@@ -154,6 +207,7 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
             writeFileSync(part, buffer);
             renameSync(part, target);
             state.downloaded += 1;
+            state.entries[filename] = { sourceUrl, catalogId };
             complete = true;
           } catch (error) {
             try { unlinkSync(part); } catch { /* no partial file */ }
@@ -162,6 +216,7 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
           }
         }
       }
+      if (!complete) delete state.entries[filename];
       state.completed += 1;
       if (state.completed % 25 === 0 || state.completed === state.total) saveState();
     }
@@ -206,6 +261,15 @@ export async function updateSnapshot({ fetchImpl = fetch, cards: suppliedCards }
   const cards = suppliedCards ?? await discoverCards(fetchImpl);
   const catalogPath = join(root, 'public', 'catalog', 'catalog.json');
   const existing = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, 'utf8')) : { characters: [], danbooruTags: [] };
+  if (!suppliedCards && cards.length !== EXPECTED_CARD_COUNT) throw new Error(`NAX gallery discovery expected ${EXPECTED_CARD_COUNT} cards, found ${cards.length}`);
+  if (!suppliedCards) {
+    const discoveredSources = new Set(cards.map(card => String(card.sourceUrl ?? card.image ?? '')));
+    const removed = (existing.artists ?? []).filter(card => {
+      const source = String(card?.sourceUrl ?? '');
+      return source && !discoveredSources.has(source);
+    });
+    if (removed.length) throw new Error(`NAX gallery discovery would remove ${removed.length} existing card(s)`);
+  }
   const output = makeCatalog(cards, existing);
   // A stable stage makes interrupted runs resumable: valid `.webp` files are
   // retained and skipped on the next invocation, while the live snapshot is
@@ -219,7 +283,7 @@ export async function updateSnapshot({ fetchImpl = fetch, cards: suppliedCards }
     const expected = new Set(output.artists.map(card => card.image.split('/').pop()));
     for (const file of readdirSync(stageArtistDir)) if (!expected.has(file)) rmSync(join(stageArtistDir, file), { force: true });
   }
-  const seeded = seedStageFromLive(output.artists, existing.artists ?? [], stageArtistDir, liveArtistDir);
+  const seeded = seedStageFromLive(output.artists, existing.artists ?? [], stageArtistDir, liveArtistDir, join(stageRoot, 'v5-download-state.json'));
   writeFileSync(stageCatalogPath, JSON.stringify(output));
   try {
     await downloadCards(output.artists, stageRoot, fetchImpl);

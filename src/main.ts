@@ -4,6 +4,7 @@ import { bindArtistCardPreview, clearArtistCardPreview } from './artist-card-pre
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from './artist-catalog';
 import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from './artist-mix-layout';
 import { paginateArtists, paginateCharacters } from './catalog-browser';
+import { buildWarmupPlan, scheduleIdleWarmup } from './catalog-warmup';
 import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } from './metadata-workspace';
 import { decodePreviews } from './preview-loader';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
@@ -11,14 +12,14 @@ import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSel
 import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
 import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
 import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptSnapshot, WeightedTag } from './types';
-import type { UpdateManifest, UpdateProgress } from './global';
+import type { CatalogComponentProgress, CatalogComponentStatus, UpdateManifest, UpdateProgress } from './global';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
 type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 'saved-library' | null;
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.2';
+const APP_VERSION = '0.6.3';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -47,6 +48,7 @@ let favoriteRandomRange: { min: number; max: number } | null = null;
 let characterFavoritesOnly = false;
 let catalogState: 'loading' | 'ready' | 'error' = 'loading';
 let catalogError = '';
+let packagedCatalogMode = false;
 let randomNotice = '';
 let mixNotice = '';
 let modal: Modal = null;
@@ -70,10 +72,16 @@ let startupFailedCards: CatalogCard[] = [];
 let startupBusy = false;
 let startupReady = false;
 let startupError = '';
+let startupComponentProgress: CatalogComponentProgress | null = null;
 let catalogUpdateUnsubscribe: (() => void) | null = null;
 let catalogUpdateBusy = false;
 let catalogUpdateStatus = '';
 let catalogUpdateError = '';
+let componentStatuses: CatalogComponentStatus[] = [];
+let componentProgress: CatalogComponentProgress | null = null;
+let componentTransferBusy = false;
+let componentTransferError = '';
+let componentProgressUnsubscribe: (() => void) | null = null;
 type AppUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'paused' | 'verifying' | 'ready' | 'installing' | 'up-to-date' | 'error';
 let appUpdatePhase: AppUpdatePhase = 'idle';
 let appUpdateManifest: UpdateManifest | null = null;
@@ -213,11 +221,20 @@ function catalogImage(card: CatalogCard): string {
   const path = String(card.image || '');
   if (!path) return './plus.png';
   if (/^(?:nai-custom|nai-catalog):\/\//i.test(path) || /^(?:blob:|data:)/i.test(path) || /^(?:\.\/|\/)/.test(path)) return path;
-  return card.runtime ? `nai-catalog://asset/${encodeURI(path).replace(/#/g, '%23')}` : resolvedCatalogPath(path);
+  return (card.runtime || packagedCatalogMode) ? `nai-catalog://asset/${encodeURI(path).replace(/#/g, '%23')}` : resolvedCatalogPath(path);
+}
+function guideImage(image?: string): string {
+  const value = String(image || '');
+  if (!value) return '';
+  return packagedCatalogMode
+    ? `nai-catalog://asset/guide/${encodeURIComponent(value)}`
+    : `./catalog/guide/${escapeHtml(value)}`;
 }
 function artistImage(item: WeightedTag): string {
   const card = catalog.artists.find(candidate => (candidate.catalogId ?? candidate.id) === (item.catalogId ?? item.id));
-  return card ? catalogImage(card) : resolvedCatalogPath(String(item.image ?? './plus.png'));
+  if (card) return catalogImage(card);
+  const image = String(item.image ?? './plus.png');
+  return packagedCatalogMode && !/^(?:nai-|blob:|data:|\.\/|\/)/i.test(image) ? `nai-catalog://asset/${encodeURI(image).replace(/#/g, '%23')}` : resolvedCatalogPath(image);
 }
 function weighted(card: CatalogCard, weight = 1): WeightedTag { return { id: id(), catalogId: card.catalogId ?? card.id, image: card.image, tag: `artist: ${card.tag}`, weight: normalizeArtistWeight(weight) }; }
 function newCharacter(label = `Character ${characters.length + 1}`, prompt = 'girl'): Character { return { id: id(), label, prompt, undesired: '' }; }
@@ -379,7 +396,7 @@ function artistCard(card: CatalogCard): string {
   const favorite = artistFavorites.has(stableId);
   const image = catalogImage(card);
   const promptText = `artist: ${card.tag}`;
-  return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" data-add-artist="${escapeHtml(stableId)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="${escapeHtml(promptText)}" ${selected ? 'aria-pressed="true"' : ''}><span class="card-image"><img src="${image}" alt="${escapeHtml(card.tag)}" loading="lazy"><img src="./plus.png" alt="" class="plus-overlay"></span><b>${escapeHtml(card.tag)}</b></button><div class="artist-card-actions"><button class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-artist="${escapeHtml(stableId)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button><button class="tiny-copy" data-copy-artist="${escapeHtml(stableId)}">Copy</button></div></article>`;
+  return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" data-add-artist="${escapeHtml(stableId)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="${escapeHtml(promptText)}" ${selected ? 'aria-pressed="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img src="${image}" alt="${escapeHtml(card.tag)}" loading="lazy"><img src="./plus.png" alt="" class="plus-overlay"></span><b>${escapeHtml(card.tag)}</b></button><div class="artist-card-actions"><button class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-artist="${escapeHtml(stableId)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button><button class="tiny-copy" data-copy-artist="${escapeHtml(stableId)}">Copy</button></div></article>`;
 }
 
 function promptArtistPickerPage(): ReturnType<typeof paginateArtists> {
@@ -593,10 +610,24 @@ function appUpdateMarkup(browserOnly: boolean): string {
   return `<div class="app-update-subsection"><div class="catalog-update-status app-update-status" id="app-update-status" role="status" aria-live="polite">${escapeHtml(appUpdatePhaseCopy())}</div>${details}${progressMarkup}${actions}</div>`;
 }
 
+function componentDisplayName(id: string): string {
+  return id === 'artists' ? 'V5 artists' : id === 'characters' ? 'V4.5 characters' : 'Prompt Builder references';
+}
+function componentAction(status: CatalogComponentStatus): string {
+  const action = status.status === 'Installed' || status.status === 'Migrated' || status.status === 'Damaged' ? 'Repair' : status.status === 'Downloading' || (status.status === 'Missing' && Boolean(status.error)) ? 'Retry' : 'Download';
+  return `<button class="secondary catalog-component-action" type="button" data-component-action="${escapeHtml(action.toLowerCase())}" data-component-id="${escapeHtml(status.id)}">${action}</button>`;
+}
+function componentSettingsMarkup(browserOnly: boolean): string {
+  if (browserOnly) return '<p class="settings-disabled">Catalog component downloads are available in the desktop app.</p>';
+  if (!componentStatuses.length) return '<p class="catalog-components-empty" role="status">Catalog components are not available in this build yet.</p>';
+  const rows = componentStatuses.map(status => `<div class="catalog-component-row" data-component-row="${escapeHtml(status.id)}"><div><b>${escapeHtml(componentDisplayName(status.id))}</b><small>${status.count.toLocaleString()} items · ${escapeHtml(status.status)}${status.error ? ` · ${escapeHtml(status.error)}` : ''}</small></div>${componentAction(status)}</div>`).join('');
+  const progress = componentProgress && componentTransferBusy ? `<div id="catalog-component-progress" class="catalog-component-progress" role="status"><div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${componentProgress.percent}"><span style="width:${componentProgress.percent}%"></span></div><small id="catalog-component-progress-label">${escapeHtml(componentProgress.phase)} · ${componentProgress.percent}% · ${escapeHtml(componentDisplayName(componentProgress.id))}</small></div>` : '';
+  return `${componentTransferError ? `<p class="catalog-status error" role="alert">${escapeHtml(componentTransferError)}</p>` : ''}${componentTransferBusy ? '<p class="catalog-status loading" role="status">Downloading component...</p>' : ''}${progress}<div class="catalog-components" id="catalog-components" aria-label="Card libraries">${rows}</div>`;
+}
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
   const catalogControls = browserOnly ? '' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`;
-  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">V5 ARTIST CATALOG</p><h3>Catalog and app updates</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Catalog checks use only the exact NAX V5 gallery. App updates use the official GitHub release manifest and verified SHA-512.</p>${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
+  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -605,7 +636,7 @@ function artistPickerMarkup(): string {
 
 function characterCard(card: CatalogCard): string {
   const favorite = characterFavorites.has(card.id);
-  return `<article class="character-catalog-card"><button type="button" data-pick-character="${escapeHtml(card.id)}"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"><b>${escapeHtml(card.tag)}</b></button><button type="button" class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-character="${escapeHtml(card.id)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button></article>`;
+  return `<article class="character-catalog-card"><button type="button" data-pick-character="${escapeHtml(card.id)}"><span class="card-skeleton" aria-hidden="true"></span><img class="preview-image" src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"><b>${escapeHtml(card.tag)}</b></button><button type="button" class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-character="${escapeHtml(card.id)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button></article>`;
 }
 
 function charactersZone(): string {
@@ -755,7 +786,7 @@ function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): st
   const tags = card.kind === 'preset' ? (card.tags ?? qualityPresetTags()) : constructorCardTags(card);
   const selected = hasPromptTagGroup(zonePrompt(zone), tags);
   const hasImage = Boolean(card.image);
-  const image = hasImage ? (card.image!.startsWith('nai-custom://') ? card.image : `./catalog/guide/${escapeHtml(card.image!)}`) : '';
+  const image = hasImage ? (card.image!.startsWith('nai-custom://') ? card.image : guideImage(card.image)) : '';
   const description = card.description?.trim() ?? '';
   const visual = hasImage ? `<img data-constructor-image-src="${image}" alt="${escapeHtml(card.tag)}" decoding="async">` : `<span class="constructor-card-text-icon" aria-hidden="true">✦</span>`;
   return `<article class="constructor-card ${selected ? 'selected' : ''} ${card.kind === 'preset' ? 'preset' : ''}" data-constructor-card="${escapeHtml(card.id)}"><button class="constructor-card-pick" type="button" data-constructor-tag="${escapeHtml(card.id)}" ${hasImage ? `data-constructor-preview-image="${escapeHtml(image)}"` : 'data-constructor-preview-no-image="true"'} data-constructor-preview-tag="${escapeHtml(card.tag)}" data-constructor-preview-description="${escapeHtml(description)}" aria-pressed="${selected}"><span class="constructor-card-image ${hasImage ? '' : 'no-image'}">${visual}</span><b>${escapeHtml(card.tag)}</b><small>${escapeHtml(card.group ?? 'Custom')}</small></button></article>`;
@@ -883,6 +914,7 @@ function render(): void {
   app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
   pendingWorkspaceTransition = null;
   bindEvents();
+  bindPreviewFade();
   document.querySelector('#guide-skip')?.addEventListener('click', finishGuide);
   document.querySelector('#guide-next')?.addEventListener('click', () => { if (onboardingIndex + 1 < onboardingSteps.length) { onboardingIndex += 1; render(); } else finishGuide(); });
   document.querySelectorAll<HTMLButtonElement>('[data-guide-theme]').forEach(button => button.addEventListener('click', () => {
@@ -903,6 +935,13 @@ function updatePrompt(): void {
   const artistOutput = document.querySelector<HTMLElement>('#artist-prompt-output');
   if (fullOutput) fullOutput.textContent = prompt();
   if (artistOutput) artistOutput.textContent = buildArtistsPrompt(base.artists);
+}
+function bindPreviewFade(): void {
+  document.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image').forEach(image => {
+    const markReady = () => image.classList.add('is-decoded');
+    if (image.complete && image.naturalWidth > 0) markReady();
+    else image.addEventListener('load', markReady, { once: true });
+  });
 }
 
 function updateEditor(area: HTMLTextAreaElement): void {
@@ -1960,7 +1999,7 @@ function refreshMixPicker(): void {
   const page = currentMixArtistPickerPage();
   const replaceTarget = mixPickerReplaceTarget ? artistMix.anchors.find(item => item.id === mixPickerReplaceTarget) : undefined;
   const replaceTargetStableId = replaceTarget ? replaceTarget.catalogId ?? replaceTarget.id : null;
-  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
+  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
   grid.scrollTop = 0;
   document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
   const pageStatus = document.querySelector<HTMLElement>('#mix-artist-page-status');
@@ -2083,6 +2122,12 @@ function bindSettingsEvents(): void {
   document.querySelector('#resume-app-update')?.addEventListener('click', () => void downloadAppUpdate());
   document.querySelector('#cancel-app-update')?.addEventListener('click', () => void cancelAppUpdate());
   document.querySelector('#install-app-update')?.addEventListener('click', () => void installAppUpdate());
+  document.querySelectorAll<HTMLButtonElement>('[data-component-action]').forEach(button => button.addEventListener('click', () => {
+    const componentId = button.dataset.componentId;
+    const action = button.dataset.componentAction;
+    if (!componentId || !window.naiCatalog) return;
+    void downloadCatalogComponent(componentId, action === 'repair');
+  }));
   document.querySelector('#download-missing-v5')?.addEventListener('click', () => void startCatalogUpdate());
   document.querySelector('#cancel-v5-update')?.addEventListener('click', () => void window.naiCatalog?.cancel());
   if (!catalogUpdateUnsubscribe && window.naiCatalog) {
@@ -2096,6 +2141,39 @@ function bindSettingsEvents(): void {
       if (event.phase === 'complete') catalogUpdateStatus = event.message || 'Catalog updated.';
     });
   }
+}
+async function refreshComponentStatuses(): Promise<void> {
+  if (!window.naiCatalog?.components) return;
+  try { componentStatuses = (await window.naiCatalog.components()).components; }
+  catch { componentStatuses = []; }
+  if (activeWorkspace === 'settings' && !componentTransferBusy) render();
+}
+async function downloadCatalogComponent(componentId: string, repair = false): Promise<void> {
+  if (!window.naiCatalog || componentTransferBusy) return;
+  componentTransferBusy = true; componentTransferError = ''; render();
+  try {
+    const result = repair ? await window.naiCatalog.repairComponent?.(componentId) : await window.naiCatalog.downloadComponent?.(componentId);
+    if (result) componentStatuses = componentStatuses.map(item => item.id === componentId ? result : item);
+    await refreshComponentStatuses();
+    await Promise.all([loadCatalog(), loadGuide()]);
+    if (activeWorkspace === 'prompt') render();
+  } catch (error) { componentTransferError = error instanceof Error ? error.message : 'The catalog component transfer failed.'; }
+  finally { componentTransferBusy = false; render(); }
+}
+function bindComponentProgress(): void {
+  if (componentProgressUnsubscribe || !window.naiCatalog?.onComponentProgress) return;
+  componentProgressUnsubscribe = window.naiCatalog.onComponentProgress(event => {
+    componentProgress = event;
+    startupComponentProgress = event;
+    startupPhase = `${event.phase} card libraries`;
+    startupCompleted = event.percent;
+    startupTotal = 100;
+    const bar = document.querySelector<HTMLElement>('#catalog-component-progress .progress-track span');
+    if (bar) bar.style.width = `${event.percent}%`;
+    const label = document.querySelector<HTMLElement>('#catalog-component-progress-label');
+    if (label) label.textContent = `${event.phase} · ${event.percent}%${event.message ? ` · ${event.message}` : ''}`;
+    if (event.phase === 'Downloading' || event.phase === 'Checking' || event.phase === 'Verifying' || event.phase === 'Opening' || event.phase === 'Retrying') renderStartup();
+  });
 }
 function updateAppProgressDom(): void {
   const status = document.querySelector<HTMLElement>('#app-update-status');
@@ -2315,14 +2393,19 @@ async function loadGuide(): Promise<void> {
 }
 
 function startupMarkup(): string {
-  const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : startupReady ? 100 : 0;
+  const progress = startupComponentProgress ? startupComponentProgress.percent : startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : startupReady ? 100 : 0;
   const error = !startupBusy && startupError ? `<div class="startup-error" role="alert"><b>Catalog startup could not finish.</b><p>${escapeHtml(startupError)}</p><button class="secondary" id="startup-retry" type="button">Retry</button><button class="tiny-copy" id="startup-continue" type="button">Continue to app</button></div>` : '';
   const failure = !startupBusy && startupFailures.length ? `<div class="startup-failure" role="status"><b>${startupFailures.length} preview${startupFailures.length === 1 ? '' : 's'} failed.</b><p>The catalog is ready. You can retry failed previews or continue.</p><button class="secondary" id="startup-retry-failed" type="button">Retry failed</button><button class="tiny-copy" id="startup-continue-failed" type="button">Continue</button></div>` : '';
-  return `<main class="startup-shell"><section class="startup-panel" aria-labelledby="startup-title"><img class="startup-mark startup-icon" src="./app-icon.png" alt=""><p class="eyebrow">NAI PROMPT STUDIO</p><h1 id="startup-title">Waking the V5 constellation</h1><p class="startup-copy">${escapeHtml(startupPhase)}. Preview data stays on this device.</p><div class="startup-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-label="Loading card previews"><div class="progress-track"><span style="width:${progress}%"></span></div><b>${progress}%</b></div>${error}${failure}</section></main>`;
+  return `<main class="startup-shell"><section class="startup-panel" aria-labelledby="startup-title"><img class="startup-mark startup-icon" src="./app-icon.png" alt=""><p class="eyebrow">NAI PROMPT STUDIO</p><h1 id="startup-title">Waking the V5 constellation</h1><p class="startup-copy">${escapeHtml(startupPhase)}. Preview data stays on this device.</p><div class="startup-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-label="Loading card previews"><div class="progress-track"><span style="width:${progress}%"></span></div><b>${progress}%</b></div>${startupComponentProgress ? `<small id="catalog-component-progress-label">${escapeHtml(startupComponentProgress.phase)} · ${progress}%</small>` : ''}${error}${failure}</section></main>`;
+}
+async function loadCatalogMode(): Promise<void> {
+  try { packagedCatalogMode = (await window.naiCatalog?.mode?.())?.packaged === true; }
+  catch { packagedCatalogMode = false; }
 }
 function renderStartup(): void {
   const app = document.querySelector<HTMLDivElement>('#app');
   if (!app) return;
+  if (!startupVisible) return;
   if (app.querySelector('.startup-shell')) {
     const progress = startupTotal ? Math.min(100, Math.round(startupCompleted / startupTotal * 100)) : startupReady ? 100 : 0;
     const track = app.querySelector<HTMLElement>('.startup-progress .progress-track span');
@@ -2345,6 +2428,7 @@ function openStudioAfterStartup(): void {
   startupVisible = false; startupEntryPending = animationMode !== 'off';
   startGuide(false);
   render();
+  void refreshComponentStatuses();
   window.setTimeout(() => { if (settings.updateCatalogOnStartup) void startCatalogUpdate(); if (settings.checkAppUpdatesOnStartup) void checkAppUpdate(false); }, 500);
 }
 async function decodePreview(card: CatalogCard): Promise<boolean> {
@@ -2390,6 +2474,7 @@ async function retryStartupFailures(): Promise<void> {
   }
 }
 async function bootApp(): Promise<void> {
+  await loadCatalogMode();
   startupBusy = true;
   startupVisible = true;
   startupError = '';
@@ -2399,23 +2484,51 @@ async function bootApp(): Promise<void> {
   startupCompleted = 0;
   startupTotal = 0;
   startupReady = false;
+  startupComponentProgress = null;
   renderStartup();
+  if (window.naiCatalog?.ensureSelected) {
+    try {
+      startupPhase = 'Checking card libraries';
+      renderStartup();
+      const components = await window.naiCatalog.ensureSelected();
+      if (components.missingManifest) throw new Error('Catalog component manifest is unavailable in this packaged build.');
+      startupComponentProgress = null;
+    } catch (error) {
+      startupError = error instanceof Error ? error.message : 'Selected catalog components could not be downloaded.';
+      startupBusy = false;
+      renderStartup();
+      return;
+    }
+  }
   await Promise.all([loadCatalog(), loadGuide()]);
   if (catalogState !== 'ready') { startupError = catalogError || 'The V5 catalog could not be loaded.'; startupBusy = false; renderStartup(); return; }
-  startupTotal = catalog.artists.length + (settings.preloadCharacterPreviews ? catalog.characters.length : 0);
-  if (!startupTotal) { startupReady = true; startupPhase = 'Opening studio'; startupBusy = false; renderStartup(); openStudioAfterStartup(); return; }
-  await preloadCards(catalog.artists, 'Preparing V5 artist previews');
-  if (settings.preloadCharacterPreviews && catalog.characters.length) await preloadCards(catalog.characters, 'Preparing character previews');
-  startupBusy = false;
+  const selectedIds = base.artists.map(item => item.catalogId ?? item.id);
+  const anchorIds = [...artistMix.anchors, ...artistMix.companions].map(item => item.catalogId ?? item.id);
+  const artistWarmup = buildWarmupPlan(catalog.artists, { selected: selectedIds, anchors: anchorIds, visible: catalog.artists.slice(0, 72).map(card => card.catalogId ?? card.id), initialLimit: catalog.artists.length });
+  const characterWarmup = settings.preloadCharacterPreviews ? buildWarmupPlan(catalog.characters, { visible: catalog.characters.slice(0, 24).map(card => card.catalogId ?? card.id), initialLimit: catalog.characters.length }) : [];
+  const warmup = [...artistWarmup, ...characterWarmup];
+  startupTotal = warmup.length;
+  startupCompleted = 0;
   startupReady = true;
-  if (startupFailedCards.length) { startupPhase = 'Preview loading paused'; startupFailures = startupFailedCards.map(card => card.tag); renderStartup(); return; }
+  startupBusy = false;
   startupPhase = 'Opening studio';
+  // Component verification and compact metadata are the startup gate. Image
+  // decode runs behind the workspace in a bounded adaptive idle queue.
   openStudioAfterStartup();
+  scheduleIdleWarmup(warmup, async card => {
+    const ok = await decodePreview(card);
+    startupCompleted += 1;
+    if (!ok) startupFailedCards = [...startupFailedCards, card];
+    startupFailures = startupFailedCards.map(item => item.tag);
+    if (startupCompleted >= startupTotal && startupFailures.length) startupPhase = 'Preview loading paused';
+    return ok;
+  }, 0, callback => window.setTimeout(callback, 0), 6).startIdle();
 }
 
 applyAnimationMode(animationMode);
 applyTheme();
 bindAppUpdateProgress();
+bindComponentProgress();
 renderStartup();
 void bootApp();
 window.addEventListener('resize', scheduleMixOrbitThreads);

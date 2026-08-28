@@ -6,6 +6,7 @@ const { pathToFileURL } = require('node:url');
 const { resolveAppPaths, ensureWritable } = require('./app-paths.cjs');
 const { containedAsset, validateImagePayload, writeAsset } = require('./custom-tag-assets.cjs');
 const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
+const { normalizeDescriptors, ensureComponent, ensureSelectedComponents, loadState, statuses, readInstallerSelections } = require('./catalog-components.cjs');
 const { checkForUpdate, downloadInstaller, validateManifest, UpdateAbortError } = require('./app-updater.cjs');
 
 const APP_USER_MODEL_ID = 'com.novelai.promptstudio';
@@ -132,10 +133,61 @@ function embeddedCatalogPath() {
   const development = path.join(__dirname, '..', 'public', 'catalog', 'catalog.json');
   return fs.existsSync(packaged) ? packaged : development;
 }
+function componentDescriptors() {
+  const candidates = [path.join(__dirname, '..', 'dist', 'catalog', 'catalog-components.json'), path.join(__dirname, '..', 'public', 'catalog', 'catalog-components.json')];
+  for (const candidate of candidates) {
+    try { const value = JSON.parse(fs.readFileSync(candidate, 'utf8')); const descriptors = normalizeDescriptors(value); if (descriptors.length) return descriptors; } catch { /* use the next build/development source */ }
+  }
+  return [];
+}
+function componentManifestPath() { return path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'catalog', 'catalog-components.json'); }
+function emitComponentProgress(event) {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('catalog:component-progress', event);
+}
+let componentController = null;
+let componentPromise = null;
+function packagedCatalogAssetMode() { return app.isPackaged; }
 function emitCatalogProgress(event) {
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send('catalog:progress', event);
 }
 ipcMain.handle('catalog:load', async () => loadCatalog({ embeddedPath: embeddedCatalogPath(), catalogDir: appPaths.catalogDir }));
+ipcMain.handle('catalog:mode', async () => ({ packaged: packagedCatalogAssetMode() }));
+ipcMain.handle('catalog:components', async () => {
+  const descriptors = componentDescriptors();
+  const state = loadState(appPaths.catalogDir);
+  return { descriptors, components: statuses(appPaths.catalogDir, descriptors), selected: readInstallerSelections(appPaths.dataDir), state, manifest: componentManifestPath() };
+});
+ipcMain.handle('catalog:ensure-selected', async () => {
+  if (!app.isPackaged) return { selected: { artists: true, guide: true, characters: false }, results: [], total: 0, development: true };
+  if (componentPromise) return componentPromise;
+  const descriptors = componentDescriptors();
+  if (!descriptors.length) return { selected: readInstallerSelections(appPaths.dataDir), results: [], total: 0, missingManifest: true };
+  componentController = new AbortController();
+  componentPromise = ensureSelectedComponents({ catalogDir: appPaths.catalogDir, dataDir: appPaths.dataDir, descriptors, signal: componentController.signal, onProgress: emitComponentProgress })
+    .finally(() => { componentController = null; componentPromise = null; });
+  return componentPromise;
+});
+ipcMain.handle('catalog:component-download', async (_event, componentId, repair = false) => {
+  if (!app.isPackaged) throw new Error('Catalog component downloads are disabled in development mode.');
+  if (componentPromise) throw new Error('A catalog component transfer is already running.');
+  const descriptor = componentDescriptors().find(item => item.id === String(componentId));
+  if (!descriptor) throw new Error('Unknown catalog component.');
+  componentController = new AbortController();
+  componentPromise = ensureComponent({ catalogDir: appPaths.catalogDir, descriptor, repair: Boolean(repair), signal: componentController.signal, onProgress: emitComponentProgress })
+    .finally(() => { componentController = null; componentPromise = null; });
+  return componentPromise;
+});
+ipcMain.handle('catalog:component-cancel', async () => { if (!componentController) return false; componentController.abort(); return true; });
+ipcMain.handle('catalog:component-repair', async (_event, componentId) => {
+  if (!app.isPackaged) throw new Error('Catalog component repairs are disabled in development mode.');
+  if (componentPromise) throw new Error('A catalog component transfer is already running.');
+  const descriptor = componentDescriptors().find(item => item.id === String(componentId));
+  if (!descriptor) throw new Error('Unknown catalog component.');
+  componentController = new AbortController();
+  componentPromise = ensureComponent({ catalogDir: appPaths.catalogDir, descriptor, repair: true, signal: componentController.signal, onProgress: emitComponentProgress })
+    .finally(() => { componentController = null; componentPromise = null; });
+  return componentPromise;
+});
 ipcMain.handle('catalog:update', async () => {
   if (catalogUpdatePromise) throw new Error('A V5 catalog update is already running.');
   catalogUpdateController = new AbortController();
@@ -242,7 +294,14 @@ app.whenReady().then(() => {
     try {
       const asset = catalogAssetFromProtocolUrl(request.url);
       const target = resolveActiveCatalogAsset(appPaths.catalogDir, asset);
-      return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
+      if (!fs.existsSync(target)) return new Response('Not found', { status: 404 });
+      // Electron's native ASAR fs integration reads archive.asar/inner/path.
+      // Returning the bytes directly avoids relying on net.fetch(file://...)'s
+      // handling of ASAR inner URLs and keeps MIME types deterministic.
+      const bytes = fs.readFileSync(target);
+      const extension = path.extname(asset).toLowerCase();
+      const mime = extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.png' ? 'image/png' : 'application/octet-stream';
+      return new Response(bytes, { status: 200, headers: { 'Content-Type': mime, 'Cache-Control': 'no-store' } });
     } catch { return new Response('Not found', { status: 404 }); }
   });
   protocol.handle('nai-library', request => {
