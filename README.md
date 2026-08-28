@@ -4,7 +4,7 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 
 ## Features
 
-- Prompt Builder with visual constructors for Frame, Scene, and Render/Quality tags, plus separate undesired-content and character prompts
+- Prompt Builder with visual constructors for Frame, Scene, and Render/Quality tags organized into folders, plus separate undesired-content and character prompts
 - V5 artist browser with favorites, weighted tags, animated card previews, random artist counts, and per-card or global weight rerolls
 - Artist Mix workspace with one or more fixed primary artists and shuffled companion artists, favorites-only pools, focus mode, and one-click prompt copying
 - Searchable character card browser with separate positive and negative character prompts
@@ -26,7 +26,7 @@ The Settings workspace can check for a newer public release, show download progr
 
 ## Roadmap
 
-- **Shareable Custom Tags folders:** export and import complete Custom Tags folders so users can share visual tag collections and quickly use them inside the Prompt Builder constructors. This is planned and is not implemented yet.
+- **Constructor folders:** Prompt Builder folders are available now. Shareable Custom Tags folders (export/import of complete visual tag collections) remain planned and are not implemented yet.
 
 ## Source-only clones and catalog hydration
 

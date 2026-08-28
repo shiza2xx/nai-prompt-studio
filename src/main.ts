@@ -8,7 +8,7 @@ import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } fr
 import { decodePreviews } from './preview-loader';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
 import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
-import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorZone } from './prompt-constructor';
+import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
 import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
 import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptSnapshot, WeightedTag } from './types';
 import type { UpdateManifest, UpdateProgress } from './global';
@@ -18,7 +18,7 @@ type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 's
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.1';
+const APP_VERSION = '0.6.2';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -93,6 +93,18 @@ let mixTransitionRevealFrame: number | undefined;
 let constructorZone: ConstructorZone | null = null;
 let constructorTrigger: HTMLElement | null = null;
 let constructorSearch = '';
+const CONSTRUCTOR_IMAGE_CONCURRENCY = 6;
+type ConstructorImageJob = { image: HTMLImageElement; token: number };
+let constructorImageQueue: ConstructorImageJob[] = [];
+let constructorImageLoads = 0;
+let constructorImageWarmupToken = 0;
+// Disclosure state intentionally lives only in this process. Each constructor
+// zone has an independent map, and no storage/draft path reads or writes it.
+const constructorFolderOpenState: Record<ConstructorZone, Record<string, boolean>> = {
+  frame: {},
+  scene: {},
+  render: {}
+};
 let guideCards: ConstructorCard[] = [];
 let guideState: 'loading' | 'ready' | 'error' = 'loading';
 let customTagPresets: CustomTagPreset[] = loadCustomTagPresets();
@@ -245,6 +257,10 @@ function startGuide(replay = false): void {
 function finishGuide(): void { settings = { ...settings, seenGuideIds: [...new Set([...settings.seenGuideIds, ...onboardingSteps.map(step => step.id)])], lastSeenVersion: APP_VERSION }; saveSettings(settings); onboardingOpen = false; render(); }
 
 function mixMotionEnabled(): boolean {
+  return motionEnabled();
+}
+
+function motionEnabled(): boolean {
   if (animationMode === 'off') return false;
   if (animationMode === 'auto' && typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return false;
   return true;
@@ -683,7 +699,7 @@ function customTagPresetId(tag: CustomTag): string {
 
 function customCard(tag: CustomTag): ConstructorCard {
   const preset = customPreset(customTagPresetId(tag));
-  return { id: `custom-${tag.id}`, tag: tag.tag, tags: splitTagGroup(tag.tag), zone: tag.zone, section: 'Custom', image: customTagImageUrl(tag), kind: 'tag', group: preset.name, description: tag.description ?? '' };
+  return { id: `custom-${tag.id}`, tag: tag.tag, tags: splitTagGroup(tag.tag), zone: tag.zone, section: 'Custom', image: customTagImageUrl(tag), kind: 'tag', presetId: preset.id, group: preset.name, description: tag.description ?? '' };
 }
 
 function rebuildEffectiveArtistCatalog(): void {
@@ -719,9 +735,20 @@ function setZonePrompt(zone: ConstructorZone, value: string): void {
 
 function constructorCards(zone: ConstructorZone): ConstructorCard[] {
   const custom = customTags.filter(tag => tag.kind !== 'artist' && tag.zone === zone).map(customCard);
-  return mergeConstructorCards(guideCards.filter(card => card.zone === zone), custom)
-    .filter(card => !constructorSearch || `${card.tag} ${card.group ?? ''} ${card.description ?? ''}`.toLocaleLowerCase().includes(constructorSearch.toLocaleLowerCase()))
-    .slice(0, 360);
+  return mergeConstructorCards(guideCards.filter(card => card.zone === zone), custom);
+}
+
+function constructorPresetFolders(): ConstructorPresetFolder[] {
+  return customTagPresets.map(preset => ({ id: preset.id, name: preset.name }));
+}
+
+function constructorFolderViews(zone: ConstructorZone): ReturnType<typeof searchConstructorFolders> {
+  const folders = groupConstructorCards(constructorCards(zone), constructorPresetFolders());
+  return searchConstructorFolders(folders, constructorSearch);
+}
+
+function constructorFolderDomId(folderId: string): string {
+  return `constructor-folder-${folderId.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
 }
 
 function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): string {
@@ -730,15 +757,25 @@ function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): st
   const hasImage = Boolean(card.image);
   const image = hasImage ? (card.image!.startsWith('nai-custom://') ? card.image : `./catalog/guide/${escapeHtml(card.image!)}`) : '';
   const description = card.description?.trim() ?? '';
-  const visual = hasImage ? `<img src="${image}" alt="${escapeHtml(card.tag)}" loading="lazy">` : `<span class="constructor-card-text-icon" aria-hidden="true">✦</span>`;
+  const visual = hasImage ? `<img data-constructor-image-src="${image}" alt="${escapeHtml(card.tag)}" decoding="async">` : `<span class="constructor-card-text-icon" aria-hidden="true">✦</span>`;
   return `<article class="constructor-card ${selected ? 'selected' : ''} ${card.kind === 'preset' ? 'preset' : ''}" data-constructor-card="${escapeHtml(card.id)}"><button class="constructor-card-pick" type="button" data-constructor-tag="${escapeHtml(card.id)}" ${hasImage ? `data-constructor-preview-image="${escapeHtml(image)}"` : 'data-constructor-preview-no-image="true"'} data-constructor-preview-tag="${escapeHtml(card.tag)}" data-constructor-preview-description="${escapeHtml(description)}" aria-pressed="${selected}"><span class="constructor-card-image ${hasImage ? '' : 'no-image'}">${visual}</span><b>${escapeHtml(card.tag)}</b><small>${escapeHtml(card.group ?? 'Custom')}</small></button></article>`;
+}
+
+function constructorFolderMarkup(folder: ConstructorFolder, zone: ConstructorZone, folderNameMatch: boolean): string {
+  const searching = Boolean(constructorSearch.trim());
+  const open = searching || Boolean(constructorFolderOpenState[zone][folder.id]);
+  const domId = constructorFolderDomId(folder.id);
+  const countLabel = `${folder.cards.length} ${folder.cards.length === 1 ? 'card' : 'cards'}`;
+  return `<section class="constructor-folder${open ? ' is-open' : ''}${folderNameMatch ? ' name-match' : ''}" data-constructor-folder-shell="${escapeHtml(folder.id)}"><button class="constructor-folder-toggle" type="button" data-constructor-folder="${escapeHtml(folder.id)}" aria-expanded="${open}" aria-controls="${domId}-cards"><span class="constructor-folder-icon" aria-hidden="true"></span><span class="constructor-folder-heading"><b>${escapeHtml(folder.name)}</b><small>${countLabel}</small></span><span class="constructor-folder-chevron" aria-hidden="true">⌄</span></button><div class="constructor-folder-reveal" id="${domId}-cards" aria-hidden="${!open}"${open ? '' : ' inert'}><div class="constructor-folder-cards">${folder.cards.map(card => constructorCardMarkup(card, zone)).join('')}</div></div></section>`;
 }
 
 function constructorModalMarkup(): string {
   if (!constructorZone) return '';
-  const cards = constructorCards(constructorZone);
+  const folders = constructorFolderViews(constructorZone);
+  const cardCount = folders.reduce((total, folder) => total + folder.cards.length, 0);
   const title = constructorZone === 'frame' ? 'Frame constructor' : constructorZone === 'scene' ? 'Scene constructor' : 'Render and quality constructor';
-  return `<div class="modal-backdrop constructor-backdrop" id="constructor-backdrop"><section class="picker-modal constructor-modal" role="dialog" aria-modal="true" aria-labelledby="constructor-title"><header><div><p class="eyebrow">CUSTOM PROMPT BUILDER</p><h2 id="constructor-title">${title}</h2><p>Click a card to add or remove it. The dialog stays open while you build.</p></div><button class="icon-button" id="close-constructor" type="button" aria-label="Close constructor">×</button></header><div class="picker-tools"><input id="constructor-search" value="${escapeHtml(constructorSearch)}" placeholder="Search tags and groups..." aria-label="Search constructor tags"><span class="constructor-count">${cards.length.toLocaleString()} cards</span></div><div class="constructor-grid" id="constructor-grid">${cards.length ? cards.map(card => constructorCardMarkup(card, constructorZone!)).join('') : '<p class="empty-inline">No constructor cards match this search.</p>'}</div><footer class="constructor-footer"><span>Selected tags are written directly into the prompt row.</span><button class="primary" id="done-constructor" type="button">Done</button></footer></section></div>`;
+  const empty = '<p class="empty-inline">No constructor cards match this search.</p>';
+  return `<div class="modal-backdrop constructor-backdrop" id="constructor-backdrop"><section class="picker-modal constructor-modal" role="dialog" aria-modal="true" aria-labelledby="constructor-title"><header><div><p class="eyebrow">CUSTOM PROMPT BUILDER</p><h2 id="constructor-title">${title}</h2><p>Click a card to add or remove it. The dialog stays open while you build.</p></div><button class="icon-button" id="close-constructor" type="button" aria-label="Close constructor">×</button></header><div class="picker-tools"><input id="constructor-search" value="${escapeHtml(constructorSearch)}" placeholder="Search tags, folders and descriptions..." aria-label="Search constructor tags"><span class="constructor-count">${cardCount.toLocaleString()} cards</span></div><div class="constructor-grid" id="constructor-grid">${folders.length ? folders.map(folder => constructorFolderMarkup(folder, constructorZone!, folder.folderNameMatch)).join('') : empty}</div><footer class="constructor-footer"><span>Selected tags are written directly into the prompt row.</span><button class="primary" id="done-constructor" type="button">Done</button></footer></section></div>`;
 }
 
 
@@ -1257,7 +1294,7 @@ function bindEvents(): void {
   document.querySelector('#done-constructor')?.addEventListener('click', closeConstructor);
   document.querySelector('#constructor-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeConstructor(); });
   document.querySelector('#constructor-search')?.addEventListener('input', event => { constructorSearch = (event.target as HTMLInputElement).value; refreshConstructorGrid(); });
-  document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]').forEach(button => button.addEventListener('click', () => toggleConstructorCard(button.dataset.constructorTag!)));
+  bindConstructorGridEvents();
   bindCustomTagEvents();
   bindArtistCardPreview();
 }
@@ -1278,10 +1315,12 @@ function openConstructor(zone: ConstructorZone, trigger?: HTMLElement): void {
   constructorSearch = '';
   modal = 'constructor';
   render();
+  startConstructorImageWarmup();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#constructor-search')?.focus(), 0);
 }
 
 function closeConstructor(): void {
+  clearConstructorImageWarmup();
   const trigger = constructorTrigger;
   const zone = constructorZone;
   constructorZone = null;
@@ -1292,15 +1331,116 @@ function closeConstructor(): void {
   if (nextTrigger) nextTrigger.focus();
 }
 
+function bindConstructorGridEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-constructor-folder]').forEach(button => button.addEventListener('click', () => toggleConstructorFolder(button.dataset.constructorFolder!, button)));
+  document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]').forEach(button => button.addEventListener('click', () => toggleConstructorCard(button.dataset.constructorTag!)));
+  bindArtistCardPreview();
+}
+
+function clearConstructorImageWarmup(): void {
+  constructorImageWarmupToken += 1;
+  constructorImageQueue = [];
+}
+
+function queueConstructorImage(image: HTMLImageElement, priority = false): void {
+  if (!image.isConnected || !image.dataset.constructorImageSrc || image.dataset.constructorImageQueued === 'true') return;
+  image.dataset.constructorImageQueued = 'true';
+  const job = { image, token: constructorImageWarmupToken };
+  if (priority) constructorImageQueue.unshift(job);
+  else constructorImageQueue.push(job);
+}
+
+function pumpConstructorImageWarmup(): void {
+  while (constructorImageLoads < CONSTRUCTOR_IMAGE_CONCURRENCY && constructorImageQueue.length) {
+    const job = constructorImageQueue.shift()!;
+    const { image } = job;
+    if (job.token !== constructorImageWarmupToken || !image.isConnected || !image.dataset.constructorImageSrc) continue;
+    const source = image.dataset.constructorImageSrc;
+    constructorImageLoads += 1;
+    image.dataset.constructorImageLoading = 'true';
+    const finish = (): void => {
+      constructorImageLoads -= 1;
+      if (image.isConnected) image.classList.add('is-loaded');
+      pumpConstructorImageWarmup();
+    };
+    image.addEventListener('load', finish, { once: true });
+    image.addEventListener('error', finish, { once: true });
+    image.decoding = 'async';
+    image.src = source;
+    delete image.dataset.constructorImageSrc;
+  }
+}
+
+function warmConstructorImages(scope: ParentNode, priority = false): void {
+  scope.querySelectorAll<HTMLImageElement>('img[data-constructor-image-src]').forEach(image => queueConstructorImage(image, priority));
+  pumpConstructorImageWarmup();
+}
+
+function startConstructorImageWarmup(): void {
+  clearConstructorImageWarmup();
+  const token = constructorImageWarmupToken;
+  window.requestAnimationFrame(() => {
+    if (token !== constructorImageWarmupToken || modal !== 'constructor') return;
+    const grid = document.querySelector<HTMLElement>('#constructor-grid');
+    if (grid) warmConstructorImages(grid);
+  });
+}
+
+function constructorGridFocusTarget(): string | null {
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return null;
+  if (active.id === 'constructor-search') return 'search';
+  if (active.dataset.constructorTag) return `card:${active.dataset.constructorTag}`;
+  if (active.dataset.constructorFolder) return `folder:${active.dataset.constructorFolder}`;
+  return null;
+}
+
+function restoreConstructorGridFocus(target: string | null): void {
+  if (!target) return;
+  let kind: 'search' | 'card' | 'folder';
+  let idValue = '';
+  if (target === 'search') kind = 'search';
+  else if (target.startsWith('card:')) { kind = 'card'; idValue = target.slice('card:'.length); }
+  else if (target.startsWith('folder:')) { kind = 'folder'; idValue = target.slice('folder:'.length); }
+  else return;
+  const element = kind === 'search'
+    ? document.querySelector<HTMLInputElement>('#constructor-search')
+    : kind === 'card'
+      ? Array.from(document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]')).find(button => button.dataset.constructorTag === idValue)
+      : Array.from(document.querySelectorAll<HTMLButtonElement>('[data-constructor-folder]')).find(button => button.dataset.constructorFolder === idValue);
+  element?.focus({ preventScroll: true });
+}
+
 function refreshConstructorGrid(): void {
   if (!constructorZone) return;
   const grid = document.querySelector<HTMLElement>('#constructor-grid');
   if (!grid) return;
+  const scrollTop = grid.scrollTop;
+  const focusTarget = constructorGridFocusTarget();
   clearArtistCardPreview();
-  grid.innerHTML = constructorCards(constructorZone).map(card => constructorCardMarkup(card, constructorZone!)).join('') || '<p class="empty-inline">No constructor cards match this search.</p>';
-  document.querySelector<HTMLInputElement>('#constructor-search')?.focus();
-  document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]').forEach(button => button.addEventListener('click', () => toggleConstructorCard(button.dataset.constructorTag!)));
-  bindArtistCardPreview();
+  const folders = constructorFolderViews(constructorZone);
+  grid.innerHTML = folders.map(folder => constructorFolderMarkup(folder, constructorZone!, folder.folderNameMatch)).join('') || '<p class="empty-inline">No constructor cards match this search.</p>';
+  grid.scrollTop = scrollTop;
+  bindConstructorGridEvents();
+  restoreConstructorGridFocus(focusTarget);
+  warmConstructorImages(grid);
+}
+
+function toggleConstructorFolder(folderId: string, button?: HTMLButtonElement): void {
+  if (!constructorZone || constructorSearch.trim()) return;
+  clearArtistCardPreview();
+  const state = constructorFolderOpenState[constructorZone];
+  const open = !state[folderId];
+  state[folderId] = open;
+  const toggle = button ?? document.querySelector<HTMLButtonElement>(`[data-constructor-folder="${CSS.escape(folderId)}"]`);
+  const shell = toggle?.closest<HTMLElement>('[data-constructor-folder-shell]');
+  const reveal = shell?.querySelector<HTMLElement>('.constructor-folder-reveal');
+  if (!toggle || !shell || !reveal) { refreshConstructorGrid(); return; }
+  shell.classList.toggle('is-open', open);
+  toggle.setAttribute('aria-expanded', String(open));
+  reveal.setAttribute('aria-hidden', String(!open));
+  reveal.toggleAttribute('inert', !open);
+  if (open) warmConstructorImages(reveal, true);
 }
 
 function toggleConstructorCard(cardId: string): void {

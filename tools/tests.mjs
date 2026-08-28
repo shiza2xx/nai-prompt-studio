@@ -17,7 +17,7 @@ import { ARTIST_PAGE_SIZE, CHARACTER_PAGE_SIZE, filterCharacters, paginateArtist
 import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from '../src/artist-mix-layout.ts';
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from '../src/artist-catalog.ts';
 import { decodeStealthPayload, extractImageMetadata, normalizeMetadata, parseMetadataJson, parsePngTextChunks, parseWebpExifUserComment } from '../src/image-metadata.ts';
-import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, guideVisualCount, hasPromptTag, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, splitTagGroup, togglePromptTag, togglePromptTagGroup } from '../src/prompt-constructor.ts';
+import { BUILTIN_CONSTRUCTOR_FOLDER_ID, canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, guideVisualCount, hasPromptTag, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTag, togglePromptTagGroup } from '../src/prompt-constructor.ts';
 
 const require = createRequire(import.meta.url);
 const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../electron/app-paths.cjs');
@@ -278,6 +278,32 @@ assert.equal(qualityPresetTags().every(tag => hasPromptTag(presetPrompt, tag)), 
 assert.equal(qualityPresetTags().reduce((value, tag) => togglePromptTag(value, tag), presetPrompt), '');
 const customOverride = { id: 'custom', tag: 'gothic', section: 'Custom', image: 'custom.png', zone: 'scene', kind: 'tag' };
 assert.equal(mergeConstructorCards(constructorFixture, [customOverride]).filter(card => card.tag === 'gothic').length, 1);
+const folderCards = [
+  { id: 'guide-frame', tag: 'upper_body', section: '5.1. Shot Types', image: 'frame.png', zone: 'frame', kind: 'tag' },
+  { id: 'custom-second-a', tag: 'moonlit', section: 'Custom', image: 'custom.png', zone: 'frame', kind: 'tag', presetId: 'second', group: 'Second folder', description: 'Night guide' },
+  { id: 'custom-first', tag: 'soft focus', section: 'Custom', image: 'custom.png', zone: 'frame', kind: 'tag', presetId: 'first', group: 'First folder', description: 'Portrait guide' },
+  { id: 'custom-second-b', tag: 'lantern', section: 'Custom', image: 'custom.png', zone: 'frame', kind: 'tag', presetId: 'second', group: 'Second folder', description: 'Warm light needle' }
+];
+const groupedFolders = groupConstructorCards(folderCards, [{ id: 'first', name: 'First folder' }, { id: 'second', name: 'Second folder' }, { id: 'empty', name: 'Empty folder' }]);
+assert.deepEqual(groupedFolders.map(folder => folder.id), [BUILTIN_CONSTRUCTOR_FOLDER_ID, 'first', 'second']);
+assert.equal(groupedFolders.find(folder => folder.id === BUILTIN_CONSTRUCTOR_FOLDER_ID)?.cards.length, 1);
+assert.equal(groupedFolders.find(folder => folder.id === 'empty'), undefined);
+const folderNameSearch = searchConstructorFolders(groupedFolders, 'second');
+assert.deepEqual(folderNameSearch.map(folder => folder.cards.map(card => card.tag)), [['moonlit', 'lantern']]);
+assert.equal(folderNameSearch[0].folderNameMatch, true);
+const descriptionSearch = searchConstructorFolders(groupedFolders, 'needle');
+assert.deepEqual(descriptionSearch.map(folder => folder.cards.map(card => card.tag)), [['lantern']]);
+assert.deepEqual(groupedFolders.find(folder => folder.id === 'second')?.cards.map(card => card.tag), ['moonlit', 'lantern']);
+const collisionFolders = groupConstructorCards([
+  { id: 'guide-collision', tag: 'wide shot', section: '5.1. Shot Types', image: 'frame.png', zone: 'frame', kind: 'tag' },
+  { id: 'custom-collision', tag: 'user wide shot', section: 'Custom', image: 'custom.png', zone: 'frame', kind: 'tag', presetId: 'hothottuk', group: 'User hothottuk', description: 'Custom collision regression' }
+], [{ id: 'hothottuk', name: 'User hothottuk' }]);
+assert.equal(collisionFolders.length, 2);
+assert.equal(collisionFolders[0].name, 'hothottuk');
+assert.equal(collisionFolders[1].name, 'User hothottuk');
+assert.notEqual(collisionFolders[0].id, collisionFolders[1].id);
+assert.equal(collisionFolders[1].id, 'hothottuk');
+assert.deepEqual(collisionFolders[1].cards.map(card => card.tag), ['user wide shot']);
 assert.equal(hasValidMagic(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 'image/png'), true);
 assert.equal(hasValidMagic(Buffer.from('RIFFxxxxWEBP'), 'image/webp'), true);
 assert.throws(() => validateImagePayload(Buffer.from('not an image'), 'image/png'), /signature/i);
@@ -982,6 +1008,25 @@ assert.match(uiSource, /let pendingWorkspaceTransition: 'prompt' \| 'custom-tags
 assert.match(uiSource, /function switchWorkspace\(workspace: 'prompt' \| 'custom-tags' \| 'metadata'\): void \{\s+if \(workspace === activeWorkspace\) return;\s+activeWorkspace = workspace;\s+pendingWorkspaceTransition = workspace;\s+render\(\);\s+\}/);
 assert.doesNotMatch(uiSource, /Compatibility marker|function switchWorkspace\(workspace: 'prompt' \| 'metadata'\)/);
 assert.match(uiSource, /function refreshConstructorGrid\(\): void \{[\s\S]*?clearArtistCardPreview\(\);[\s\S]*?grid\.innerHTML/);
+const constructorFolderToggleSource = uiSource.match(/function toggleConstructorFolder\(folderId: string, button\?: HTMLButtonElement\): void \{[\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(constructorFolderToggleSource, /shell\.classList\.toggle\('is-open', open\)/);
+assert.match(constructorFolderToggleSource, /reveal\.toggleAttribute\('inert', !open\)/);
+assert.match(constructorFolderToggleSource, /warmConstructorImages\(reveal, true\)/);
+assert.doesNotMatch(constructorFolderToggleSource, /refreshConstructorGrid\(\);\s*\}/);
+assert.match(uiSource, /class="constructor-folder-reveal"[\s\S]*?aria-hidden="\$\{!open\}"[\s\S]*?inert/);
+assert.match(uiSource, /data-constructor-image-src=.*?decoding="async"/);
+assert.match(uiSource, /const CONSTRUCTOR_IMAGE_CONCURRENCY = 6;/);
+assert.match(uiSource, /function startConstructorImageWarmup\(\): void \{[\s\S]*?requestAnimationFrame[\s\S]*?warmConstructorImages\(grid\)/);
+assert.match(uiSource, /function warmConstructorImages\(scope: ParentNode, priority = false\): void \{[\s\S]*?img\[data-constructor-image-src\][\s\S]*?queueConstructorImage\(image, priority\)/);
+assert.match(uiSource, /function pumpConstructorImageWarmup\(\): void \{[\s\S]*?image\.decoding = 'async';[\s\S]*?image\.src = source;/);
+assert.match(uiSource, /function openConstructor\([\s\S]*?render\(\);\s+startConstructorImageWarmup\(\);/);
+assert.match(uiSource, /function closeConstructor\(\): void \{\s+clearConstructorImageWarmup\(\);/);
+assert.match(uiSource, /function refreshConstructorGrid\(\): void \{[\s\S]*?warmConstructorImages\(grid\)/);
+assert.match(styleSource, /\.constructor-folder-reveal \{[\s\S]*?grid-template-rows: 0fr[\s\S]*?transition:/);
+assert.match(styleSource, /\.constructor-folder\.is-open \.constructor-folder-reveal \{ grid-template-rows: 1fr/);
+assert.match(styleSource, /\.constructor-card-image img\.is-loaded \{ opacity: 1; \}/);
+assert.match(uiSource, /function restoreConstructorGridFocus\(target: string \| null\): void \{[\s\S]*?target\.startsWith\('folder:'\)[\s\S]*?target\.slice\('folder:'\.length\)/);
+assert.doesNotMatch(uiSource, /target\.split\(':', 2\)/);
 assert.match(uiSource, /function revokeCustomImageUrl\(key: string\): void \{[\s\S]*?URL\.revokeObjectURL\(url\)/);
 assert.match(uiSource, /function setCustomImageUrl\(key: string, url: string\): void \{[\s\S]*?revokeCustomImageUrl\(key\)/);
 assert.match(uiSource, /class="\$\{workspacePanelClass\('prompt'\)\}"/);
@@ -1179,10 +1224,10 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.6.1');
+assert.equal(packageSource.version, '0.6.2');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
-assert.match(uiSource, /const APP_VERSION = '0\.6\.1'/);
+assert.match(uiSource, /const APP_VERSION = '0\.6\.2'/);
 assert.match(uiSource, /type AppUpdatePhase = 'idle' \| 'checking' \| 'available' \| 'downloading' \| 'paused' \| 'verifying' \| 'ready' \| 'installing' \| 'up-to-date' \| 'error'/);
 assert.match(uiSource, /role="progressbar"/);
 assert.match(uiSource, /Download update/);
@@ -1542,7 +1587,7 @@ assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-templa
 assert.match(styleSource, /\.mix-orbit-primary\.mix-anchor-group\.is-multi-anchor \{ max-width: min\(560px, calc\(100% - 20px\)\); \}/);
 assert.doesNotMatch(styleSource.match(/\.mix-orbit\[data-layout-density="compact"\] \.mix-anchor-group\.is-multi-anchor[\s\S]*?\n\}/)?.[0] ?? '', /width: 96px|height: 64px/);
 assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Eight interface themes/);
-assert.equal(packageSource.version, '0.6.1');
+assert.equal(packageSource.version, '0.6.2');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
 console.log(`Tests passed: page discovery, atomic replacement/failure recovery, WebP validation, prompt serialization, migration, random uniqueness, and exact catalog assets (${catalog.artists.length} V5 artists / ${catalog.characters.length} characters).`);

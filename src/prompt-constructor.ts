@@ -7,9 +7,33 @@ export interface ConstructorCard extends GuideExample {
   zone: ConstructorZone;
   kind?: 'tag' | 'quality' | 'preset';
   group?: string;
+  /** Custom Tag preset identity. Built-in guide cards intentionally omit it. */
+  presetId?: string;
   description?: string;
   tags?: string[];
 }
+
+export interface ConstructorFolder {
+  id: string;
+  name: string;
+  cards: ConstructorCard[];
+}
+
+export interface ConstructorPresetFolder {
+  id: string;
+  name: string;
+}
+
+export interface ConstructorFolderSearchResult extends ConstructorFolder {
+  /** True when the query matched the folder name and therefore reveals all cards. */
+  folderNameMatch: boolean;
+}
+
+// The namespace separator cannot occur in validated Custom Tag preset IDs,
+// so a user folder named/identified "hothottuk" can never collide with this
+// internal key. The visible folder name remains the source's familiar label.
+export const BUILTIN_CONSTRUCTOR_FOLDER_ID = 'builtin:hothottuk';
+export const BUILTIN_CONSTRUCTOR_FOLDER_NAME = 'hothottuk';
 
 export const CONSTRUCTOR_SECTIONS: Record<ConstructorZone, readonly string[]> = {
   frame: ['5.1.', '5.2.', '5.3.', '5.4.'],
@@ -147,6 +171,83 @@ export function classifyGuideEntries(entries: GuideExample[]): ConstructorCard[]
 export function mergeConstructorCards(builtIns: ConstructorCard[], custom: ConstructorCard[]): ConstructorCard[] {
   const customKeys = new Set(custom.map(card => canonicalCustomTagIdentity(card.zone, constructorCardTags(card))));
   return [...builtIns.filter(card => !customKeys.has(canonicalCustomTagIdentity(card.zone, constructorCardTags(card)))), ...custom];
+}
+
+function isCustomConstructorCard(card: ConstructorCard): boolean {
+  // `section: Custom` keeps legacy in-memory/test records useful while
+  // presetId is the authoritative identity for current Custom Tags records.
+  return Boolean(card.presetId) || card.section === 'Custom';
+}
+
+function fallbackCustomFolderId(card: ConstructorCard): string {
+  const name = card.group?.trim() || 'My Tags';
+  return `custom-${normalizePromptToken(name).replace(/[^a-z0-9]+/g, '-') || 'my-tags'}`;
+}
+
+/**
+ * Group already-merged constructor cards into stable, ordered folders.
+ * Built-in cards always live in hothottuk. Custom folders follow the persisted
+ * Custom Tags preset order; legacy/unknown preset IDs are appended in card
+ * order so cards are never hidden.
+ */
+export function groupConstructorCards(cards: readonly ConstructorCard[], presets: readonly ConstructorPresetFolder[] = []): ConstructorFolder[] {
+  const byId = new Map<string, ConstructorFolder>();
+  const ensure = (id: string, name: string): ConstructorFolder => {
+    const existing = byId.get(id);
+    if (existing) return existing;
+    const folder: ConstructorFolder = { id, name, cards: [] };
+    byId.set(id, folder);
+    return folder;
+  };
+
+  const builtIn = ensure(BUILTIN_CONSTRUCTOR_FOLDER_ID, BUILTIN_CONSTRUCTOR_FOLDER_NAME);
+  for (const card of cards) {
+    if (!isCustomConstructorCard(card)) {
+      builtIn.cards.push(card);
+      continue;
+    }
+    const id = card.presetId || fallbackCustomFolderId(card);
+    const name = card.group?.trim() || presets.find(preset => preset.id === id)?.name || 'My Tags';
+    ensure(id, name).cards.push(card);
+  }
+
+  const ordered: ConstructorFolder[] = [];
+  if (builtIn.cards.length) ordered.push(builtIn);
+  for (const preset of presets) {
+    const folder = byId.get(preset.id);
+    if (folder?.cards.length) {
+      // A renamed preset is authoritative even if a stale card group is left
+      // in memory during a migration or an editor transition.
+      folder.name = preset.name;
+      ordered.push(folder);
+    }
+  }
+  for (const folder of byId.values()) {
+    if (!ordered.includes(folder) && folder.cards.length) ordered.push(folder);
+  }
+  return ordered;
+}
+
+function constructorCardSearchText(card: ConstructorCard): string {
+  return `${card.tag} ${card.section} ${card.group ?? ''} ${card.description ?? ''}`.toLocaleLowerCase();
+}
+
+/** Apply constructor search without changing the input folders or expansion state. */
+export function searchConstructorFolders(folders: readonly ConstructorFolder[], query: string): ConstructorFolderSearchResult[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return folders.map(folder => ({ ...folder, cards: [...folder.cards], folderNameMatch: false }));
+  return folders.flatMap(folder => {
+    const folderNameMatch = folder.name.toLocaleLowerCase().includes(normalized);
+    const cards = folderNameMatch
+      ? [...folder.cards]
+      : folder.cards.filter(card => constructorCardSearchText(card).includes(normalized));
+    return cards.length ? [{ ...folder, cards, folderNameMatch }] : [];
+  });
+}
+
+/** Alias kept intentionally small for callers that only need the filtered cards. */
+export function filterConstructorFolders(folders: readonly ConstructorFolder[], query: string): ConstructorFolder[] {
+  return searchConstructorFolders(folders, query).map(({ folderNameMatch: _folderNameMatch, ...folder }) => folder);
 }
 
 export function guideVisualCount(entries: GuideExample[]): Record<ConstructorZone, number> {
