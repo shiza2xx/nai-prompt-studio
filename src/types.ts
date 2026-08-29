@@ -2,6 +2,18 @@ export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 
 export type AnimationMode = 'auto' | 'on' | 'off';
 export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir' | 'celestial-light' | 'ember-peach' | 'gothic-ivory' | 'galaxy';
+export type PreviewCachePreset = 'large' | 'balanced';
+
+export interface PreviewCacheBudgets {
+  grid: number;
+  content: number;
+  hover: number;
+}
+
+export const PREVIEW_CACHE_BUDGETS: Record<PreviewCachePreset, PreviewCacheBudgets> = {
+  large: { grid: 1024 * 1024 * 1024, content: 384 * 1024 * 1024, hover: 128 * 1024 * 1024 },
+  balanced: { grid: 384 * 1024 * 1024, content: 128 * 1024 * 1024, hover: 64 * 1024 * 1024 }
+};
 
 export interface WeightedTag {
   id: string;
@@ -116,6 +128,8 @@ export interface AppSettings {
   checkAppUpdatesOnStartup: boolean;
   seenGuideIds: string[];
   lastSeenVersion: string;
+  /** Runtime preview memory ceilings. Missing legacy values migrate to large. */
+  previewCachePreset: PreviewCachePreset;
 }
 
 export interface ArtistMixDraft {

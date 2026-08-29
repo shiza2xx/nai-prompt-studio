@@ -24,7 +24,7 @@ const manifest = {
   url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
   size: stat.size,
   sha512: sha.digest('hex'),
-  releaseNotes: 'v0.6.4 repairs thin catalog state and downloads without rebuilding the immutable v0.6.3 catalog packs, and fixes V5 artist card thumbnails in the Prompt Builder and Artist Mix pickers. During installation, V5 artist and Prompt Builder components are selected by default, while the optional V4.5 character catalog is off by default; selected missing components download when the application first launches. Upgrades preserve installed data and catalogs, migrate the v0.6.2 legacy pack, and support manual or optional startup refresh; the V5 artist component contains exactly 4,198 cards.',
+  releaseNotes: 'v0.6.5 speeds up reusable artist-card loading with a bounded two-tier preview cache, loads original artist images lazily on hover, and keeps custom and user cards untouched without recompressing their images.',
   // Additive field: schema-1 clients ignore catalogs while v0.6.4 reuses the
   // v0.6.3 descriptors to verify and hydrate selected ASAR components.
   catalogs

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "version": "0.6.5",
+  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.5.exe",
+  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.5/NAI-Prompt-Studio-V5-Setup-0.6.5.exe",
+  "size": 97906092,
+  "sha512": "a979545f6bf00c648c07630ec2768a70913cdf2c69f56d5869b2fc0d06d61d793f22072371120df1b32d3b1fdbe8481eebce94f4952ef7618e36dda38bc65991",
+  "releaseNotes": "v0.6.5 speeds up reusable artist-card loading with a bounded two-tier preview cache, loads original artist images lazily on hover, and keeps custom and user cards untouched without recompressing their images.",
+  "catalogs": [
+    {
+      "id": "artists",
+      "filename": "nai-v5-artists.asar",
+      "expectedRoot": "cards/artist",
+      "count": 4198,
+      "version": "0.6.3",
+      "trustedUrl": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-v5-artists.asar",
+      "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-v5-artists.asar",
+      "size": 756428044,
+      "sha512": "006c0bc154a14b2be250e28e602e4d54166588234c795d43c4f8e5fa5d158c3b4aca56302f998376c539a56fbb14f30c6704f6507065fffb5e57590538ffe14c"
+    },
+    {
+      "id": "characters",
+      "filename": "nai-characters.asar",
+      "expectedRoot": "cards/character",
+      "count": 5457,
+      "version": "0.6.3",
+      "trustedUrl": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-characters.asar",
+      "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-characters.asar",
+      "size": 1514743041,
+      "sha512": "7537ae45780f8e0de469310b2f8d9b2e3a2cdcfab6c87d2eb105e8380c9cbd9bdc835c553f401dabdb5e8eda47e9f41f999bfaecb38e3ccac0918923da00ec5c"
+    },
+    {
+      "id": "guide",
+      "filename": "nai-constructor-guide.asar",
+      "expectedRoot": "guide",
+      "count": 281,
+      "version": "0.6.3",
+      "trustedUrl": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-constructor-guide.asar",
+      "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.3/nai-constructor-guide.asar",
+      "size": 33958035,
+      "sha512": "10959520cb200fda9e7f5c6740f9b8bfac29ff3794c232f7583f2803a986980b836eceec9c8adb1c6400c9a44ea97250c19df660529a81ec96284b04a211f4d0"
+    }
+  ]
+}

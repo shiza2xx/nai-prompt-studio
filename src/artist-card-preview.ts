@@ -4,7 +4,14 @@ let previewHost: HTMLElement | null = null;
 let activeTarget: HTMLElement | null = null;
 let activeByPointer = false;
 let activeByFocus = false;
+let previewRequestToken = 0;
 const boundTargets = new WeakSet<HTMLElement>();
+let previewImageLoader: ((source: string) => Promise<string | undefined>) | null = null;
+
+/** Let the renderer provide the short-lived full-original hover loader. */
+export function configureArtistCardPreview(loader: ((source: string) => Promise<string | undefined>) | null): void {
+  previewImageLoader = loader;
+}
 
 function ensurePreviewHost(): HTMLElement {
   if (previewHost?.isConnected) return previewHost;
@@ -47,6 +54,7 @@ function restartPreviewReveal(host: HTMLElement): void {
 
 function showPreview(target: HTMLElement, byPointer: boolean): void {
   activeTarget = target;
+  const requestToken = ++previewRequestToken;
   if (byPointer) activeByPointer = true;
   const host = ensurePreviewHost();
   const previewImage = host.querySelector<HTMLImageElement>('img');
@@ -71,7 +79,20 @@ function showPreview(target: HTMLElement, byPointer: boolean): void {
   if (kind === 'message') {
     prompt.textContent = target.dataset.artistPreviewMessage ?? '';
   } else {
-    previewImage.src = imageSource ?? '';
+    const source = imageSource ?? '';
+    previewImage.classList.remove('is-preview-error');
+    // Only official NAX artist cards request a full original through the
+    // hover cache. User-owned/custom/constructor/library bytes remain on their
+    // existing direct source and are never transformed.
+    const officialArtist = target.dataset.artistPreviewOfficial === 'true';
+    if (source && officialArtist && previewImageLoader) {
+      const targetAtRequest = target;
+      void previewImageLoader(source).then(url => {
+        if (requestToken !== previewRequestToken || activeTarget !== targetAtRequest || !previewImage.isConnected) return;
+        if (url) previewImage.src = url;
+        else previewImage.classList.add('is-preview-error');
+      });
+    } else previewImage.src = source;
     previewImage.alt = displayTag ?? '';
     prompt.textContent = constructor ? 'Prompt builder tag' : library ? target.dataset.libraryPreviewPrompt ?? '' : target.dataset.artistPreviewPrompt ?? '';
   }
@@ -87,6 +108,7 @@ function hidePreview(target: HTMLElement): void {
 
 /** Hide the shared preview before its active card is removed or replaced. */
 export function clearArtistCardPreview(): void {
+  previewRequestToken += 1;
   activeByPointer = false;
   activeByFocus = false;
   activeTarget = null;

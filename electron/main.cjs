@@ -290,7 +290,7 @@ app.whenReady().then(() => {
       return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
     } catch { return new Response('Not found', { status: 404 }); }
   });
-  protocol.handle('nai-catalog', request => {
+  protocol.handle('nai-catalog', async request => {
     try {
       const asset = catalogAssetFromProtocolUrl(request.url);
       const target = resolveActiveCatalogAsset(appPaths.catalogDir, asset);
@@ -298,7 +298,7 @@ app.whenReady().then(() => {
       // Electron's native ASAR fs integration reads archive.asar/inner/path.
       // Returning the bytes directly avoids relying on net.fetch(file://...)'s
       // handling of ASAR inner URLs and keeps MIME types deterministic.
-      const bytes = fs.readFileSync(target);
+      const bytes = await fs.promises.readFile(target);
       const extension = path.extname(asset).toLowerCase();
       const mime = extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.png' ? 'image/png' : 'application/octet-stream';
       return new Response(bytes, { status: 200, headers: { 'Content-Type': mime, 'Cache-Control': 'no-store' } });

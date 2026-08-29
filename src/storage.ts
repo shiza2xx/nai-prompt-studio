@@ -1,6 +1,6 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { mixCompanionCapacity } from './artist-mix-layout.ts';
-import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
+import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PreviewCachePreset, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -280,6 +280,10 @@ export function normalizeTheme(value: unknown): StudioTheme {
   return value === 'midnight-blue' || value === 'raspberry-rose' || value === 'noir' || value === 'celestial-light' || value === 'ember-peach' || value === 'gothic-ivory' || value === 'galaxy' ? value : 'arcane-gold';
 }
 
+export function normalizePreviewCachePreset(value: unknown): PreviewCachePreset {
+  return value === 'balanced' ? 'balanced' : 'large';
+}
+
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {
   const source = value && typeof value === 'object' ? value as Partial<AppSettings> : {};
   return {
@@ -289,7 +293,8 @@ export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown)
     updateCatalogOnStartup: source.updateCatalogOnStartup !== false,
     checkAppUpdatesOnStartup: source.checkAppUpdatesOnStartup !== false,
     seenGuideIds: Array.isArray(source.seenGuideIds) ? source.seenGuideIds.filter((item): item is string => typeof item === 'string').slice(0, 100) : [],
-    lastSeenVersion: typeof source.lastSeenVersion === 'string' ? source.lastSeenVersion : ''
+    lastSeenVersion: typeof source.lastSeenVersion === 'string' ? source.lastSeenVersion : '',
+    previewCachePreset: normalizePreviewCachePreset(source.previewCachePreset)
   };
 }
 
@@ -297,7 +302,12 @@ export function loadSettings(legacyAnimationMode?: unknown): AppSettings {
   const remote = desktopSnapshot.exists ? desktopSnapshot.data?.settings : undefined;
   const local = localValue<unknown>(SETTINGS_KEY, null);
   const value = normalizeSettings(remote ?? local, legacyAnimationMode);
-  if (remote === undefined && bridge()) bridge()?.save('settings', value);
+  // Persist additive migrations (including the large preview-cache default)
+  // when an older desktop profile omits the new field.
+  if (remote === undefined) {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(value)); } catch { /* private browsing */ }
+  }
+  if (bridge() && (remote === undefined || JSON.stringify(remote) !== JSON.stringify(value))) bridge()?.save('settings', value);
   return value;
 }
 

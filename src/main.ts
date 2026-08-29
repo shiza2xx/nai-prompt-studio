@@ -1,17 +1,19 @@
 import './styles.css';
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { bindArtistCardPreview, clearArtistCardPreview } from './artist-card-preview';
+import { configureArtistCardPreview } from './artist-card-preview';
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from './artist-catalog';
 import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from './artist-mix-layout';
 import { paginateArtists, paginateCharacters } from './catalog-browser';
-import { buildWarmupPlan, scheduleIdleWarmup } from './catalog-warmup';
+import { buildWarmupPlan, scheduleIdleWarmup, uniqueWarmupItems } from './catalog-warmup';
 import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } from './metadata-workspace';
-import { decodePreviews } from './preview-loader';
+import { PreviewCache, PREVIEW_IMAGE_SELECTOR, type PreviewImageLike, type PreviewLease, type PreviewPriority, type PreviewRootLike } from './preview-cache';
+import { createOfficialArtistThumbnail } from './artist-thumbnail';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
 import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
 import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
-import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
-import type { AnimationMode, AppSettings, ArtistMixDraft, BasePrompt, CatalogCard, Character, CustomTag, CustomTagKind, CustomTagPreset, GuideExample, OfflineCatalog, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptSnapshot, WeightedTag } from './types';
+import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
+import { PREVIEW_CACHE_BUDGETS, type AnimationMode, type AppSettings, type ArtistMixDraft, type BasePrompt, type CatalogCard, type Character, type CustomTag, type CustomTagKind, type CustomTagPreset, type GuideExample, type OfflineCatalog, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedLibraryItem, type SavedPromptData, type SavedPromptSnapshot, type WeightedTag } from './types';
 import type { CatalogComponentProgress, CatalogComponentStatus, UpdateManifest, UpdateProgress } from './global';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
@@ -19,7 +21,7 @@ type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 's
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.4';
+const APP_VERSION = '0.6.5';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -82,6 +84,37 @@ let componentProgress: CatalogComponentProgress | null = null;
 let componentTransferBusy = false;
 let componentTransferError = '';
 let componentProgressUnsubscribe: (() => void) | null = null;
+const activePreviewBudgets = () => PREVIEW_CACHE_BUDGETS[normalizePreviewCachePreset(settings.previewCachePreset)];
+const gridPreviewCache = new PreviewCache({
+  variant: 'official-artist-thumbnail',
+  maxBytes: activePreviewBudgets().grid,
+  foregroundConcurrency: 4,
+  backgroundConcurrency: 2,
+  transform: async (blob, context) => createOfficialArtistThumbnail(blob as Blob, context.signal)
+});
+const contentPreviewCache = new PreviewCache({ variant: 'content', maxBytes: activePreviewBudgets().content, foregroundConcurrency: 4, backgroundConcurrency: 2 });
+const hoverPreviewCache = new PreviewCache({ variant: 'official-artist-original', maxBytes: activePreviewBudgets().hover, foregroundConcurrency: 4, backgroundConcurrency: 2 });
+// Keep this name as a local compatibility alias for startup/catalog callers.
+const previewCache = gridPreviewCache;
+let previewIdleCancel: (() => void) | null = null;
+let currentArtistPageLease: PreviewLease | null = null;
+let currentMixPageLease: PreviewLease | null = null;
+const recentArtistPageLeases = new Map<string, PreviewLease>();
+let previewPageToken = 0;
+let activeHoverOriginalSource = '';
+configureArtistCardPreview(async source => {
+  try {
+    // Retain at most the currently hovered original. Re-hovering this same
+    // card can reuse it, while moving across cards aggressively clears the
+    // previous full-resolution entry.
+    if (source !== activeHoverOriginalSource) {
+      hoverPreviewCache.clear();
+      activeHoverOriginalSource = source;
+    }
+    const entry = await hoverPreviewCache.load(source, 'visible');
+    return entry.state === 'ready' ? entry.url : undefined;
+  } catch { return undefined; }
+});
 type AppUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'paused' | 'verifying' | 'ready' | 'installing' | 'up-to-date' | 'error';
 let appUpdatePhase: AppUpdatePhase = 'idle';
 let appUpdateManifest: UpdateManifest | null = null;
@@ -145,9 +178,32 @@ let libraryFormDescription = '';
 let libraryFormPrompt: SavedPromptData = { positive: '', negative: '', characters: [] };
 let libraryFormMix: SavedArtistMixData = { artists: [], serializedPrompt: '' };
 let libraryFormScrollTop = 0;
+let searchDebounceTimer: number | undefined;
+const workspaceScrollTop = new Map<string, number>();
+const viewScrollTop = new Map<string, number>();
+let renderedWorkspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings' = activeWorkspace;
 const libraryPolarities = new Map<string, { base: 'positive' | 'negative'; characters: Array<'positive' | 'negative'> }>();
 // Legacy compatibility marker: new MetadataWorkspace(() => catalog.artists)
 const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card), saveMetadataToLibrary);
+
+function scheduleSearch(callback: () => void): void {
+  if (searchDebounceTimer !== undefined) window.clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = window.setTimeout(() => { searchDebounceTimer = undefined; callback(); }, 150);
+}
+
+function snapshotViewScroll(): void {
+  workspaceScrollTop.set(renderedWorkspace, window.scrollY);
+  for (const element of document.querySelectorAll<HTMLElement>('#artist-grid, #mix-artist-grid, #character-grid, #constructor-grid, #custom-tag-grid')) {
+    if (element.id) viewScrollTop.set(element.id, element.scrollTop);
+  }
+}
+
+function restoreViewScroll(): void {
+  if (workspaceScrollTop.has(activeWorkspace)) window.scrollTo({ top: workspaceScrollTop.get(activeWorkspace)!, behavior: 'auto' });
+  for (const element of document.querySelectorAll<HTMLElement>('#artist-grid, #mix-artist-grid, #character-grid, #constructor-grid, #custom-tag-grid')) {
+    if (element.id && viewScrollTop.has(element.id)) element.scrollTop = viewScrollTop.get(element.id)!;
+  }
+}
 
 function revokeCustomImageUrl(key: string): void {
   const url = customImageUrls.get(key);
@@ -189,6 +245,9 @@ function emptyBase(): BasePrompt {
 }
 
 function emptyCatalog(): OfflineCatalog { return { version: 2, catalogId: 'nai-v5', artists: [], characters: [], tags: FALLBACK_TAGS }; }
+function catalogRevision(value: Partial<OfflineCatalog>): string {
+  return [APP_VERSION, value.catalogId ?? 'nai-v5', value.generatedAt ?? ''].join(':');
+}
 function normalizeRange(value?: { min: number; max: number }, available = 0): { min: number; max: number } {
   const requestedMin = Number(value?.min);
   const requestedMax = Number(value?.max);
@@ -222,6 +281,76 @@ function catalogImage(card: CatalogCard): string {
   if (!path) return './plus.png';
   if (/^(?:nai-custom|nai-catalog):\/\//i.test(path) || /^(?:blob:|data:)/i.test(path) || /^(?:\.\/|\/)/.test(path)) return path;
   return (card.runtime || packagedCatalogMode) ? `nai-catalog://asset/${encodeURI(path).replace(/#/g, '%23')}` : resolvedCatalogPath(path);
+}
+function isCatalogPreviewSource(source: string): boolean {
+  return /^(?:nai-catalog:\/\/|\.\/catalog\/)/i.test(source);
+}
+function isOfficialArtistCard(card: CatalogCard | undefined): boolean {
+  return Boolean(card && card.custom !== true && officialArtists.some(item => (item.catalogId ?? item.id) === (card.catalogId ?? card.id)));
+}
+function artistItemCard(item: WeightedTag): CatalogCard | undefined {
+  return catalog.artists.find(candidate => (candidate.catalogId ?? candidate.id) === (item.catalogId ?? item.id));
+}
+function previewCacheForImage(image: PreviewImageLike): PreviewCache {
+  return image.dataset.previewCache === 'grid' ? gridPreviewCache : contentPreviewCache;
+}
+function contentOrGridPreviewCache(card: CatalogCard): PreviewCache {
+  return isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
+}
+function clearHoverPreviewCache(): void {
+  clearArtistCardPreview();
+  hoverPreviewCache.clear();
+  activeHoverOriginalSource = '';
+}
+function invalidateOfficialPreviewCatalog(revision: string): void {
+  // Grid thumbnails and hover originals share catalog ownership but never
+  // share decoded bytes. Keep user/content entries intact on revision churn.
+  gridPreviewCache.invalidateCatalog(revision, isCatalogPreviewSource);
+  hoverPreviewCache.invalidateCatalog(revision, isCatalogPreviewSource);
+}
+function applyPreviewCachePreset(value: AppSettings['previewCachePreset']): void {
+  const preset = normalizePreviewCachePreset(value);
+  const budgets = PREVIEW_CACHE_BUDGETS[preset];
+  gridPreviewCache.setMaxBytes(budgets.grid);
+  contentPreviewCache.setMaxBytes(budgets.content);
+  hoverPreviewCache.setMaxBytes(budgets.hover);
+}
+function officialThumbnailSource(card: CatalogCard): string | null {
+  return isOfficialArtistCard(card) ? catalogImage(card) : null;
+}
+function previewPageGroupIdentity(kind: 'artist' | 'mix' | 'character' | 'favorites', page: number, query = ''): string {
+  return `${kind}:${page}:${query.trim().toLocaleLowerCase()}`;
+}
+function updatePreviewLeases(scope: 'prompt' | 'mix' | 'artist-page' | 'mix-page', cards: readonly CatalogCard[] = []): void {
+  const sources = cards.map(officialThumbnailSource).filter((source): source is string => Boolean(source));
+  if (scope === 'prompt') {
+    const selected = base.artists.map(artistItemCard).map(card => card ? officialThumbnailSource(card) : null).filter((source): source is string => Boolean(source));
+    gridPreviewCache.setLease('selected-prompt-artists', selected);
+  } else if (scope === 'mix') {
+    const mix = [...artistMix.anchors, ...artistMix.companions].map(artistItemCard).map(card => card ? officialThumbnailSource(card) : null).filter((source): source is string => Boolean(source));
+    gridPreviewCache.setLease('mix-anchors-companions', mix);
+  } else if (scope === 'artist-page') {
+    if (currentArtistPageLease) retainRecentArtistSources(`transition:${previewPageToken}`, currentArtistPageLease.sources);
+    currentArtistPageLease?.release();
+    currentArtistPageLease = gridPreviewCache.acquireLease(previewPageGroupIdentity('artist', artistPage, artistSearch) + `:${artistFavoritesOnly}`, sources);
+  } else {
+    currentMixPageLease?.release();
+    currentMixPageLease = gridPreviewCache.acquireLease(previewPageGroupIdentity('mix', mixArtistPage, artistSearch) + `:${artistMix.favoritesOnly}`, sources);
+  }
+}
+function retainRecentArtistPage(identity: string, cards: readonly CatalogCard[]): void {
+  const sources = cards.map(officialThumbnailSource).filter((source): source is string => Boolean(source));
+  retainRecentArtistSources(identity, sources);
+}
+function retainRecentArtistSources(identity: string, sources: readonly string[]): void {
+  recentArtistPageLeases.get(identity)?.release();
+  recentArtistPageLeases.set(identity, gridPreviewCache.acquireLease(`recent:${identity}`, sources));
+  while (recentArtistPageLeases.size > 4) {
+    const oldest = recentArtistPageLeases.keys().next().value as string | undefined;
+    if (!oldest) break;
+    recentArtistPageLeases.get(oldest)?.release();
+    recentArtistPageLeases.delete(oldest);
+  }
 }
 function guideImage(image?: string): string {
   const value = String(image || '');
@@ -318,7 +447,7 @@ function commitArtistMix(nextMix: ArtistMixDraft, notice: string): void {
   artistMix = nextMix;
   mixNotice = notice;
   saveArtistMixSoon();
-  clearArtistCardPreview();
+  clearHoverPreviewCache();
   if (!shouldAnimate) {
     mixTransitionActive = false;
     render();
@@ -387,7 +516,9 @@ function selectedArtistMarkup(item: WeightedTag): string {
   const value = normalizeArtistWeight(item.weight);
   const image = item.image ? artistImage(item) : './plus.png';
   const previewPrompt = serializeTag(item) ?? item.tag;
-  return `<article class="selected-artist" data-selected-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(item.tag)}" data-artist-preview-prompt="${escapeHtml(previewPrompt)}"><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(item.tag)}" loading="lazy"></div><div class="selected-artist-copy"><b>${escapeHtml(item.tag)}</b><code>${escapeHtml(previewPrompt)}</code><small>V5 artist</small><div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-artist-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(item.tag)}"><span class="number-stepper"><input type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-artist-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(item.tag)}"><span class="number-stepper-buttons"><button type="button" data-number-step="up" aria-label="Increase weight for ${escapeHtml(item.tag)}" title="Increase weight">▲</button><button type="button" data-number-step="down" aria-label="Decrease weight for ${escapeHtml(item.tag)}" title="Decrease weight">▼</button></span></span><button class="tiny-copy reroll-weight" type="button" data-reroll-weight="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(item.tag)}">Reroll</button></div></div><button class="icon-button" data-remove-artist="${escapeHtml(item.id)}" aria-label="Remove artist">×</button></article>`;
+  const official = isOfficialArtistCard(artistItemCard(item));
+  const cache = official ? 'grid' : 'content';
+  return `<article class="selected-artist" data-selected-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-official="${official}" data-artist-preview-tag="${escapeHtml(item.tag)}" data-artist-preview-prompt="${escapeHtml(previewPrompt)}"><div class="selected-artist-image"><img data-preview-cache="${cache}" data-preview-src="${image}" alt="${escapeHtml(item.tag)}" loading="lazy"></div><div class="selected-artist-copy"><b>${escapeHtml(item.tag)}</b><code>${escapeHtml(previewPrompt)}</code><small>V5 artist</small><div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-artist-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(item.tag)}"><span class="number-stepper"><input type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-artist-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(item.tag)}"><span class="number-stepper-buttons"><button type="button" data-number-step="up" aria-label="Increase weight for ${escapeHtml(item.tag)}" title="Increase weight">▲</button><button type="button" data-number-step="down" aria-label="Decrease weight for ${escapeHtml(item.tag)}" title="Decrease weight">▼</button></span></span><button class="tiny-copy reroll-weight" type="button" data-reroll-weight="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(item.tag)}">Reroll</button></div></div><button class="icon-button" data-remove-artist="${escapeHtml(item.id)}" aria-label="Remove artist">×</button></article>`;
 }
 
 function artistCard(card: CatalogCard): string {
@@ -396,7 +527,8 @@ function artistCard(card: CatalogCard): string {
   const favorite = artistFavorites.has(stableId);
   const image = catalogImage(card);
   const promptText = `artist: ${card.tag}`;
-  return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" data-add-artist="${escapeHtml(stableId)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="${escapeHtml(promptText)}" ${selected ? 'aria-pressed="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img src="${image}" alt="${escapeHtml(card.tag)}" loading="lazy"><img src="./plus.png" alt="" class="plus-overlay"></span><b>${escapeHtml(card.tag)}</b></button><div class="artist-card-actions"><button class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-artist="${escapeHtml(stableId)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button><button class="tiny-copy" data-copy-artist="${escapeHtml(stableId)}">Copy</button></div></article>`;
+  const official = isOfficialArtistCard(card);
+  return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" data-add-artist="${escapeHtml(stableId)}" data-artist-preview-official="${official}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="${escapeHtml(promptText)}" ${selected ? 'aria-pressed="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img data-preview-cache="${official ? 'grid' : 'content'}" data-preview-src="${image}" alt="${escapeHtml(card.tag)}" loading="lazy"><img src="./plus.png" alt="" class="plus-overlay"></span><b>${escapeHtml(card.tag)}</b></button><div class="artist-card-actions"><button class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-artist="${escapeHtml(stableId)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button><button class="tiny-copy" data-copy-artist="${escapeHtml(stableId)}">Copy</button></div></article>`;
 }
 
 function promptArtistPickerPage(): ReturnType<typeof paginateArtists> {
@@ -454,12 +586,15 @@ function reconcileArtistMix(value: ArtistMixDraft): ArtistMixDraft {
 function mixArtistCardMarkup(item: WeightedTag, anchor: boolean): string {
   const value = normalizeArtistWeight(item.weight);
   const image = artistImage(item);
+  const official = isOfficialArtistCard(artistItemCard(item));
+  const cache = official ? 'grid' : 'content';
   const label = item.tag.replace(/^artist:\s*/i, '');
   const weightControls = `<div class="weight-controls"><input type="range" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight-range="${escapeHtml(item.id)}" aria-label="Weight for ${escapeHtml(label)}"><input class="mix-weight-number" type="number" min="0.1" max="2" step="0.1" value="${value.toFixed(1)}" data-mix-weight="${escapeHtml(item.id)}" aria-label="Numeric weight for ${escapeHtml(label)}"><button class="tiny-copy reroll-weight" type="button" data-mix-reroll="${escapeHtml(item.id)}" aria-label="Reroll weight for ${escapeHtml(label)}">Reroll</button></div>`;
-  const articleAttrs = `class="selected-artist mix-artist-card ${anchor ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"`;
+  let articleAttrs = `class="selected-artist mix-artist-card ${anchor ? 'mix-primary' : ''}" data-mix-artist="${escapeHtml(item.id)}" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeHtml(label)}" data-artist-preview-prompt="${escapeHtml(serializeTag(item) ?? item.tag)}"`;
   const actions = `${!anchor || artistMix.anchors.length > 1 ? `<button class="mix-pin ${anchor ? 'is-pinned' : ''}" type="button" data-mix-pin="${escapeHtml(item.id)}" aria-pressed="${anchor}" aria-label="${anchor ? 'Unpin' : 'Pin'} ${escapeHtml(label)}">${anchor ? '◆' : '◇'}</button>` : ''}<button class="icon-button" type="button" data-mix-remove="${escapeHtml(item.id)}" aria-label="Remove ${escapeHtml(label)}">×</button>`;
-  if (!anchor) return `<article ${articleAttrs}><div class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>COMPANION ARTIST</small><b>${escapeHtml(label)}</b>${weightControls}</div>${actions}</article>`;
-  const identity = `<button class="mix-anchor-replace-trigger" type="button" data-mix-replace-anchor="${escapeHtml(item.id)}" aria-label="Replace anchor ${escapeHtml(label)}"><span class="selected-artist-image"><img src="${image}" alt="${escapeHtml(label)}" loading="lazy"></span><span class="selected-artist-copy"><small>ANCHOR ARTIST</small><b>${escapeHtml(label)}</b></span></button>`;
+  articleAttrs += ` data-artist-preview-official="${official}"`;
+  if (!anchor) return `<article ${articleAttrs}><div class="selected-artist-image"><img data-preview-cache="${cache}" data-preview-src="${image}" alt="${escapeHtml(label)}" loading="lazy"></div><div class="selected-artist-copy"><small>COMPANION ARTIST</small><b>${escapeHtml(label)}</b>${weightControls}</div>${actions}</article>`;
+  const identity = `<button class="mix-anchor-replace-trigger" type="button" data-mix-replace-anchor="${escapeHtml(item.id)}" aria-label="Replace anchor ${escapeHtml(label)}"><span class="selected-artist-image"><img data-preview-cache="${cache}" data-preview-src="${image}" alt="${escapeHtml(label)}" loading="lazy"></span><span class="selected-artist-copy"><small>ANCHOR ARTIST</small><b>${escapeHtml(label)}</b></span></button>`;
   return `<article ${articleAttrs}><div class="mix-anchor-identity">${identity}${weightControls}</div>${actions}</article>`;
 }
 function mixOrbitMarkup(): string {
@@ -627,7 +762,7 @@ function componentSettingsMarkup(browserOnly: boolean): string {
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
   const catalogControls = browserOnly ? '' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`;
-  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
+  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">PREVIEWS</p><h3>Memory budget</h3><label class="settings-field">Artist preview cache<select id="preview-cache-preset"><option value="large"${settings.previewCachePreset === 'large' ? ' selected' : ''}>Large · 1.5 GB total</option><option value="balanced"${settings.previewCachePreset === 'balanced' ? ' selected' : ''}>Balanced · 576 MB total</option></select></label><p class="settings-help">Official artist cards use runtime thumbnails; originals are kept only while hovering.</p></section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -636,7 +771,7 @@ function artistPickerMarkup(): string {
 
 function characterCard(card: CatalogCard): string {
   const favorite = characterFavorites.has(card.id);
-  return `<article class="character-catalog-card"><button type="button" data-pick-character="${escapeHtml(card.id)}"><span class="card-skeleton" aria-hidden="true"></span><img class="preview-image" src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"><b>${escapeHtml(card.tag)}</b></button><button type="button" class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-character="${escapeHtml(card.id)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button></article>`;
+  return `<article class="character-catalog-card"><button type="button" data-pick-character="${escapeHtml(card.id)}"><span class="card-skeleton" aria-hidden="true"></span><img class="preview-image" data-preview-cache="content" data-preview-src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"><b>${escapeHtml(card.tag)}</b></button><button type="button" class="favorite-button ${favorite ? 'is-favorite' : ''}" data-favorite-character="${escapeHtml(card.id)}" aria-label="${favorite ? 'Remove favorite' : 'Add favorite'}">★</button></article>`;
 }
 
 function charactersZone(): string {
@@ -689,7 +824,7 @@ function savedLibraryCardMarkup(item: SavedLibraryItem): string {
     ? `<details class="saved-library-details"><summary>Prompt details</summary>${promptBlock('Base prompt', { positive: item.data?.positive ?? item.prompt, negative: item.data?.negative ?? '' }, -1, polarity.base)}${(item.data?.characters ?? []).map((character, index) => promptBlock(character.label, character, index, polarity.characters[index] ?? 'positive')).join('')}${generationMarkup}</details>`
     : `<details class="saved-library-details"><summary>Artist details</summary><code>${escapeHtml(item.data?.artists.map(artist => `${artist.tag} (${artist.weight})`).join(', ') || 'No structured artists')}</code></details>`;
   const previewAttrs = image ? ` tabindex="0" role="img" aria-label="Preview cover for ${escapeHtml(item.name)}" data-library-preview-image="${escapeHtml(image)}" data-library-preview-tag="${escapeHtml(item.name)}" data-library-preview-prompt="${escapeHtml(item.kind === 'prompt' ? item.data?.positive ?? item.prompt : item.data?.serializedPrompt ?? item.prompt)}" data-library-preview-description="${escapeHtml(item.description ?? '')}"` : '';
-  return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}"${previewAttrs}>${image ? `<img src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><p class="saved-library-description">${escapeHtml(item.description || 'No description.')}</p>${details}<div class="saved-library-actions"><button class="secondary saved-library-rounded" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="secondary saved-library-rounded" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
+  return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}"${previewAttrs}>${image ? `<img data-preview-cache="content" data-preview-src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><p class="saved-library-description">${escapeHtml(item.description || 'No description.')}</p>${details}<div class="saved-library-actions"><button class="secondary saved-library-rounded" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="secondary saved-library-rounded" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
 }
 
 function savedLibraryWorkspace(): string {
@@ -788,7 +923,7 @@ function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): st
   const hasImage = Boolean(card.image);
   const image = hasImage ? (card.image!.startsWith('nai-custom://') ? card.image : guideImage(card.image)) : '';
   const description = card.description?.trim() ?? '';
-  const visual = hasImage ? `<img data-constructor-image-src="${image}" alt="${escapeHtml(card.tag)}" decoding="async">` : `<span class="constructor-card-text-icon" aria-hidden="true">✦</span>`;
+  const visual = hasImage ? `<img data-preview-cache="content" data-preview-src="${image}" data-constructor-image-src="${image}" alt="${escapeHtml(card.tag)}" decoding="async">` : `<span class="constructor-card-text-icon" aria-hidden="true">✦</span>`;
   return `<article class="constructor-card ${selected ? 'selected' : ''} ${card.kind === 'preset' ? 'preset' : ''}" data-constructor-card="${escapeHtml(card.id)}"><button class="constructor-card-pick" type="button" data-constructor-tag="${escapeHtml(card.id)}" ${hasImage ? `data-constructor-preview-image="${escapeHtml(image)}"` : 'data-constructor-preview-no-image="true"'} data-constructor-preview-tag="${escapeHtml(card.tag)}" data-constructor-preview-description="${escapeHtml(description)}" aria-pressed="${selected}"><span class="constructor-card-image ${hasImage ? '' : 'no-image'}">${visual}</span><b>${escapeHtml(card.tag)}</b><small>${escapeHtml(card.group ?? 'Custom')}</small></button></article>`;
 }
 
@@ -862,7 +997,7 @@ function customTagsWorkspace(): string {
   const nameLabel = kind === 'artist' ? 'Artist name' : 'Tag';
   const namePlaceholder = kind === 'artist' ? 'artist name' : '1girl, upper body, looking at viewer';
   const constructor = kind === 'artist' ? '<p class="custom-artist-note">Artist cards appear in Add Artist, random pools, Artist Mix, and metadata highlights.</p>' : `<fieldset class="field constructor-choices"><legend>Constructor</legend><div class="zone-choice-grid">${customZoneChoice('frame', editing?.zone ?? 'frame')}${customZoneChoice('scene', editing?.zone ?? 'frame')}${customZoneChoice('render', editing?.zone ?? 'frame')}</div></fieldset>`;
-  return `<section class="custom-tags-workspace" aria-labelledby="custom-tags-title"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="custom-tags-title">Custom Tag Builder</h2><p>Build prompt tags and artist cards for your studio.</p></div></header><div class="custom-tags-layout"><aside class="custom-preset-sidebar" aria-label="Custom tag presets"><div class="preset-sidebar-heading"><div><p class="eyebrow">PRESET FOLDERS</p><h3>My presets</h3></div><span class="preset-total">${customTags.length}</span></div><button class="preset-all ${selectedCustomPresetId === 'all' ? 'selected' : ''}" type="button" data-select-preset="all" aria-pressed="${selectedCustomPresetId === 'all'}"><span><b>All Tags</b><small>${customTags.length} ${customTags.length === 1 ? 'card' : 'cards'}</small></span><span aria-hidden="true">${selectedCustomPresetId === 'all' ? '●' : '○'}</span></button><div class="custom-preset-list">${customTagPresets.map(customPresetMarkup).join('')}</div>${creatingCustomPreset ? `<form class="preset-create-form" id="custom-preset-form"><label class="field"><span>New preset folder</span><input id="custom-preset-name" maxlength="80" placeholder="A short folder name" required></label><div><button class="primary" type="submit">Create preset</button><button class="tiny-copy" type="button" id="cancel-create-preset">Cancel</button></div></form>` : '<button class="secondary preset-create-button" type="button" id="create-preset">＋ New preset</button>'}${deletePrompt}</aside><form class="custom-tag-form" id="custom-tag-form"><div class="form-heading"><div><p class="eyebrow">CREATE OR EDIT</p><h3>${editing ? `Edit custom ${kind}` : `New custom ${kind}`}</h3></div>${editing ? '<button class="tiny-copy" type="button" id="cancel-custom-edit">Cancel edit</button>' : ''}</div><p class="custom-destination" role="status">Destination: <b>${escapeHtml(destination.name)}</b>${selectedCustomPresetId === 'all' ? ' <small>All Tags is a view. New cards go to My Tags.</small>' : ''}</p>${customTypeSelector(kind)}<div class="field image-field"><span>Image <i>${imageHelp}</i></span><div class="custom-image-drop${hasImage ? ' has-image' : ''}" id="custom-image-drop" aria-describedby="custom-image-status"><input id="custom-tag-image" class="custom-file-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" tabindex="-1"><button class="custom-image-empty-content" type="button" id="custom-tag-choose"${hasImage ? ' hidden' : ''}><span class="drop-icon" aria-hidden="true">＋</span><b>Drop an image here</b><span>or</span><span class="secondary choose-image-label">Choose image</span></button>${imagePreview}</div><p class="custom-image-status" id="custom-image-status">${imageStatus}</p></div><label class="field"><span>${nameLabel}</span><input id="custom-tag-name" value="${escapeHtml(editing?.tag ?? '')}" required maxlength="180" placeholder="${namePlaceholder}"></label>${constructor}<label class="field"><span>Description / guide <i>(optional)</i></span><textarea id="custom-tag-description" maxlength="2000" placeholder="Explain what this card changes or when to use it.">${escapeHtml(editing?.description ?? '')}</textarea></label><p class="custom-tag-status" id="custom-tag-status" role="status" aria-live="polite"></p><button class="primary custom-save-button" type="submit">${editing ? 'Save changes' : `Save custom ${kind}`}</button></form><section class="custom-tag-library"><div class="subheading"><div><p class="eyebrow">SAVED CARDS</p><h3>${visibleCards.length} shown <span>·</span> ${customTags.length} total</h3></div><div class="custom-library-tools"><input id="custom-tag-search" value="${escapeHtml(customTagSearch)}" placeholder="Search your cards..." aria-label="Search custom cards"><div class="custom-zone-filter" role="group" aria-label="Filter saved cards"><button type="button" class="chip ${customTagFilter === 'all' ? 'on' : ''}" data-custom-filter="all" aria-pressed="${customTagFilter === 'all'}">All</button><button type="button" class="chip ${customTagFilter === 'artist' ? 'on' : ''}" data-custom-filter="artist" aria-pressed="${customTagFilter === 'artist'}">Artists</button><button type="button" class="chip ${customTagFilter === 'frame' ? 'on' : ''}" data-custom-filter="frame" aria-pressed="${customTagFilter === 'frame'}">Frame</button><button type="button" class="chip ${customTagFilter === 'scene' ? 'on' : ''}" data-custom-filter="scene" aria-pressed="${customTagFilter === 'scene'}">Scene</button><button type="button" class="chip ${customTagFilter === 'render' ? 'on' : ''}" data-custom-filter="render" aria-pressed="${customTagFilter === 'render'}">Render</button></div></div></div><div class="custom-tag-grid" tabindex="0">${visibleCards.length ? visibleCards.map(customLibraryCardMarkup).join('') : '<p class="empty-inline">No saved cards match this preset and filter yet.</p>'}</div></section></div></section>`;
+  return `<section class="custom-tags-workspace" aria-labelledby="custom-tags-title"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="custom-tags-title">Custom Tag Builder</h2><p>Build prompt tags and artist cards for your studio.</p></div></header><div class="custom-tags-layout"><aside class="custom-preset-sidebar" aria-label="Custom tag presets"><div class="preset-sidebar-heading"><div><p class="eyebrow">PRESET FOLDERS</p><h3>My presets</h3></div><span class="preset-total">${customTags.length}</span></div><button class="preset-all ${selectedCustomPresetId === 'all' ? 'selected' : ''}" type="button" data-select-preset="all" aria-pressed="${selectedCustomPresetId === 'all'}"><span><b>All Tags</b><small>${customTags.length} ${customTags.length === 1 ? 'card' : 'cards'}</small></span><span aria-hidden="true">${selectedCustomPresetId === 'all' ? '●' : '○'}</span></button><div class="custom-preset-list">${customTagPresets.map(customPresetMarkup).join('')}</div>${creatingCustomPreset ? `<form class="preset-create-form" id="custom-preset-form"><label class="field"><span>New preset folder</span><input id="custom-preset-name" maxlength="80" placeholder="A short folder name" required></label><div><button class="primary" type="submit">Create preset</button><button class="tiny-copy" type="button" id="cancel-create-preset">Cancel</button></div></form>` : '<button class="secondary preset-create-button" type="button" id="create-preset">＋ New preset</button>'}${deletePrompt}</aside><form class="custom-tag-form" id="custom-tag-form"><div class="form-heading"><div><p class="eyebrow">CREATE OR EDIT</p><h3>${editing ? `Edit custom ${kind}` : `New custom ${kind}`}</h3></div>${editing ? '<button class="tiny-copy" type="button" id="cancel-custom-edit">Cancel edit</button>' : ''}</div><p class="custom-destination" role="status">Destination: <b>${escapeHtml(destination.name)}</b>${selectedCustomPresetId === 'all' ? ' <small>All Tags is a view. New cards go to My Tags.</small>' : ''}</p>${customTypeSelector(kind)}<div class="field image-field"><span>Image <i>${imageHelp}</i></span><div class="custom-image-drop${hasImage ? ' has-image' : ''}" id="custom-image-drop" aria-describedby="custom-image-status"><input id="custom-tag-image" class="custom-file-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" tabindex="-1"><button class="custom-image-empty-content" type="button" id="custom-tag-choose"${hasImage ? ' hidden' : ''}><span class="drop-icon" aria-hidden="true">＋</span><b>Drop an image here</b><span>or</span><span class="secondary choose-image-label">Choose image</span></button>${imagePreview}</div><p class="custom-image-status" id="custom-image-status">${imageStatus}</p></div><label class="field"><span>${nameLabel}</span><input id="custom-tag-name" value="${escapeHtml(editing?.tag ?? '')}" required maxlength="180" placeholder="${namePlaceholder}"></label>${constructor}<label class="field"><span>Description / guide <i>(optional)</i></span><textarea id="custom-tag-description" maxlength="2000" placeholder="Explain what this card changes or when to use it.">${escapeHtml(editing?.description ?? '')}</textarea></label><p class="custom-tag-status" id="custom-tag-status" role="status" aria-live="polite"></p><button class="primary custom-save-button" type="submit">${editing ? 'Save changes' : `Save custom ${kind}`}</button></form><section class="custom-tag-library"><div class="subheading"><div><p class="eyebrow">SAVED CARDS</p><h3>${visibleCards.length} shown <span>·</span> ${customTags.length} total</h3></div><div class="custom-library-tools"><input id="custom-tag-search" value="${escapeHtml(customTagSearch)}" placeholder="Search your cards..." aria-label="Search custom cards"><div class="custom-zone-filter" role="group" aria-label="Filter saved cards"><button type="button" class="chip ${customTagFilter === 'all' ? 'on' : ''}" data-custom-filter="all" aria-pressed="${customTagFilter === 'all'}">All</button><button type="button" class="chip ${customTagFilter === 'artist' ? 'on' : ''}" data-custom-filter="artist" aria-pressed="${customTagFilter === 'artist'}">Artists</button><button type="button" class="chip ${customTagFilter === 'frame' ? 'on' : ''}" data-custom-filter="frame" aria-pressed="${customTagFilter === 'frame'}">Frame</button><button type="button" class="chip ${customTagFilter === 'scene' ? 'on' : ''}" data-custom-filter="scene" aria-pressed="${customTagFilter === 'scene'}">Scene</button><button type="button" class="chip ${customTagFilter === 'render' ? 'on' : ''}" data-custom-filter="render" aria-pressed="${customTagFilter === 'render'}">Render</button></div></div></div><div class="custom-tag-grid" id="custom-tag-grid" tabindex="0">${visibleCards.length ? visibleCards.map(customLibraryCardMarkup).join('') : '<p class="empty-inline">No saved cards match this preset and filter yet.</p>'}</div></section></div></section>`;
 }
 
 function customLibraryCardMarkup(item: CustomTag): string {
@@ -870,7 +1005,7 @@ function customLibraryCardMarkup(item: CustomTag): string {
   const preset = customPreset(customTagPresetId(item));
   const isArtist = item.kind === 'artist';
   const status = isArtist && shadowedCustomArtistIds.has(item.id) ? 'NAX card active' : isArtist ? 'Artist' : item.zone === 'render' ? 'Render / Quality' : item.zone[0].toUpperCase() + item.zone.slice(1);
-  return `<article class="custom-library-card" data-constructor-preview-image="${escapeHtml(customTagImageUrl(item))}" data-constructor-preview-tag="${escapeHtml(item.tag)}" data-constructor-preview-description="${escapeHtml(description)}"><img src="${escapeHtml(customTagImageUrl(item))}" alt="${escapeHtml(item.tag)}" loading="lazy"><div><b>${escapeHtml(item.tag)}</b><small>${escapeHtml(preset.name)} · ${status}</small>${description ? `<p>${escapeHtml(description)}</p>` : ''}</div><div class="custom-library-actions"><button class="tiny-copy" type="button" data-edit-custom-tag="${escapeHtml(item.id)}">Edit</button><button class="tiny-copy" type="button" data-delete-custom-tag="${escapeHtml(item.id)}">Delete</button></div></article>`;
+  return `<article class="custom-library-card" data-constructor-preview-image="${escapeHtml(customTagImageUrl(item))}" data-constructor-preview-tag="${escapeHtml(item.tag)}" data-constructor-preview-description="${escapeHtml(description)}"><img data-preview-cache="content" data-preview-src="${escapeHtml(customTagImageUrl(item))}" alt="${escapeHtml(item.tag)}" loading="lazy"><div><b>${escapeHtml(item.tag)}</b><small>${escapeHtml(preset.name)} · ${status}</small>${description ? `<p>${escapeHtml(description)}</p>` : ''}</div><div class="custom-library-actions"><button class="tiny-copy" type="button" data-edit-custom-tag="${escapeHtml(item.id)}">Edit</button><button class="tiny-copy" type="button" data-delete-custom-tag="${escapeHtml(item.id)}">Delete</button></div></article>`;
 }
 
 function workspacePanelClass(workspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings'): string {
@@ -881,6 +1016,7 @@ function workspacePanelClass(workspace: 'prompt' | 'artist-mix' | 'saved-library
 
 function switchWorkspace(workspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings'): void {
   if (workspace === activeWorkspace) return;
+  clearHoverPreviewCache();
   focusMode = false;
   activeWorkspace = workspace;
   pendingWorkspaceTransition = workspace;
@@ -900,8 +1036,11 @@ function render(): void {
   const app = document.querySelector<HTMLDivElement>('#app');
   if (!app) return;
   document.documentElement.dataset.workspace = activeWorkspace;
-  clearArtistCardPreview();
+  clearHoverPreviewCache();
+  updatePreviewLeases('prompt');
+  updatePreviewLeases('mix');
   const tabs = focusMode ? '' : `<div class="workspace-tabs" role="tablist" aria-label="Studio workspaces"><button id="prompt-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'prompt'}" aria-controls="prompt-panel" class="${activeWorkspace === 'prompt' ? 'on' : ''}">Prompt Builder</button><button id="artist-mix-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'artist-mix'}" aria-controls="artist-mix-panel" class="${activeWorkspace === 'artist-mix' ? 'on' : ''}">Artist Mix</button><button id="saved-library-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'saved-library'}" aria-controls="saved-library-panel" class="${activeWorkspace === 'saved-library' ? 'on' : ''}">Saved Library</button><button id="custom-tags-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'custom-tags'}" aria-controls="custom-tags-panel" class="${activeWorkspace === 'custom-tags' ? 'on' : ''}">Custom Tags</button><button id="metadata-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'metadata'}" aria-controls="metadata-panel" class="${activeWorkspace === 'metadata' ? 'on' : ''}">Image Metadata</button><button id="settings-tab" type="button" role="tab" aria-selected="${activeWorkspace === 'settings'}" aria-controls="settings-panel" class="${activeWorkspace === 'settings' ? 'on' : ''}">Settings</button></div>`;
+  snapshotViewScroll();
   snapshotAccordionState();
   const activeMarkup = activeWorkspace === 'prompt'
     ? `<section id="prompt-panel" class="${workspacePanelClass('prompt')}" role="tabpanel" aria-labelledby="prompt-tab"><section class="workspace-intro"><div><p class="eyebrow">FOUR-ZONE WORKSPACE</p><h2>Build the prompt in order.</h2><p>Frame → artists → scene → render. Undesired content and character blocks stay separate.</p></div></section><section class="four-zone-grid">${zoneDetails()}${artistZone()}${charactersZone()}</section><footer class="app-footer"><div class="footer-brand"><span>NAI Prompt Studio</span><span class="footer-links"><a href="https://nax.moe/?gallery=danbooru-artist-tags-2-v5" target="_blank" rel="noopener noreferrer">NAX · CC BY 4.0</a><a href="https://hothottuk.neocities.org/en" target="_blank" rel="noopener noreferrer">hothottuk's guide</a></span></div></footer></section>`
@@ -914,7 +1053,8 @@ function render(): void {
   app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
   pendingWorkspaceTransition = null;
   bindEvents();
-  bindPreviewFade();
+  bindPreviewFade(app.querySelector<HTMLElement>('.app-shell') ?? app);
+  restoreViewScroll();
   document.querySelector('#guide-skip')?.addEventListener('click', finishGuide);
   document.querySelector('#guide-next')?.addEventListener('click', () => { if (onboardingIndex + 1 < onboardingSteps.length) { onboardingIndex += 1; render(); } else finishGuide(); });
   document.querySelectorAll<HTMLButtonElement>('[data-guide-theme]').forEach(button => button.addEventListener('click', () => {
@@ -928,6 +1068,7 @@ function render(): void {
   bindSavedLibraryEvents();
   if (activeWorkspace === 'artist-mix') scheduleMixOrbitThreads();
   if (startupEntryPending) { startupEntryPending = false; window.setTimeout(() => document.querySelector('.startup-entry')?.classList.remove('startup-entry'), 240); }
+  renderedWorkspace = activeWorkspace;
 }
 
 function updatePrompt(): void {
@@ -936,7 +1077,15 @@ function updatePrompt(): void {
   if (fullOutput) fullOutput.textContent = prompt();
   if (artistOutput) artistOutput.textContent = buildArtistsPrompt(base.artists);
 }
+function hydratePreviewScope(scope: ParentNode): void {
+  const images = Array.from(scope.querySelectorAll(PREVIEW_IMAGE_SELECTOR)) as unknown as PreviewImageLike[];
+  for (const image of images) {
+    const cache = previewCacheForImage(image);
+    cache.hydrateImage(image, { priority: image.dataset.previewCache === 'grid' ? 'current-page' : 'background', isCurrent: () => true });
+  }
+}
 function bindPreviewFade(scope: ParentNode = document): void {
+  if (typeof previewCache !== 'undefined' && typeof hydratePreviewScope === 'function') hydratePreviewScope(scope);
   scope.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image').forEach(image => {
     const markReady = () => {
       if (image.naturalWidth <= 0) return;
@@ -944,8 +1093,15 @@ function bindPreviewFade(scope: ParentNode = document): void {
       const thumbnail = image.parentElement;
       if (thumbnail && typeof HTMLElement !== 'undefined' && thumbnail instanceof HTMLElement) thumbnail.classList.add('is-preview-ready');
     };
+    const markFailed = () => {
+      if (image.dataset) image.dataset.previewState = 'error';
+      image.classList.add('is-preview-error');
+      // The cache marks the parent ready for failed asynchronous jobs. The
+      // listener remains local-only for legacy/direct image failures.
+    };
     if (image.complete && image.naturalWidth > 0) markReady();
     else image.addEventListener('load', markReady, { once: true });
+    image.addEventListener('error', markFailed, { once: true });
   });
 }
 
@@ -1225,7 +1381,7 @@ function bindSavedLibraryEvents(): void {
   document.querySelector('#save-library-prompt')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
   document.querySelector('#save-library-mix')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'manual'));
   document.querySelector('#save-library-empty')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
-  document.querySelector('#saved-library-search')?.addEventListener('input', event => { savedLibrarySearch = (event.target as HTMLInputElement).value; render(); });
+  document.querySelector('#saved-library-search')?.addEventListener('input', event => { savedLibrarySearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
   document.querySelectorAll<HTMLButtonElement>('[data-library-filter]').forEach(button => button.addEventListener('click', () => { savedLibraryFilter = button.dataset.libraryFilter as typeof savedLibraryFilter; render(); }));
   document.querySelectorAll<HTMLButtonElement>('[data-library-copy]').forEach(button => button.addEventListener('click', () => {
     const item = savedLibrary.find(value => value.id === button.dataset.libraryCopy);
@@ -1295,17 +1451,17 @@ function bindEvents(): void {
   document.querySelector('#open-artist-picker-empty')?.addEventListener('click', event => openArtistPicker(event.currentTarget as HTMLElement));
   document.querySelector('#close-artist-picker')?.addEventListener('click', closeArtistPicker);
   document.querySelector('#artist-picker-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeArtistPicker(); });
-  document.querySelector('#artist-search')?.addEventListener('input', event => { artistSearch = (event.target as HTMLInputElement).value; artistPage = 1; refreshArtistGrid(); });
-  document.querySelector('#artist-favorites')?.addEventListener('click', () => { artistFavoritesOnly = !artistFavoritesOnly; artistPage = 1; refreshArtistGrid(); });
-  document.querySelector('#artist-previous')?.addEventListener('click', () => { artistPage -= 1; refreshArtistGrid(); });
-  document.querySelector('#artist-next')?.addEventListener('click', () => { artistPage += 1; refreshArtistGrid(); });
+  document.querySelector('#artist-search')?.addEventListener('input', event => { artistSearch = (event.target as HTMLInputElement).value; artistPage = 1; scheduleSearch(() => refreshArtistGrid({ resetScroll: true })); });
+  document.querySelector('#artist-favorites')?.addEventListener('click', () => { artistFavoritesOnly = !artistFavoritesOnly; artistPage = 1; refreshArtistGrid({ resetScroll: true }); });
+  document.querySelector('#artist-previous')?.addEventListener('click', () => { artistPage -= 1; refreshArtistGrid({ resetScroll: true }); });
+  document.querySelector('#artist-next')?.addEventListener('click', () => { artistPage += 1; refreshArtistGrid({ resetScroll: true }); });
   document.querySelector('#open-character-picker')?.addEventListener('click', event => openCharacterPicker(event.currentTarget as HTMLElement));
   document.querySelector('#close-character-picker')?.addEventListener('click', closeCharacterPicker);
   document.querySelector('#character-picker-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeCharacterPicker(); });
-  document.querySelector('#character-search')?.addEventListener('input', event => { characterSearch = (event.target as HTMLInputElement).value; characterPage = 1; refreshCharacterPicker(); });
-  document.querySelector('#character-favorites')?.addEventListener('click', () => { characterFavoritesOnly = !characterFavoritesOnly; characterPage = 1; refreshCharacterPicker(); });
-  document.querySelector('#character-previous')?.addEventListener('click', () => { characterPage -= 1; refreshCharacterPicker(); });
-  document.querySelector('#character-next')?.addEventListener('click', () => { characterPage += 1; refreshCharacterPicker(); });
+  document.querySelector('#character-search')?.addEventListener('input', event => { characterSearch = (event.target as HTMLInputElement).value; characterPage = 1; scheduleSearch(() => refreshCharacterPicker({ resetScroll: true })); });
+  document.querySelector('#character-favorites')?.addEventListener('click', () => { characterFavoritesOnly = !characterFavoritesOnly; characterPage = 1; refreshCharacterPicker({ resetScroll: true }); });
+  document.querySelector('#character-previous')?.addEventListener('click', () => { characterPage -= 1; refreshCharacterPicker({ resetScroll: true }); });
+  document.querySelector('#character-next')?.addEventListener('click', () => { characterPage += 1; refreshCharacterPicker({ resetScroll: true }); });
   document.querySelector('#random-favorites-only')?.addEventListener('click', () => {
     artistRandomFavoritesOnly = !artistRandomFavoritesOnly;
     const range = effectiveRandomRange();
@@ -1337,7 +1493,7 @@ function bindEvents(): void {
   document.querySelector('#close-constructor')?.addEventListener('click', closeConstructor);
   document.querySelector('#done-constructor')?.addEventListener('click', closeConstructor);
   document.querySelector('#constructor-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeConstructor(); });
-  document.querySelector('#constructor-search')?.addEventListener('input', event => { constructorSearch = (event.target as HTMLInputElement).value; refreshConstructorGrid(); });
+  document.querySelector('#constructor-search')?.addEventListener('input', event => { constructorSearch = (event.target as HTMLInputElement).value; scheduleSearch(refreshConstructorGrid); });
   bindConstructorGridEvents();
   bindCustomTagEvents();
   bindArtistCardPreview();
@@ -1387,37 +1543,17 @@ function clearConstructorImageWarmup(): void {
 }
 
 function queueConstructorImage(image: HTMLImageElement, priority = false): void {
-  if (!image.isConnected || !image.dataset.constructorImageSrc || image.dataset.constructorImageQueued === 'true') return;
-  image.dataset.constructorImageQueued = 'true';
-  const job = { image, token: constructorImageWarmupToken };
-  if (priority) constructorImageQueue.unshift(job);
-  else constructorImageQueue.push(job);
+  if (!image.isConnected || !image.dataset.constructorImageSrc) return;
+  contentPreviewCache.hydrateImage(image, { priority: priority ? 'visible' : 'background', isCurrent: () => modal === 'constructor' && constructorImageWarmupToken >= 0 });
 }
 
 function pumpConstructorImageWarmup(): void {
-  while (constructorImageLoads < CONSTRUCTOR_IMAGE_CONCURRENCY && constructorImageQueue.length) {
-    const job = constructorImageQueue.shift()!;
-    const { image } = job;
-    if (job.token !== constructorImageWarmupToken || !image.isConnected || !image.dataset.constructorImageSrc) continue;
-    const source = image.dataset.constructorImageSrc;
-    constructorImageLoads += 1;
-    image.dataset.constructorImageLoading = 'true';
-    const finish = (): void => {
-      constructorImageLoads -= 1;
-      if (image.isConnected) image.classList.add('is-loaded');
-      pumpConstructorImageWarmup();
-    };
-    image.addEventListener('load', finish, { once: true });
-    image.addEventListener('error', finish, { once: true });
-    image.decoding = 'async';
-    image.src = source;
-    delete image.dataset.constructorImageSrc;
-  }
+  // PreviewCache owns the shared foreground/background worker limits.
 }
 
 function warmConstructorImages(scope: ParentNode, priority = false): void {
   scope.querySelectorAll<HTMLImageElement>('img[data-constructor-image-src]').forEach(image => queueConstructorImage(image, priority));
-  pumpConstructorImageWarmup();
+  contentPreviewCache.hydrate(scope as unknown as PreviewRootLike, { priority: priority ? 'visible' : 'background', isCurrent: () => modal === 'constructor' });
 }
 
 function startConstructorImageWarmup(): void {
@@ -1561,7 +1697,7 @@ function deleteCustomPreset(presetId: string): void {
 
 function bindCustomTagEvents(): void {
   if (activeWorkspace !== 'custom-tags') return;
-  document.querySelector('#custom-tag-search')?.addEventListener('input', event => { customTagSearch = (event.target as HTMLInputElement).value; render(); });
+  document.querySelector('#custom-tag-search')?.addEventListener('input', event => { customTagSearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
   document.querySelectorAll<HTMLButtonElement>('[data-custom-filter]').forEach(button => button.addEventListener('click', () => { customTagFilter = button.dataset.customFilter as ConstructorZone | 'artist' | 'all'; render(); }));
   document.querySelectorAll<HTMLButtonElement>('[data-select-preset]').forEach(button => button.addEventListener('click', () => {
     selectedCustomPresetId = button.dataset.selectPreset === 'all' ? 'all' : (button.dataset.selectPreset ?? DEFAULT_CUSTOM_TAG_PRESET_ID);
@@ -1701,7 +1837,10 @@ async function deleteCustomTag(tagId: string): Promise<void> {
   render();
 }
 function closeArtistPicker(): void {
+  clearHoverPreviewCache();
   const picker = document.querySelector<HTMLElement>('#artist-picker-backdrop');
+  const grid = document.querySelector<HTMLElement>('#artist-grid');
+  if (grid) viewScrollTop.set(grid.id, grid.scrollTop);
   if (picker) picker.hidden = true;
   if (modal === 'artists') modal = null;
   const trigger = artistPickerTrigger;
@@ -1715,11 +1854,17 @@ function openCharacterPicker(trigger?: HTMLElement): void {
   characterPickerTrigger = trigger ?? document.activeElement as HTMLElement;
   modal = 'characters';
   picker.hidden = false;
+  // The picker markup is retained while hidden. Hydrate it on demand without
+  // rebinding the legacy load/error listeners every time the dialog reopens.
+  hydratePreviewScope(picker);
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#character-search')?.focus(), 0);
 }
 
 function closeCharacterPicker(): void {
+  clearHoverPreviewCache();
   const picker = document.querySelector<HTMLElement>('#character-picker-backdrop');
+  const grid = document.querySelector<HTMLElement>('#character-grid');
+  if (grid) viewScrollTop.set(grid.id, grid.scrollTop);
   if (picker) picker.hidden = true;
   if (modal === 'characters') modal = null;
   const trigger = characterPickerTrigger;
@@ -1728,14 +1873,14 @@ function closeCharacterPicker(): void {
 }
 
 function focusField(selector: string): void { window.setTimeout(() => document.querySelector<HTMLInputElement>(selector)?.focus(), 0); }
-function bindArtistEvents(): void {
-  document.querySelectorAll<HTMLButtonElement>('[data-add-artist]').forEach(button => button.addEventListener('click', () => addArtist(button.dataset.addArtist!)));
-  document.querySelectorAll<HTMLButtonElement>('[data-copy-artist]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.copyArtist); if (card) void copy(serializeTag(weighted(card)) ?? '', `[data-copy-artist="${card.catalogId ?? card.id}"]`); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-favorite-artist]').forEach(button => button.addEventListener('click', event => {
+function bindArtistEvents(scope: ParentNode = document): void {
+  scope.querySelectorAll<HTMLButtonElement>('[data-add-artist]').forEach(button => button.addEventListener('click', () => addArtist(button.dataset.addArtist!)));
+  scope.querySelectorAll<HTMLButtonElement>('[data-copy-artist]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.copyArtist); if (card) void copy(serializeTag(weighted(card)) ?? '', `[data-copy-artist="${card.catalogId ?? card.id}"]`); }));
+  scope.querySelectorAll<HTMLButtonElement>('[data-favorite-artist]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     toggleFavorite(button.dataset.favoriteArtist!, 'artists', true);
   }));
-  document.querySelectorAll<HTMLInputElement>('[data-artist-weight],[data-artist-range]').forEach(input => input.addEventListener('input', () => {
+  scope.querySelectorAll<HTMLInputElement>('[data-artist-weight],[data-artist-range]').forEach(input => input.addEventListener('input', () => {
     const id = input.dataset.artistWeight ?? input.dataset.artistRange;
     const item = base.artists.find(artist => artist.id === id);
     if (!item) return;
@@ -1746,14 +1891,14 @@ function bindArtistEvents(): void {
     updatePrompt();
     saveSoon();
   }));
-  document.querySelectorAll<HTMLButtonElement>('[data-reroll-weight]').forEach(button => button.addEventListener('click', () => {
+  scope.querySelectorAll<HTMLButtonElement>('[data-reroll-weight]').forEach(button => button.addEventListener('click', () => {
     const index = base.artists.findIndex(artist => artist.id === button.dataset.rerollWeight);
     if (index < 0) return;
     base.artists[index] = rerollArtistWeight(base.artists[index]);
     saveSoon();
     render();
   }));
-  document.querySelectorAll<HTMLButtonElement>('[data-remove-artist]').forEach(button => button.addEventListener('click', () => { base.artists = base.artists.filter(item => item.id !== button.dataset.removeArtist); render(); }));
+  scope.querySelectorAll<HTMLButtonElement>('[data-remove-artist]').forEach(button => button.addEventListener('click', () => { base.artists = base.artists.filter(item => item.id !== button.dataset.removeArtist); render(); }));
 }
 function bindCharacterEvents(): void {
   bindCharacterBlockEvents();
@@ -1793,32 +1938,47 @@ function bindCharacterPickerEvents(): void {
   }));
 }
 
-function refreshArtistGrid(options: { preserveScroll?: boolean; focusFavoriteId?: string } = {}): void {
+function refreshArtistGrid(options: { preserveScroll?: boolean; resetScroll?: boolean; focusFavoriteId?: string } = {}): void {
   const grid = document.querySelector<HTMLElement>('#artist-grid');
   if (!grid) return;
-  const previousScrollTop = options.preserveScroll ? grid.scrollTop : 0;
+  clearHoverPreviewCache();
+  const requestToken = ++previewPageToken;
+  const previousScrollTop = options.resetScroll ? 0 : options.preserveScroll ? grid.scrollTop : viewScrollTop.get(grid.id) ?? grid.scrollTop;
   const page = promptArtistPickerPage();
-  grid.innerHTML = page.cards.map(artistCard).join('') || `<p class="empty-inline" role="status">${artistFavoritesOnly ? 'No favorited V5 artists match this search.' : 'No V5 artists match this search.'}</p>`;
-  bindPreviewFade(grid);
-  grid.scrollTop = previousScrollTop;
-  const favoritesButton = document.querySelector<HTMLButtonElement>('#artist-favorites');
-  favoritesButton?.classList.toggle('on', artistFavoritesOnly);
-  favoritesButton?.setAttribute('aria-pressed', String(artistFavoritesOnly));
-  const count = document.querySelector<HTMLElement>('#artist-count');
-  if (count) count.textContent = `${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`;
+  updatePreviewLeases('artist-page', page.cards);
   const pageStatus = document.querySelector<HTMLElement>('#artist-page-status');
-  if (pageStatus) pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0';
-  const previous = document.querySelector<HTMLButtonElement>('#artist-previous');
-  const next = document.querySelector<HTMLButtonElement>('#artist-next');
-  if (previous) previous.disabled = !page.hasPrevious;
-  if (next) next.disabled = !page.hasNext;
-  bindArtistEvents();
-  bindArtistCardPreview();
-  if (options.focusFavoriteId) {
-    const favoriteButton = Array.from(grid.querySelectorAll<HTMLButtonElement>('[data-favorite-artist]'))
-      .find(button => button.dataset.favoriteArtist === options.focusFavoriteId);
-    favoriteButton?.focus({ preventScroll: true });
-  }
+  if (pageStatus) { pageStatus.textContent = 'Preparing page…'; pageStatus.setAttribute('aria-busy', 'true'); }
+  grid.setAttribute('aria-busy', 'true');
+  void Promise.all(page.cards.map(card => contentOrGridPreviewCache(card).load(catalogImage(card), 'current-page'))).then(() => {
+    if (requestToken !== previewPageToken || !grid.isConnected) return;
+    grid.dataset.previewPage = previewPageGroupIdentity('artist', page.page, artistSearch) + `:${artistFavoritesOnly}`;
+    grid.innerHTML = page.cards.map(artistCard).join('') || `<p class="empty-inline" role="status">${artistFavoritesOnly ? 'No favorited V5 artists match this search.' : 'No V5 artists match this search.'}</p>`;
+    bindPreviewFade(grid);
+    grid.scrollTop = previousScrollTop;
+    viewScrollTop.set(grid.id, grid.scrollTop);
+    const favoritesButton = document.querySelector<HTMLButtonElement>('#artist-favorites');
+    favoritesButton?.classList.toggle('on', artistFavoritesOnly);
+    favoritesButton?.setAttribute('aria-pressed', String(artistFavoritesOnly));
+    const count = document.querySelector<HTMLElement>('#artist-count');
+    if (count) count.textContent = `${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`;
+    if (pageStatus) { pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0'; pageStatus.removeAttribute('aria-busy'); }
+    grid.removeAttribute('aria-busy');
+    const previous = document.querySelector<HTMLButtonElement>('#artist-previous');
+    const next = document.querySelector<HTMLButtonElement>('#artist-next');
+    if (previous) previous.disabled = !page.hasPrevious;
+    if (next) next.disabled = !page.hasNext;
+    bindArtistEvents();
+    bindArtistCardPreview();
+    prefetchAdjacentArtistPages(page, artistFavoritesOnly);
+    if (options.focusFavoriteId) {
+      const favoriteButton = Array.from(grid.querySelectorAll<HTMLButtonElement>('[data-favorite-artist]')).find(button => button.dataset.favoriteArtist === options.focusFavoriteId);
+      favoriteButton?.focus({ preventScroll: true });
+    }
+  }).catch(() => {
+    if (requestToken !== previewPageToken) return;
+    if (pageStatus) { pageStatus.textContent = 'Preview unavailable · Retry'; pageStatus.removeAttribute('aria-busy'); }
+    grid.removeAttribute('aria-busy');
+  });
 }
 
 function renderCharacterList(): void {
@@ -1829,7 +1989,7 @@ function renderCharacterList(): void {
   bindCharacterBlockEvents();
 }
 
-function refreshCharacterPicker(): void {
+function refreshCharacterPicker(options: { resetScroll?: boolean } = {}): void {
   const grid = document.querySelector<HTMLElement>('#character-grid');
   const status = document.querySelector<HTMLElement>('#character-picker-status');
   const count = document.querySelector<HTMLElement>('#character-picker-count');
@@ -1837,27 +1997,53 @@ function refreshCharacterPicker(): void {
   const previous = document.querySelector<HTMLButtonElement>('#character-previous');
   const next = document.querySelector<HTMLButtonElement>('#character-next');
   if (!grid || !status || !count || !pageStatus || !previous || !next) return;
+  clearHoverPreviewCache();
+  const requestToken = ++previewPageToken;
+  const previousScrollTop = options.resetScroll ? 0 : viewScrollTop.get(grid.id) ?? grid.scrollTop;
   const page = paginateCharacters(catalog.characters, { query: characterSearch, favoritesOnly: characterFavoritesOnly, favoriteIds: characterFavorites, page: characterPage });
   characterPage = page.page;
-  grid.innerHTML = page.cards.map(characterCard).join('');
-  bindPreviewFade(grid);
-  status.innerHTML = characterPickerStatus(page);
-  count.textContent = `${page.filteredCount.toLocaleString()} of ${catalog.characters.length.toLocaleString()} cards`;
-  pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0';
-  previous.disabled = !page.hasPrevious;
-  next.disabled = !page.hasNext;
-  const favoritesButton = document.querySelector<HTMLButtonElement>('#character-favorites');
-  favoritesButton?.classList.toggle('on', characterFavoritesOnly);
-  favoritesButton?.setAttribute('aria-pressed', String(characterFavoritesOnly));
-  bindCharacterPickerEvents();
-  status.querySelector('#retry-catalog-character')?.addEventListener('click', () => { closeCharacterPicker(); catalogState = 'loading'; catalogError = ''; render(); void loadCatalog(); });
+  pageStatus.textContent = 'Preparing page…'; pageStatus.setAttribute('aria-busy', 'true'); grid.setAttribute('aria-busy', 'true');
+  void Promise.all(page.cards.map(card => contentPreviewCache.load(catalogImage(card), 'current-page'))).then(() => {
+    if (requestToken !== previewPageToken || !grid.isConnected) return;
+    grid.dataset.previewPage = previewPageGroupIdentity('character', page.page, characterSearch) + `:${characterFavoritesOnly}`;
+    grid.innerHTML = page.cards.map(characterCard).join('');
+    bindPreviewFade(grid);
+    grid.scrollTop = previousScrollTop;
+    viewScrollTop.set(grid.id, grid.scrollTop);
+    status.innerHTML = characterPickerStatus(page);
+    count.textContent = `${page.filteredCount.toLocaleString()} of ${catalog.characters.length.toLocaleString()} cards`;
+    pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0'; pageStatus.removeAttribute('aria-busy'); grid.removeAttribute('aria-busy');
+    previous.disabled = !page.hasPrevious;
+    next.disabled = !page.hasNext;
+    const favoritesButton = document.querySelector<HTMLButtonElement>('#character-favorites');
+    favoritesButton?.classList.toggle('on', characterFavoritesOnly);
+    favoritesButton?.setAttribute('aria-pressed', String(characterFavoritesOnly));
+    bindCharacterPickerEvents();
+    prefetchAdjacentCharacterPages(page);
+    status.querySelector('#retry-catalog-character')?.addEventListener('click', () => { closeCharacterPicker(); catalogState = 'loading'; catalogError = ''; render(); void loadCatalog(); });
+  }).catch(() => { if (requestToken !== previewPageToken) return; pageStatus.textContent = 'Preview unavailable · Retry'; pageStatus.removeAttribute('aria-busy'); grid.removeAttribute('aria-busy'); });
 }
 function addArtist(cardId: string): void {
   const card = catalog.artists.find(item => (item.catalogId ?? item.id) === cardId);
   if (!card || base.artists.some(item => item.catalogId === (card.catalogId ?? card.id))) return;
-  base.artists.push(weighted(card));
-  render();
-  openArtistPicker(document.querySelector<HTMLElement>('#open-artist-picker') ?? undefined);
+  clearHoverPreviewCache();
+  const added = weighted(card);
+  base.artists.push(added);
+  saveSoon();
+  const selectedGrid = document.querySelector<HTMLElement>('.selected-artist-grid');
+  if (!selectedGrid) { render(); return; }
+  const emptyCard = selectedGrid.querySelector<HTMLElement>('#open-artist-picker-empty');
+  emptyCard?.insertAdjacentHTML('beforebegin', selectedArtistMarkup(added));
+  const selectedCount = selectedGrid.closest<HTMLElement>('.selected-artists')?.querySelector('h3 span');
+  if (selectedCount) selectedCount.textContent = String(base.artists.length);
+  const pickerCard = document.querySelector<HTMLElement>(`[data-add-artist="${CSS.escape(cardId)}"]`);
+  pickerCard?.closest<HTMLElement>('.artist-card')?.classList.add('selected');
+  pickerCard?.setAttribute('aria-pressed', 'true');
+  const addedElement = selectedGrid.querySelector<HTMLElement>(`[data-selected-artist="${CSS.escape(added.id)}"]`);
+  bindArtistEvents(addedElement ?? selectedGrid);
+  bindPreviewFade(selectedGrid);
+  bindArtistCardPreview(selectedGrid);
+  updatePrompt();
   focusField('#artist-search');
 }
 
@@ -1977,7 +2163,10 @@ function rerollMixStrength(): void {
   syncMixWeightState(nextMix, changedIds, document.activeElement as HTMLElement | null, notice);
 }
 function closeMixPicker(): void {
+  clearHoverPreviewCache();
   const picker = document.querySelector<HTMLElement>('#mix-picker-backdrop');
+  const grid = document.querySelector<HTMLElement>('#mix-artist-grid');
+  if (grid) viewScrollTop.set(grid.id, grid.scrollTop);
   if (picker) picker.hidden = true;
   if (modal === 'artists') modal = null;
   clearArtistCardPreview();
@@ -1993,34 +2182,50 @@ function openMixPicker(mode: 'primary' | 'companion' | 'replace-anchor' = 'prima
   if (!picker) return;
   mixPickerMode = mode;
   mixPickerReplaceTarget = mode === 'replace-anchor' ? replaceTarget ?? null : null;
-  mixArtistPage = 1;
   mixPickerTrigger = trigger ?? document.activeElement as HTMLElement;
   modal = 'artists';
   picker.hidden = false;
   refreshMixPicker();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#mix-artist-search')?.focus(), 0);
 }
-function refreshMixPicker(): void {
+function refreshMixPicker(options: { resetScroll?: boolean } = {}): void {
   const grid = document.querySelector<HTMLElement>('#mix-artist-grid');
   if (!grid) return;
+  clearHoverPreviewCache();
+  const requestToken = ++previewPageToken;
+  const previousScrollTop = options.resetScroll ? 0 : viewScrollTop.get(grid.id) ?? grid.scrollTop;
   const page = currentMixArtistPickerPage();
+  updatePreviewLeases('mix-page', page.cards);
   const replaceTarget = mixPickerReplaceTarget ? artistMix.anchors.find(item => item.id === mixPickerReplaceTarget) : undefined;
   const replaceTargetStableId = replaceTarget ? replaceTarget.catalogId ?? replaceTarget.id : null;
-  grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
-  bindPreviewFade(grid);
-  grid.scrollTop = 0;
-  document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
   const pageStatus = document.querySelector<HTMLElement>('#mix-artist-page-status');
-  if (pageStatus) pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0';
-  const previous = document.querySelector<HTMLButtonElement>('#mix-artist-previous');
-  const next = document.querySelector<HTMLButtonElement>('#mix-artist-next');
-  if (previous) previous.disabled = !page.hasPrevious;
-  if (next) next.disabled = !page.hasNext;
-  const favoritesButton = document.querySelector<HTMLButtonElement>('#mix-picker-favorites');
-  favoritesButton?.classList.toggle('on', artistMix.favoritesOnly);
-  favoritesButton?.setAttribute('aria-pressed', String(artistMix.favoritesOnly));
-  grid.querySelectorAll<HTMLButtonElement>('[data-mix-pick]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.mixPick); if (card) mixPickerMode === 'companion' ? addMixCompanion(card) : mixPickerMode === 'replace-anchor' ? replaceMixAnchor(card) : setMixPrimary(card); }));
-  bindArtistCardPreview();
+  if (pageStatus) { pageStatus.textContent = 'Preparing page…'; pageStatus.setAttribute('aria-busy', 'true'); }
+  grid.setAttribute('aria-busy', 'true');
+  void Promise.all(page.cards.map(card => contentOrGridPreviewCache(card).load(catalogImage(card), 'current-page'))).then(() => {
+    if (requestToken !== previewPageToken || !grid.isConnected) return;
+    grid.dataset.previewPage = previewPageGroupIdentity('mix', page.page, artistSearch) + `:${artistMix.favoritesOnly}`;
+    grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; const official = isOfficialArtistCard(card); return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-official="${official}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img data-preview-cache="${official ? 'grid' : 'content'}" data-preview-src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
+    bindPreviewFade(grid);
+    grid.scrollTop = previousScrollTop;
+    viewScrollTop.set(grid.id, grid.scrollTop);
+    document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
+    if (pageStatus) { pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0'; pageStatus.removeAttribute('aria-busy'); }
+    grid.removeAttribute('aria-busy');
+    const previous = document.querySelector<HTMLButtonElement>('#mix-artist-previous');
+    const next = document.querySelector<HTMLButtonElement>('#mix-artist-next');
+    if (previous) previous.disabled = !page.hasPrevious;
+    if (next) next.disabled = !page.hasNext;
+    const favoritesButton = document.querySelector<HTMLButtonElement>('#mix-picker-favorites');
+    favoritesButton?.classList.toggle('on', artistMix.favoritesOnly);
+    favoritesButton?.setAttribute('aria-pressed', String(artistMix.favoritesOnly));
+    grid.querySelectorAll<HTMLButtonElement>('[data-mix-pick]').forEach(button => button.addEventListener('click', () => { const card = catalog.artists.find(item => (item.catalogId ?? item.id) === button.dataset.mixPick); if (card) mixPickerMode === 'companion' ? addMixCompanion(card) : mixPickerMode === 'replace-anchor' ? replaceMixAnchor(card) : setMixPrimary(card); }));
+    bindArtistCardPreview();
+    prefetchAdjacentArtistPages(page, artistMix.favoritesOnly);
+  }).catch(() => {
+    if (requestToken !== previewPageToken) return;
+    if (pageStatus) { pageStatus.textContent = 'Preview unavailable · Retry'; pageStatus.removeAttribute('aria-busy'); }
+    grid.removeAttribute('aria-busy');
+  });
 }
 function bindArtistMixEvents(): void {
   document.querySelector('#enter-mix-focus')?.addEventListener('click', () => { focusMode = true; render(); });
@@ -2035,10 +2240,10 @@ function bindArtistMixEvents(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-mix-replace-anchor]').forEach(button => button.addEventListener('click', event => openMixPicker('replace-anchor', event.currentTarget as HTMLElement, button.dataset.mixReplaceAnchor)));
   document.querySelector('#close-mix-picker')?.addEventListener('click', closeMixPicker);
   document.querySelector('#mix-picker-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeMixPicker(); });
-  document.querySelector('#mix-artist-search')?.addEventListener('input', event => { artistSearch = (event.target as HTMLInputElement).value; mixArtistPage = 1; refreshMixPicker(); });
-  document.querySelector('#mix-picker-favorites')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; mixArtistPage = 1; saveArtistMixSoon(); refreshMixPicker(); });
-  document.querySelector('#mix-artist-previous')?.addEventListener('click', () => { mixArtistPage -= 1; refreshMixPicker(); });
-  document.querySelector('#mix-artist-next')?.addEventListener('click', () => { mixArtistPage += 1; refreshMixPicker(); });
+  document.querySelector('#mix-artist-search')?.addEventListener('input', event => { artistSearch = (event.target as HTMLInputElement).value; mixArtistPage = 1; scheduleSearch(() => refreshMixPicker({ resetScroll: true })); });
+  document.querySelector('#mix-picker-favorites')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; mixArtistPage = 1; saveArtistMixSoon(); refreshMixPicker({ resetScroll: true }); });
+  document.querySelector('#mix-artist-previous')?.addEventListener('click', () => { mixArtistPage -= 1; refreshMixPicker({ resetScroll: true }); });
+  document.querySelector('#mix-artist-next')?.addEventListener('click', () => { mixArtistPage += 1; refreshMixPicker({ resetScroll: true }); });
   document.querySelector('#mix-favorites-only')?.addEventListener('click', () => { artistMix = { ...artistMix, favoritesOnly: !artistMix.favoritesOnly }; saveArtistMixSoon(); syncMixBehaviorControls(); });
   document.querySelector('#mix-anchor-weights-lock')?.addEventListener('click', () => {
     artistMix = { ...artistMix, anchorWeightsLocked: !artistMix.anchorWeightsLocked };
@@ -2116,6 +2321,12 @@ function bindSettingsEvents(): void {
     settings = { ...settings, preloadCharacterPreviews: (event.target as HTMLInputElement).checked };
     saveSettings(settings);
     render();
+  });
+  document.querySelector<HTMLSelectElement>('#preview-cache-preset')?.addEventListener('change', event => {
+    const previewCachePreset = normalizePreviewCachePreset((event.target as HTMLSelectElement).value);
+    settings = { ...settings, previewCachePreset };
+    applyPreviewCachePreset(previewCachePreset);
+    saveSettings(settings);
   });
   document.querySelector<HTMLSelectElement>('#studio-theme')?.addEventListener('change', event => {
     const value = (event.target as HTMLSelectElement).value;
@@ -2255,6 +2466,7 @@ async function startCatalogUpdate(): Promise<void> {
     const previousById = new Map(previousArtists.map(card => [card.catalogId ?? card.id, card]));
     officialArtists = result.catalog.artists;
     catalog = { ...result.catalog, artists: [] };
+    invalidateOfficialPreviewCatalog(catalogRevision(result.catalog));
     rebuildEffectiveArtistCatalog();
     catalogState = 'ready';
     const changedCards = officialArtists.filter(card => {
@@ -2266,10 +2478,15 @@ async function startCatalogUpdate(): Promise<void> {
       const status = document.querySelector<HTMLElement>('#catalog-update-status');
       if (status) status.textContent = catalogUpdateStatus;
     }
-    const previewResult = await decodePreviews(changedCards, decodePreview, 6, (completed, total) => {
-      const status = document.querySelector<HTMLElement>('#catalog-update-status');
-      if (status) status.textContent = `Warming changed previews · ${completed.toLocaleString()} / ${total.toLocaleString()}`;
-    });
+    for (const card of changedCards) {
+      const cache = isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
+      cache.invalidateSources([catalogImage(card)]);
+    }
+    const previewResult = { failed: [] as CatalogCard[] };
+    await Promise.all(changedCards.slice(0, 144).map(async card => {
+      const ok = await decodePreview(card, 'background');
+      if (!ok) previewResult.failed.push(card);
+    }));
     randomRange = normalizeRange(randomRange, catalog.artists.length);
     catalogUpdateStatus = `${result.added ? `+${result.added} artists` : '0 new artists'}${previewResult.failed.length ? `. ${previewResult.failed.length} preview${previewResult.failed.length === 1 ? '' : 's'} failed.` : ''}`;
     randomNotice = result.added ? `Catalog refreshed with +${result.added} artists.` : 'Catalog is already up to date.';
@@ -2332,9 +2549,27 @@ function toggleFavorite(cardId: string, kind: 'artists' | 'characters', preserve
   if (values.has(cardId)) values.delete(cardId); else values.add(cardId);
   saveFavorites(values, kind);
   if (kind === 'artists') {
-    refreshArtistGrid({ preserveScroll: preserveArtistScroll, focusFavoriteId: preserveArtistScroll ? cardId : undefined });
+    if (!artistFavoritesOnly) {
+      document.querySelectorAll<HTMLButtonElement>(`[data-favorite-artist="${CSS.escape(cardId)}"]`).forEach(button => {
+        const favorite = values.has(cardId);
+        button.classList.toggle('is-favorite', favorite);
+        button.setAttribute('aria-label', favorite ? 'Remove favorite' : 'Add favorite');
+      });
+      syncMixBehaviorControls();
+      return;
+    }
+    refreshArtistGrid({ preserveScroll: preserveArtistScroll, resetScroll: !preserveArtistScroll, focusFavoriteId: preserveArtistScroll ? cardId : undefined });
   } else {
-    refreshCharacterPicker();
+    if (!characterFavoritesOnly) {
+      const button = document.querySelector<HTMLButtonElement>(`[data-favorite-character="${CSS.escape(cardId)}"]`);
+      if (button) {
+        const favorite = values.has(cardId);
+        button.classList.toggle('is-favorite', favorite);
+        button.setAttribute('aria-label', favorite ? 'Remove favorite' : 'Add favorite');
+      }
+      return;
+    }
+    refreshCharacterPicker({ resetScroll: true });
   }
 }
 function resetPrompt(): void { base = emptyBase(); characters = []; randomRange = { ...DEFAULT_RANGE }; favoriteRandomRange = null; saveSoon(); render(); }
@@ -2370,6 +2605,7 @@ async function loadCatalog(): Promise<void> {
     if (!Array.isArray(loaded.artists) || !Array.isArray(loaded.characters)) throw new Error('Catalog snapshot is missing artist or character arrays');
     officialArtists = loaded.artists;
     catalog = { ...emptyCatalog(), ...loaded, artists: [], characters: loaded.characters, tags: loaded.tags ?? FALLBACK_TAGS } as OfflineCatalog;
+    invalidateOfficialPreviewCatalog(catalogRevision(catalog));
     rebuildEffectiveArtistCatalog();
     catalogState = 'ready';
     catalogError = '';
@@ -2439,25 +2675,29 @@ function openStudioAfterStartup(): void {
   void refreshComponentStatuses();
   window.setTimeout(() => { if (settings.updateCatalogOnStartup) void startCatalogUpdate(); if (settings.checkAppUpdatesOnStartup) void checkAppUpdate(false); }, 500);
 }
-async function decodePreview(card: CatalogCard): Promise<boolean> {
+async function decodePreview(card: CatalogCard, priority: PreviewPriority = 'background'): Promise<boolean> {
   if (typeof Image === 'undefined') return true;
-  const image = new Image();
-  image.decoding = 'async';
-  image.src = catalogImage(card);
-  try {
-    if (typeof image.decode === 'function') await image.decode();
-    else await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Image failed')); });
-    return true;
-  } catch { return false; }
-  finally { image.onload = null; image.onerror = null; image.src = ''; }
+  const cache = isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
+  const result = await cache.load(catalogImage(card), priority);
+  return result.state === 'ready';
 }
-async function preloadCards(cards: CatalogCard[], phase: string): Promise<CatalogCard[]> {
+async function preloadCards(cards: CatalogCard[], phase: string, priority: PreviewPriority = 'visible'): Promise<CatalogCard[]> {
   startupPhase = phase;
   const completedBeforePhase = startupCompleted;
   const retryIds = new Set(cards.map(card => card.catalogId ?? card.id));
   startupFailedCards = startupFailedCards.filter(card => !retryIds.has(card.catalogId ?? card.id));
   renderStartup();
-  const result = await decodePreviews(cards, decodePreview, 6, (completed) => { startupCompleted = completedBeforePhase + completed; renderStartup(); });
+  const failed: CatalogCard[] = [];
+  let completed = 0;
+  await Promise.all(cards.map(async card => {
+    let ok = false;
+    try { ok = await decodePreview(card, priority); } catch { ok = false; }
+    if (!ok) failed.push(card);
+    completed += 1;
+    startupCompleted = completedBeforePhase + completed;
+    renderStartup();
+  }));
+  const result = { failed, completed, total: cards.length };
   startupFailedCards = [...startupFailedCards, ...result.failed];
   startupFailures = startupFailedCards.map(card => card.tag);
   renderStartup();
@@ -2466,6 +2706,10 @@ async function preloadCards(cards: CatalogCard[], phase: string): Promise<Catalo
 async function retryStartupFailures(): Promise<void> {
   const failed = [...startupFailedCards];
   if (!failed.length) return;
+  for (const card of failed) {
+    const cache = isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
+    cache.invalidateSources([catalogImage(card)]);
+  }
   startupBusy = true;
   startupCompleted = 0;
   startupTotal = failed.length;
@@ -2481,6 +2725,111 @@ async function retryStartupFailures(): Promise<void> {
     renderStartup();
   }
 }
+
+const STARTUP_ARTIST_PAGE_SIZE = 72;
+const STARTUP_BLOCKING_PREVIEW_LIMIT = STARTUP_ARTIST_PAGE_SIZE;
+const STARTUP_IDLE_SOURCE_LIMIT = 24;
+
+function startupCardIds(cards: readonly CatalogCard[]): string[] {
+  return cards.map(card => card.catalogId ?? card.id);
+}
+
+function startupCatalogCards(): CatalogCard[] {
+  const firstArtistPage = paginateArtists(catalog.artists, { page: 1, pageSize: STARTUP_ARTIST_PAGE_SIZE }).cards;
+  const firstFavoritesPage = paginateArtists(catalog.artists, { page: 1, pageSize: STARTUP_ARTIST_PAGE_SIZE, favoritesOnly: true, favoriteIds: artistFavorites }).cards;
+  const selectedIds = base.artists.map(item => item.catalogId ?? item.id);
+  const anchors = artistMix.anchors.map(item => item.catalogId ?? item.id);
+  const companions = artistMix.companions.map(item => item.catalogId ?? item.id);
+  const visibleIds = startupCardIds([...firstArtistPage, ...firstFavoritesPage]);
+  const artistCards = buildWarmupPlan(catalog.artists, {
+    selected: selectedIds,
+    anchors,
+    companions,
+    visible: visibleIds,
+    initialLimit: Math.max(STARTUP_ARTIST_PAGE_SIZE, visibleIds.length + selectedIds.length + anchors.length + companions.length),
+    includeCatalogRemainder: false
+  });
+  if (!settings.preloadCharacterPreviews) return artistCards;
+  const firstCharacterPage = paginateCharacters(catalog.characters, { page: 1 }).cards;
+  const firstCharacterFavoritesPage = paginateCharacters(catalog.characters, { page: 1, favoritesOnly: true, favoriteIds: characterFavorites }).cards;
+  const characterIds = startupCardIds([...firstCharacterPage, ...firstCharacterFavoritesPage]);
+  return [...artistCards, ...buildWarmupPlan(catalog.characters, { visible: characterIds, initialLimit: characterIds.length, includeCatalogRemainder: false })];
+}
+
+function startupBlockingCards(warmup: readonly CatalogCard[]): CatalogCard[] {
+  const firstArtistIds = new Set(startupCardIds(paginateArtists(catalog.artists, { page: 1, pageSize: STARTUP_ARTIST_PAGE_SIZE }).cards));
+  const selectedMixIds = new Set([
+    ...base.artists.map(item => item.catalogId ?? item.id),
+    ...artistMix.anchors.map(item => item.catalogId ?? item.id),
+    ...artistMix.companions.map(item => item.catalogId ?? item.id)
+  ]);
+  const critical = warmup.filter(card => {
+    const idValue = card.catalogId ?? card.id;
+    return firstArtistIds.has(idValue) || selectedMixIds.has(idValue);
+  });
+  // A small/empty catalog still uses the bounded prefix, while a normal
+  // catalog always keeps the complete first artist page in the budgeted set.
+  return critical.length >= STARTUP_BLOCKING_PREVIEW_LIMIT ? critical : warmup.slice(0, STARTUP_BLOCKING_PREVIEW_LIMIT);
+}
+
+function startupUserPreviewSources(): string[] {
+  const sources = new Set<string>();
+  for (const item of savedLibraryItems().slice(0, STARTUP_IDLE_SOURCE_LIMIT)) {
+    const image = libraryImageUrl(item);
+    if (image) sources.add(image);
+  }
+  for (const item of customTags.slice(0, STARTUP_IDLE_SOURCE_LIMIT)) {
+    const image = customTagImageUrl(item);
+    if (image && image !== './plus.png') sources.add(image);
+  }
+  return [...sources];
+}
+
+function prefetchCatalogCards(cards: readonly CatalogCard[]): void {
+  for (const card of cards) {
+    const source = catalogImage(card);
+    // Prefetches retain only cache state; they never touch the current DOM.
+    const cache = isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
+    void cache.load(source, 'background').catch(() => {});
+  }
+}
+
+function prefetchAdjacentArtistPages(page: ReturnType<typeof paginateArtists>, favoritesOnly = false): void {
+  const adjacent: CatalogCard[] = [];
+  if (page.hasNext) adjacent.push(...paginateArtists(catalog.artists, { query: artistSearch, favoritesOnly, favoriteIds: artistFavorites, page: page.page + 1 }).cards);
+  if (page.hasPrevious) adjacent.push(...paginateArtists(catalog.artists, { query: artistSearch, favoritesOnly, favoriteIds: artistFavorites, page: page.page - 1 }).cards);
+  const identity = `${favoritesOnly ? 'favorites' : 'all'}:${artistSearch}:${page.page}`;
+  retainRecentArtistPage(identity, adjacent);
+  prefetchCatalogCards(adjacent);
+  const favorites = paginateArtists(catalog.artists, { query: '', favoritesOnly: true, favoriteIds: artistFavorites, page: 1 }).cards;
+  gridPreviewCache.setLease('favorites-first-page', favorites.map(officialThumbnailSource).filter((source): source is string => Boolean(source)));
+}
+
+function prefetchAdjacentCharacterPages(page: ReturnType<typeof paginateCharacters>): void {
+  const adjacent: CatalogCard[] = [];
+  if (page.hasNext) adjacent.push(...paginateCharacters(catalog.characters, { query: characterSearch, favoritesOnly: characterFavoritesOnly, favoriteIds: characterFavorites, page: page.page + 1 }).cards);
+  if (page.hasPrevious) adjacent.push(...paginateCharacters(catalog.characters, { query: characterSearch, favoritesOnly: characterFavoritesOnly, favoriteIds: characterFavorites, page: page.page - 1 }).cards);
+  prefetchCatalogCards(adjacent);
+}
+
+function scheduleStartupIdlePreviews(cards: readonly CatalogCard[], sources: readonly string[]): void {
+  previewIdleCancel?.();
+  const warmupJobs: Array<{ source: string; card?: CatalogCard }> = [
+    ...cards.map(card => ({ source: catalogImage(card), card })),
+    ...sources.map(source => ({ source, card: undefined }))
+  ];
+  const jobs = uniqueWarmupItems(warmupJobs, job => job.source);
+  const run = scheduleIdleWarmup(jobs, async job => {
+    try {
+      const cache = job.card ? contentOrGridPreviewCache(job.card) : contentPreviewCache;
+      return (await cache.load(job.source, 'background')).state === 'ready';
+    }
+    catch { return false; }
+  }, 0, callback => window.setTimeout(callback, 16), 1);
+  previewIdleCancel = run.cancel;
+  run.startIdle();
+}
+
 async function bootApp(): Promise<void> {
   await loadCatalogMode();
   startupBusy = true;
@@ -2510,27 +2859,30 @@ async function bootApp(): Promise<void> {
   }
   await Promise.all([loadCatalog(), loadGuide()]);
   if (catalogState !== 'ready') { startupError = catalogError || 'The V5 catalog could not be loaded.'; startupBusy = false; renderStartup(); return; }
-  const selectedIds = base.artists.map(item => item.catalogId ?? item.id);
-  const anchorIds = [...artistMix.anchors, ...artistMix.companions].map(item => item.catalogId ?? item.id);
-  const artistWarmup = buildWarmupPlan(catalog.artists, { selected: selectedIds, anchors: anchorIds, visible: catalog.artists.slice(0, 72).map(card => card.catalogId ?? card.id), initialLimit: catalog.artists.length });
-  const characterWarmup = settings.preloadCharacterPreviews ? buildWarmupPlan(catalog.characters, { visible: catalog.characters.slice(0, 24).map(card => card.catalogId ?? card.id), initialLimit: catalog.characters.length }) : [];
-  const warmup = [...artistWarmup, ...characterWarmup];
-  startupTotal = warmup.length;
+  const warmup = startupCatalogCards();
+  const blocking = startupBlockingCards(warmup);
+  const blockingIds = new Set(blocking.map(card => card.catalogId ?? card.id));
+  const idleCards = warmup.filter(card => !blockingIds.has(card.catalogId ?? card.id));
+  const startupSources = startupUserPreviewSources();
+  startupTotal = blocking.length;
   startupCompleted = 0;
+  startupReady = false;
+  startupBusy = true;
+  startupPhase = 'Preparing card previews';
+  renderStartup();
+  // Entry is gated on the complete first official page plus selected/Mix
+  // thumbnails. Every card has bounded terminal success/failure, so a broken
+  // image cannot leave the startup view in an infinite skeleton state.
+  await preloadCards(blocking, 'Preparing card previews', 'visible');
   startupReady = true;
   startupBusy = false;
   startupPhase = 'Opening studio';
-  // Component verification and compact metadata are the startup gate. Image
-  // decode runs behind the workspace in a bounded adaptive idle queue.
   openStudioAfterStartup();
-  scheduleIdleWarmup(warmup, async card => {
-    const ok = await decodePreview(card);
-    startupCompleted += 1;
-    if (!ok) startupFailedCards = [...startupFailedCards, card];
-    startupFailures = startupFailedCards.map(item => item.tag);
-    if (startupCompleted >= startupTotal && startupFailures.length) startupPhase = 'Preview loading paused';
-    return ok;
-  }, 0, callback => window.setTimeout(callback, 0), 6).startIdle();
+  const pageTwo = paginateArtists(catalog.artists, { page: 2, pageSize: STARTUP_ARTIST_PAGE_SIZE }).cards;
+  const favoritesFirst = paginateArtists(catalog.artists, { page: 1, pageSize: STARTUP_ARTIST_PAGE_SIZE, favoritesOnly: true, favoriteIds: artistFavorites }).cards;
+  // Keep the first background groups deterministic: page 2, then the first
+  // Favorites page, then any remaining startup cards and user-owned sources.
+  scheduleStartupIdlePreviews([...pageTwo, ...favoritesFirst, ...idleCards], startupSources);
 }
 
 applyAnimationMode(animationMode);
@@ -2540,6 +2892,6 @@ bindComponentProgress();
 renderStartup();
 void bootApp();
 window.addEventListener('resize', scheduleMixOrbitThreads);
-window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); });
+window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); previewIdleCancel?.(); gridPreviewCache.dispose(); contentPreviewCache.dispose(); hoverPreviewCache.dispose(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); });
 
 export { normalizeRange, randomizeArtists, prompt };
