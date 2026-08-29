@@ -12,10 +12,9 @@ function run(command, args) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-// Packaging is closed over a complete, freshly generated component set. This
-// runs before electron-builder so a thin desktop build can never silently ship
-// compact metadata with missing catalog descriptors/packs.
-run(process.execPath, [join(projectRoot, 'tools', 'catalog-packs.mjs')]);
+// Packaging reuses the immutable v0.6.3 component set. The app hotfix is
+// deliberately decoupled from catalog repacking so existing public URLs and
+// hashes remain stable.
 const descriptor = join(projectRoot, 'release-v5', 'catalog-packs', 'catalog-components.json');
 if (!existsSync(descriptor)) throw new Error(`Catalog component descriptor is missing: ${descriptor}`);
 const descriptors = normalizeDescriptors(JSON.parse(readFileSync(descriptor, 'utf8')));

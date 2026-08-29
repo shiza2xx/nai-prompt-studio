@@ -12,7 +12,7 @@ internal static class Program
     // Must stay aligned with the Electron executable, taskbar identity and NSIS shortcuts.
     private const string CanonicalApplicationExecutable = "NAI Prompt Studio.exe";
     private const int FooterSize = 96;
-    private const string FooterMagic = "NAISETUPV0630000";
+    private const string FooterMagic = "NAISETUPV0640000";
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int MessageBoxW(IntPtr window, string text, string caption, uint type);

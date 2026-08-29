@@ -24,9 +24,9 @@ const manifest = {
   url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
   size: stat.size,
   sha512: sha.digest('hex'),
-  releaseNotes: 'v0.6.3 uses a lightweight installer. During installation, V5 artist and Prompt Builder components are selected by default, while the optional V4.5 character catalog is off by default; selected missing components download when the application first launches. Upgrades preserve installed data and catalogs, migrate the v0.6.2 legacy pack, and support manual or optional startup refresh; the V5 artist component contains exactly 4,198 cards.',
-  // Additive field: schema-1 clients ignore catalogs while v0.6.3 uses the
-  // descriptors to verify and hydrate selected ASAR components.
+  releaseNotes: 'v0.6.4 repairs thin catalog state and downloads without rebuilding the immutable v0.6.3 catalog packs. During installation, V5 artist and Prompt Builder components are selected by default, while the optional V4.5 character catalog is off by default; selected missing components download when the application first launches. Upgrades preserve installed data and catalogs, migrate the v0.6.2 legacy pack, and support manual or optional startup refresh; the V5 artist component contains exactly 4,198 cards.',
+  // Additive field: schema-1 clients ignore catalogs while v0.6.4 reuses the
+  // v0.6.3 descriptors to verify and hydrate selected ASAR components.
   catalogs
 };
 await fs.writeFile(join(projectRoot, 'release-v5', 'update-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);

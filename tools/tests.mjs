@@ -27,7 +27,7 @@ const { resolveAppPaths, ensureWritable, migrateLegacyWorkspace } = require('../
 const { containedAsset, hasValidMagic, validateImagePayload } = require('../electron/custom-tag-assets.cjs');
 const { loadCatalog: loadRuntimeCatalog, parseGalleryPage: parseRuntimeGalleryPage, normalizeImageUrl: normalizeRuntimeImageUrl, runUpdate: runRuntimeCatalogUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('../electron/catalog-updater.cjs');
 const { compareVersions, validateManifest, readResponseJson, downloadInstaller, parseContentRange } = require('../electron/app-updater.cjs');
-const { COMPONENTS, componentFile, componentPaths, normalizeDescriptor, verifyComponent, loadState, saveState, activateComponent, resolveComponentAsset, ensureComponent, ensureSelectedComponents, validateLegacyArchive, downloadComponent, inspectComponent, statusForComponent, statuses, safeRelative } = require('../electron/catalog-components.cjs');
+const { COMPONENTS, componentFile, partialFile, componentPaths, normalizeDescriptor, verifyComponent, loadState, saveState, activateComponent, resolveComponentAsset, ensureComponent, ensureSelectedComponents, validateLegacyArchive, downloadComponent, inspectComponent, statusForComponent, statuses, safeRelative } = require('../electron/catalog-components.cjs');
 
 const testTempRoot = join(process.cwd(), '.test-tmp-v063', String(process.pid));
 mkdirSync(testTempRoot, { recursive: true });
@@ -906,6 +906,7 @@ const previewSource = readFileSync(new URL('../src/artist-card-preview.ts', impo
 const storageSource = readFileSync(new URL('../src/storage.ts', import.meta.url), 'utf8');
 const metadataWorkspaceSource = readFileSync(new URL('../src/metadata-workspace.ts', import.meta.url), 'utf8');
 const electronSource = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+const componentSource = readFileSync(new URL('../electron/catalog-components.cjs', import.meta.url), 'utf8');
 const catalogUpdaterSource = readFileSync(new URL('../electron/catalog-updater.cjs', import.meta.url), 'utf8');
 const preloadSource = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
 const appPathsSource = readFileSync(new URL('../electron/app-paths.cjs', import.meta.url), 'utf8');
@@ -1249,10 +1250,94 @@ assert.match(electronSource, /Menu\.setApplicationMenu\(null\)/);
 assert.match(electronSource, /window\.removeMenu\(\)/);
 assert.match(electronSource, /will-navigate/);
 assert.match(electronSource, /No system profile fallback was used/);
-assert.equal(packageSource.version, '0.6.3');
+assert.equal(packageSource.version, '0.6.4');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
-assert.match(uiSource, /const APP_VERSION = '0\.6\.3'/);
+assert.match(uiSource, /const APP_VERSION = '0\.6\.4'/);
+assert.match(uiSource, /function bindPreviewFade\(scope: ParentNode = document\): void \{[\s\S]*?scope\.querySelectorAll<HTMLImageElement>\('\.card-image img:first-of-type, \.character-catalog-card \.preview-image'\)/);
+const previewFadeSource = uiSource.match(/function bindPreviewFade\([\s\S]*?\n\}/)?.[0] ?? '';
+assert.match(previewFadeSource, /image\.classList\.add\('is-decoded'\)/);
+assert.match(previewFadeSource, /image\.parentElement/);
+assert.match(previewFadeSource, /is-preview-ready/);
+assert.match(previewFadeSource, /typeof HTMLElement !== 'undefined' && thumbnail instanceof HTMLElement/);
+assert.match(previewFadeSource, /image\.complete && image\.naturalWidth > 0/);
+assert.match(previewFadeSource, /image\.addEventListener\('load', markReady, \{ once: true \}\)/);
+function refreshSource(name) {
+  const start = uiSource.indexOf(`function ${name}(`);
+  const end = uiSource.indexOf('\nfunction ', start + 1);
+  return start >= 0 ? uiSource.slice(start, end < 0 ? uiSource.length : end) : '';
+}
+for (const pickerRefresh of ['refreshArtistGrid', 'refreshMixPicker', 'refreshCharacterPicker']) {
+  const source = refreshSource(pickerRefresh);
+  assert.match(source, /\.innerHTML =/);
+  assert.match(source, /bindPreviewFade\(grid\);/);
+}
+assert.match(uiSource, /grid\.innerHTML = page\.cards\.map\(artistCard\)\.join\('\'\)[\s\S]*?bindPreviewFade\(grid\);/);
+assert.match(uiSource, /grid\.innerHTML = page\.cards\.map\(characterCard\)\.join\('\'\);[\s\S]*?bindPreviewFade\(grid\);/);
+assert.match(uiSource, /grid\.innerHTML = page\.cards\.map\(card => \{[\s\S]*?bindPreviewFade\(grid\);/);
+// Exercise the readiness contract with deterministic fake images. This keeps
+// the regression gate behavioral even though main.ts is an application entry
+// module rather than a directly importable unit.
+const previewFunctionStart = uiSource.indexOf('function bindPreviewFade(');
+const previewFunctionEnd = uiSource.indexOf('\n}\n\nfunction updateEditor', previewFunctionStart) + 2;
+const previewFunctionForTest = uiSource.slice(previewFunctionStart, previewFunctionEnd)
+  .replace(/scope: ParentNode = document/g, 'scope = document')
+  .replace(/querySelectorAll<HTMLImageElement>/g, 'querySelectorAll')
+  .replace(/\): void \{/g, ') {');
+class PreviewTestHTMLElement {}
+const bindPreviewFadeForTest = new Function('document', 'HTMLElement', `return (${previewFunctionForTest})`)(undefined, PreviewTestHTMLElement);
+class PreviewTestClassList {
+  constructor() { this.values = new Set(); }
+  add(value) { this.values.add(value); }
+  contains(value) { return this.values.has(value); }
+}
+class PreviewTestParent extends PreviewTestHTMLElement {
+  constructor() { super(); this.classList = new PreviewTestClassList(); }
+}
+class PreviewTestImage {
+  constructor(complete, naturalWidth, parent = new PreviewTestParent()) { this.complete = complete; this.naturalWidth = naturalWidth; this.classList = new PreviewTestClassList(); this.parentElement = parent; this.listeners = new Map(); }
+  addEventListener(type, callback, options) { const entries = this.listeners.get(type) ?? []; entries.push({ callback, once: options?.once === true }); this.listeners.set(type, entries); }
+  emit(type) { const entries = this.listeners.get(type) ?? []; for (const entry of [...entries]) entry.callback(); this.listeners.set(type, entries.filter(entry => !entry.once)); }
+  listenerCount(type) { return (this.listeners.get(type) ?? []).length; }
+}
+const cachedPreview = new PreviewTestImage(true, 96);
+const pendingPreview = new PreviewTestImage(false, 0);
+const failedCachePreview = new PreviewTestImage(true, 0);
+const unrelatedPreview = new PreviewTestImage(false, 0);
+let previewSelector = '';
+let previewScopeCalls = 0;
+const previewGrid = { querySelectorAll(selector) { previewScopeCalls += 1; previewSelector = selector; return [cachedPreview, pendingPreview, failedCachePreview]; } };
+bindPreviewFadeForTest(previewGrid);
+assert.equal(previewScopeCalls, 1);
+assert.equal(previewSelector, '.card-image img:first-of-type, .character-catalog-card .preview-image');
+assert.equal(cachedPreview.classList.contains('is-decoded'), true);
+assert.equal(cachedPreview.parentElement.classList.contains('is-preview-ready'), true);
+assert.equal(cachedPreview.listenerCount('load'), 0);
+assert.equal(pendingPreview.classList.contains('is-decoded'), false);
+assert.equal(pendingPreview.parentElement.classList.contains('is-preview-ready'), false);
+assert.equal(pendingPreview.listenerCount('load'), 1);
+assert.equal(failedCachePreview.classList.contains('is-decoded'), false);
+assert.equal(failedCachePreview.parentElement.classList.contains('is-preview-ready'), false);
+assert.equal(failedCachePreview.listenerCount('load'), 1);
+failedCachePreview.emit('error'); failedCachePreview.emit('load');
+pendingPreview.naturalWidth = 96; pendingPreview.emit('load'); pendingPreview.emit('load');
+assert.equal(pendingPreview.classList.contains('is-decoded'), true);
+assert.equal(pendingPreview.parentElement.classList.contains('is-preview-ready'), true);
+assert.equal(failedCachePreview.classList.contains('is-decoded'), false);
+assert.equal(failedCachePreview.parentElement.classList.contains('is-preview-ready'), false);
+assert.equal(pendingPreview.listenerCount('load'), 0);
+assert.equal(failedCachePreview.listenerCount('load'), 0);
+assert.equal(unrelatedPreview.classList.contains('is-decoded'), false);
+const nonElementParentClassList = new PreviewTestClassList();
+const nonElementParentPreview = new PreviewTestImage(true, 96, { classList: nonElementParentClassList });
+bindPreviewFadeForTest({ querySelectorAll() { return [nonElementParentPreview]; } });
+assert.equal(nonElementParentPreview.classList.contains('is-decoded'), true);
+assert.equal(nonElementParentClassList.contains('is-preview-ready'), false);
+assert.doesNotMatch(previewFunctionForTest, /setInterval|setTimeout|requestAnimationFrame/);
+assert.match(styleSource, /\.card-image > img:first-of-type\.is-decoded, \.character-catalog-card \.preview-image\.is-decoded \{[^}]*opacity: 1/);
+assert.match(styleSource, /\.card-image\.is-preview-ready > \.card-skeleton, \.character-catalog-card > button:first-child\.is-preview-ready > \.card-skeleton \{[^}]*display: none;[^}]*animation: none;[^}]*pointer-events: none;/);
+assert.match(previewSource, /const boundTargets = new WeakSet<HTMLElement>\(\)/);
+assert.match(previewSource, /root\.querySelectorAll<HTMLElement>\(PREVIEW_SELECTOR\)/);
 assert.match(uiSource, /type AppUpdatePhase = 'idle' \| 'checking' \| 'available' \| 'downloading' \| 'paused' \| 'verifying' \| 'ready' \| 'installing' \| 'up-to-date' \| 'error'/);
 assert.match(uiSource, /role="progressbar"/);
 assert.match(uiSource, /Download update/);
@@ -1289,7 +1374,8 @@ for (const variable of ['TEMP', 'TMP', 'TMPDIR', 'ELECTRON_CACHE', 'ELECTRON_BUI
   assert.match(localEnvSource, new RegExp(variable));
 }
 assert.match(localRunnerSource, /createLocalEnvironment\(\)/);
-assert.match(desktopBuildSource, /catalog-packs\.mjs/);
+assert.match(desktopBuildSource, /catalog-components\.json/);
+assert.doesNotMatch(desktopBuildSource, /catalog-packs\.mjs/);
 assert.match(desktopBuildSource, /Catalog component packs are incomplete/);
 assert.doesNotMatch(desktopBuildSource, /optimize-desktop-catalog\.ps1/);
 assert.match(catalogPacksSource, /createPackageFromFiles/);
@@ -1576,7 +1662,9 @@ assert.match(electronSource, /APP_USER_MODEL_ID/);
 assert.match(electronSource, /app\.setAppUserModelId\(APP_USER_MODEL_ID\)/);
 assert.match(electronSource, /APP_ICON/);
 assert.match(installerLauncherSource, /CanonicalApplicationExecutable/);
-assert.match(installerLauncherSource, /NAISETUPV0630000/);
+assert.match(installerLauncherSource, /NAISETUPV0640000/);
+assert.match(componentSource, /require\('original-fs'\)/);
+assert.match(componentSource, /outerFs\.createReadStream/);
 
 // v0.6.3 thin component contracts. Fixtures stay under the workspace and use
 // an injected development inspector; packaged runtime uses native Electron fs.
@@ -1687,6 +1775,143 @@ const ranges = [];
 await downloadComponent({ catalogDir: join(downloadProfile, 'catalog'), descriptor: artistComponent.descriptor, request: async (_url, request) => { ranges.push(request.headers.Range || ''); return { status: 206, ok: true, headers: { 'content-range': `bytes ${split}-${archiveBytes.length - 1}/${archiveBytes.length}`, 'content-length': archiveBytes.length - split }, body: archiveBytes.subarray(split) }; }, retries: 0, archiveInspector: componentInspector });
 assert.deepEqual(ranges, [`bytes=${split}-`]);
 assert.equal(loadState(join(downloadProfile, 'catalog')).components.artists.size, archiveBytes.length);
+
+// A complete valid partial is promoted locally without an HTTP request.
+const completePartialProfile = localTemp('component-complete-partial');
+const completePartialCatalog = join(completePartialProfile, 'catalog');
+const completePartialPath = join(componentPaths(completePartialCatalog).downloads, artistComponent.descriptor.filename + '.partial');
+mkdirSync(componentPaths(completePartialCatalog).downloads, { recursive: true });
+writeFileSync(completePartialPath, archiveBytes);
+let completePartialRequests = 0;
+const completePartialResult = await downloadComponent({ catalogDir: completePartialCatalog, descriptor: artistComponent.descriptor, request: async () => { completePartialRequests += 1; throw new Error('complete partial must not request'); }, retries: 0, archiveInspector: componentInspector });
+assert.equal(completePartialResult.status, 'Installed');
+assert.equal(completePartialRequests, 0);
+assert.equal(existsSync(completePartialPath), false);
+
+// Cancellation is checked before exact-partial verification, so an already
+// aborted repair cannot promote or remove the resumable partial.
+const preabortedCompleteProfile = localTemp('component-preaborted-complete');
+const preabortedCompleteCatalog = join(preabortedCompleteProfile, 'catalog');
+const preabortedCompletePartial = partialFile(preabortedCompleteCatalog, artistComponent.descriptor);
+mkdirSync(componentPaths(preabortedCompleteCatalog).downloads, { recursive: true });
+writeFileSync(preabortedCompletePartial, archiveBytes);
+const preabortedCompleteController = new AbortController();
+preabortedCompleteController.abort();
+await assert.rejects(downloadComponent({ catalogDir: preabortedCompleteCatalog, descriptor: artistComponent.descriptor, signal: preabortedCompleteController.signal, request: async () => { throw new Error('pre-aborted exact partial must not request'); }, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(existsSync(componentFile(preabortedCompleteCatalog, artistComponent.descriptor)), false);
+assert.equal(readFileSync(preabortedCompletePartial).equals(archiveBytes), true);
+
+// A buffered response can complete its write before the caller cancellation
+// callback runs; the guard after progress must leave it resumable, not active.
+const bufferedAbortProfile = localTemp('component-buffered-abort');
+const bufferedAbortCatalog = join(bufferedAbortProfile, 'catalog');
+const bufferedAbortController = new AbortController();
+let bufferedAbortProgress = false;
+await assert.rejects(downloadComponent({ catalogDir: bufferedAbortCatalog, descriptor: artistComponent.descriptor, signal: bufferedAbortController.signal, request: async () => ({ status: 200, ok: true, body: archiveBytes }), onProgress: event => { if (event.phase === 'Downloading') { bufferedAbortProgress = true; bufferedAbortController.abort(); } }, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(bufferedAbortProgress, true);
+assert.equal(existsSync(componentFile(bufferedAbortCatalog, artistComponent.descriptor)), false);
+assert.equal(readFileSync(partialFile(bufferedAbortCatalog, artistComponent.descriptor)).equals(archiveBytes), true);
+
+// Cancellation at the verifying checkpoint is also before activation/state
+// commit, while the complete partial remains available for a later retry.
+const verifyingAbortProfile = localTemp('component-verifying-abort');
+const verifyingAbortCatalog = join(verifyingAbortProfile, 'catalog');
+const verifyingAbortController = new AbortController();
+await assert.rejects(downloadComponent({ catalogDir: verifyingAbortCatalog, descriptor: artistComponent.descriptor, signal: verifyingAbortController.signal, request: async () => ({ status: 200, ok: true, body: archiveBytes }), onProgress: event => { if (event.phase === 'Verifying') verifyingAbortController.abort(); }, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(existsSync(componentFile(verifyingAbortCatalog, artistComponent.descriptor)), false);
+assert.equal(readFileSync(partialFile(verifyingAbortCatalog, artistComponent.descriptor)).equals(archiveBytes), true);
+
+// Repair rehashes a valid target and persists true facts without touching the
+// network, removing only the matching stale partial.
+const repairProfile = localTemp('component-repair');
+const repairCatalog = join(repairProfile, 'catalog');
+const repairSource = join(repairProfile, artistComponent.descriptor.filename);
+writeFileSync(repairSource, archiveBytes);
+const repairActivated = activateComponent(repairCatalog, await verifyComponent(repairSource, artistComponent.descriptor, { archiveInspector: componentInspector }));
+const repairStat = statSync(repairActivated.path);
+const repairState = loadState(repairCatalog);
+repairState.components.artists = { status: 'Installed', filename: artistComponent.descriptor.filename, size: repairStat.size, sha512: artistComponent.descriptor.sha512, mtimeMs: 1, version: '0.6.3', expectedRoot: 'cards/artist', count: 4198 };
+saveState(repairCatalog, repairState);
+const repairPartial = partialFile(repairCatalog, artistComponent.descriptor);
+writeFileSync(repairPartial, Buffer.from('stale partial'));
+let repairRequests = 0;
+const repaired = await ensureComponent({ catalogDir: repairCatalog, descriptor: artistComponent.descriptor, repair: true, request: async () => { repairRequests += 1; throw new Error('repair must be local'); }, retries: 0, archiveInspector: componentInspector });
+assert.equal(repaired.status, 'Installed');
+assert.equal(repairRequests, 0);
+assert.equal(existsSync(repairPartial), false);
+const repairedRecord = loadState(repairCatalog).components.artists;
+assert.equal(repairedRecord.size, repairStat.size);
+assert.equal(repairedRecord.sha512, artistComponent.descriptor.sha512);
+assert.equal(repairedRecord.mtimeMs, statSync(repairActivated.path).mtimeMs);
+
+// Repair also observes cancellation raised during local archive inspection;
+// the valid target and unrelated partial are left untouched.
+const repairAbortProfile = localTemp('component-repair-abort');
+const repairAbortCatalog = join(repairAbortProfile, 'catalog');
+const repairAbortSource = join(repairAbortProfile, artistComponent.descriptor.filename);
+writeFileSync(repairAbortSource, archiveBytes);
+const repairAbortActivated = activateComponent(repairAbortCatalog, await verifyComponent(repairAbortSource, artistComponent.descriptor, { archiveInspector: componentInspector }));
+const repairAbortState = loadState(repairAbortCatalog);
+repairAbortState.components.artists = { status: 'Installed', filename: artistComponent.descriptor.filename, size: archiveBytes.length, sha512: artistComponent.descriptor.sha512, mtimeMs: 1, version: '0.6.3', expectedRoot: 'cards/artist', count: 4198 };
+saveState(repairAbortCatalog, repairAbortState);
+const repairAbortPartial = partialFile(repairAbortCatalog, artistComponent.descriptor);
+const repairAbortPartialBytes = Buffer.from('repair partial remains');
+writeFileSync(repairAbortPartial, repairAbortPartialBytes);
+const preabortedRepairController = new AbortController();
+preabortedRepairController.abort();
+await assert.rejects(ensureComponent({ catalogDir: repairAbortCatalog, descriptor: artistComponent.descriptor, signal: preabortedRepairController.signal, repair: true, request: async () => { throw new Error('pre-aborted repair must not request'); }, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(existsSync(componentFile(repairAbortCatalog, artistComponent.descriptor)), true);
+assert.equal(readFileSync(repairAbortPartial).equals(repairAbortPartialBytes), true);
+assert.equal(loadState(repairAbortCatalog).components.artists.mtimeMs, 1);
+const repairAbortController = new AbortController();
+const abortingInspector = { list: file => { repairAbortController.abort(); return listPackage(file); }, read: componentInspector.read };
+await assert.rejects(ensureComponent({ catalogDir: repairAbortCatalog, descriptor: artistComponent.descriptor, signal: repairAbortController.signal, repair: true, request: async () => { throw new Error('cancelled repair must not request'); }, retries: 0, archiveInspector: abortingInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(existsSync(componentFile(repairAbortCatalog, artistComponent.descriptor)), true);
+assert.equal(readFileSync(repairAbortPartial).equals(repairAbortPartialBytes), true);
+assert.equal(loadState(repairAbortCatalog).components.artists.mtimeMs, 1);
+
+// A corrupt complete partial is discarded and replaced by a fresh response.
+const corruptCompleteProfile = localTemp('component-corrupt-complete');
+const corruptCompleteCatalog = join(corruptCompleteProfile, 'catalog');
+const corruptCompletePath = partialFile(corruptCompleteCatalog, artistComponent.descriptor);
+mkdirSync(componentPaths(corruptCompleteCatalog).downloads, { recursive: true });
+writeFileSync(corruptCompletePath, Buffer.alloc(archiveBytes.length, 0x63));
+const corruptCompleteRanges = [];
+await downloadComponent({ catalogDir: corruptCompleteCatalog, descriptor: artistComponent.descriptor, request: async (_url, request) => { corruptCompleteRanges.push(request.headers.Range || ''); return { status: 200, ok: true, body: archiveBytes }; }, retries: 0, archiveInspector: componentInspector });
+assert.deepEqual(corruptCompleteRanges, ['']);
+
+// A server-side 416 for an incomplete range gets one fresh, zero-offset
+// request even when the configured retry budget is zero.
+const incomplete416Profile = localTemp('component-incomplete-416');
+const incomplete416Catalog = join(incomplete416Profile, 'catalog');
+const incomplete416Partial = partialFile(incomplete416Catalog, artistComponent.descriptor);
+mkdirSync(componentPaths(incomplete416Catalog).downloads, { recursive: true });
+writeFileSync(incomplete416Partial, archiveBytes.subarray(0, split));
+const incomplete416Ranges = [];
+await downloadComponent({ catalogDir: incomplete416Catalog, descriptor: artistComponent.descriptor, request: async (_url, request) => {
+  incomplete416Ranges.push(request.headers.Range || '');
+  if (incomplete416Ranges.length === 1) return { status: 416, ok: false, body: Buffer.alloc(0) };
+  return { status: 200, ok: true, body: archiveBytes };
+}, retries: 0, archiveInspector: componentInspector });
+assert.deepEqual(incomplete416Ranges, [`bytes=${split}-`, '']);
+
+// A cancellation raised while releasing a 416 response must be observed
+// before the reset/fresh request, preserving the resumable prefix.
+const abort416Profile = localTemp('component-abort-416');
+const abort416Catalog = join(abort416Profile, 'catalog');
+const abort416Partial = partialFile(abort416Catalog, artistComponent.descriptor);
+mkdirSync(componentPaths(abort416Catalog).downloads, { recursive: true });
+writeFileSync(abort416Partial, archiveBytes.subarray(0, split));
+const abort416Controller = new AbortController();
+let abort416Requests = 0;
+await assert.rejects(downloadComponent({ catalogDir: abort416Catalog, descriptor: artistComponent.descriptor, signal: abort416Controller.signal, request: async () => {
+  abort416Requests += 1;
+  return { status: 416, ok: false, body: Buffer.alloc(0), destroy: () => abort416Controller.abort() };
+}, retries: 0, archiveInspector: componentInspector }), error => error?.code === 'ABORT_ERR');
+assert.equal(abort416Requests, 1);
+assert.equal(existsSync(componentFile(abort416Catalog, artistComponent.descriptor)), false);
+assert.equal(readFileSync(abort416Partial).equals(archiveBytes.subarray(0, split)), true);
+
 
 // A resumed 206 response without a matching Content-Range must fail before
 // appending. Otherwise a server can return an unrelated payload that happens
@@ -1849,7 +2074,7 @@ assert.match(resolveComponentAsset(legacyCatalogDir, 'guide/fixture.png'), /lega
 const optionsPath = join(legacyProfile, 'installer-options.ini');
 writeFileSync(optionsPath, '[catalogs]\nv5Artists=1\nbuilder=1\nv45Characters=0\n');
 const legacySnapshot = readFileSync(optionsPath, 'utf8');
-const legacyResults = await ensureSelectedComponents({ catalogDir: legacyCatalogDir, dataDir: legacyProfile, descriptors: [artistComponent.descriptor, { ...artistComponent.descriptor, id: 'guide', filename: COMPONENTS.guide.filename, expectedRoot: COMPONENTS.guide.expectedRoot, count: COMPONENTS.guide.count }, { ...artistComponent.descriptor, id: 'characters', filename: COMPONENTS.characters.filename, expectedRoot: COMPONENTS.characters.expectedRoot, count: COMPONENTS.characters.count }], request: async () => { throw new Error('legacy source must suppress downloads'); }, archiveInspector: componentInspector });
+const legacyResults = await ensureSelectedComponents({ catalogDir: legacyCatalogDir, dataDir: legacyProfile, descriptors: [artistComponent.descriptor, { ...COMPONENTS.guide, size: artistComponent.descriptor.size, sha512: artistComponent.descriptor.sha512 }, { ...COMPONENTS.characters, size: artistComponent.descriptor.size, sha512: artistComponent.descriptor.sha512 }], request: async () => { throw new Error('legacy source must suppress downloads'); }, archiveInspector: componentInspector });
 assert.equal(legacyResults.migrated, true);
 assert.deepEqual(legacyResults.results.map(item => item.status), ['Migrated', 'Migrated']);
 assert.equal(readFileSync(optionsPath, 'utf8'), legacySnapshot);
@@ -1881,6 +2106,10 @@ const legacyStatusDescriptors = [
 ];
 const legacyStatuses = statuses(legacyCatalogDir, legacyStatusDescriptors, { archiveInspector: componentInspector });
 assert.deepEqual(legacyStatuses.map(item => item.status), ['Installed', 'Migrated', 'Migrated']);
+let installedPriorityRequests = 0;
+const installedPriority = await ensureSelectedComponents({ catalogDir: legacyCatalogDir, dataDir: legacyProfile, descriptors: [legacyArtistDescriptor, { ...COMPONENTS.guide, size: legacyArtistDescriptor.size, sha512: legacyArtistDescriptor.sha512 }, { ...COMPONENTS.characters, size: legacyArtistDescriptor.size, sha512: legacyArtistDescriptor.sha512 }], request: async () => { installedPriorityRequests += 1; throw new Error('legacy fallback should suppress only missing component downloads'); }, archiveInspector: componentInspector });
+assert.deepEqual(installedPriority.results.map(item => item.status), ['Installed', 'Migrated']);
+assert.equal(installedPriorityRequests, 0);
 
 // A damaged regular component must not shadow a validated migrated archive;
 // runtime resolution should continue down the documented source precedence.
@@ -1990,6 +2219,7 @@ assert.doesNotMatch(mixLockHandler, /render\(\)|scheduleMixOrbitThreads\(\)/);
 assert.match(uiSource, /mixPickerMode: 'primary' \| 'companion' \| 'replace-anchor'/);
 assert.match(uiSource, /mixPickerReplaceTarget/);
 assert.match(uiSource, /data-mix-replace-anchor/);
+for (const mode of ['primary', 'companion', 'replace-anchor']) assert.match(uiSource, new RegExp(`openMixPicker\\('${mode}'`));
 assert.match(uiSource, /openMixPicker\('replace-anchor',[\s\S]*?button\.dataset\.mixReplaceAnchor/);
 assert.match(uiSource, /function replaceMixAnchor\(card: CatalogCard\)[\s\S]*?target\.weight[\s\S]*?companions = artistMix\.companions\.filter/);
 const replaceAnchorSource = uiSource.match(/function replaceMixAnchor\(card: CatalogCard\)[\s\S]*?\n\}/)?.[0] ?? '';
@@ -2024,7 +2254,7 @@ assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-templa
 assert.match(styleSource, /\.mix-orbit-primary\.mix-anchor-group\.is-multi-anchor \{ max-width: min\(560px, calc\(100% - 20px\)\); \}/);
 assert.doesNotMatch(styleSource.match(/\.mix-orbit\[data-layout-density="compact"\] \.mix-anchor-group\.is-multi-anchor[\s\S]*?\n\}/)?.[0] ?? '', /width: 96px|height: 64px/);
 assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Eight interface themes/);
-assert.equal(packageSource.version, '0.6.3');
+assert.equal(packageSource.version, '0.6.4');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
 rmSync(testTempRoot, { recursive: true, force: true });

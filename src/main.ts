@@ -19,7 +19,7 @@ type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 's
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.3';
+const APP_VERSION = '0.6.4';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -936,9 +936,14 @@ function updatePrompt(): void {
   if (fullOutput) fullOutput.textContent = prompt();
   if (artistOutput) artistOutput.textContent = buildArtistsPrompt(base.artists);
 }
-function bindPreviewFade(): void {
-  document.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image').forEach(image => {
-    const markReady = () => image.classList.add('is-decoded');
+function bindPreviewFade(scope: ParentNode = document): void {
+  scope.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image').forEach(image => {
+    const markReady = () => {
+      if (image.naturalWidth <= 0) return;
+      image.classList.add('is-decoded');
+      const thumbnail = image.parentElement;
+      if (thumbnail && typeof HTMLElement !== 'undefined' && thumbnail instanceof HTMLElement) thumbnail.classList.add('is-preview-ready');
+    };
     if (image.complete && image.naturalWidth > 0) markReady();
     else image.addEventListener('load', markReady, { once: true });
   });
@@ -1794,6 +1799,7 @@ function refreshArtistGrid(options: { preserveScroll?: boolean; focusFavoriteId?
   const previousScrollTop = options.preserveScroll ? grid.scrollTop : 0;
   const page = promptArtistPickerPage();
   grid.innerHTML = page.cards.map(artistCard).join('') || `<p class="empty-inline" role="status">${artistFavoritesOnly ? 'No favorited V5 artists match this search.' : 'No V5 artists match this search.'}</p>`;
+  bindPreviewFade(grid);
   grid.scrollTop = previousScrollTop;
   const favoritesButton = document.querySelector<HTMLButtonElement>('#artist-favorites');
   favoritesButton?.classList.toggle('on', artistFavoritesOnly);
@@ -1834,6 +1840,7 @@ function refreshCharacterPicker(): void {
   const page = paginateCharacters(catalog.characters, { query: characterSearch, favoritesOnly: characterFavoritesOnly, favoriteIds: characterFavorites, page: characterPage });
   characterPage = page.page;
   grid.innerHTML = page.cards.map(characterCard).join('');
+  bindPreviewFade(grid);
   status.innerHTML = characterPickerStatus(page);
   count.textContent = `${page.filteredCount.toLocaleString()} of ${catalog.characters.length.toLocaleString()} cards`;
   pageStatus.textContent = page.pageCount ? `Page ${page.page} of ${page.pageCount}` : 'Page 0 of 0';
@@ -2000,6 +2007,7 @@ function refreshMixPicker(): void {
   const replaceTarget = mixPickerReplaceTarget ? artistMix.anchors.find(item => item.id === mixPickerReplaceTarget) : undefined;
   const replaceTargetStableId = replaceTarget ? replaceTarget.catalogId ?? replaceTarget.id : null;
   grid.innerHTML = page.cards.map(card => { const stable = card.catalogId ?? card.id; const selected = artistMix.anchors.some(item => (item.catalogId ?? item.id) === stable); const replaceBlocked = mixPickerMode === 'replace-anchor' && selected && stable !== replaceTargetStableId; return `<article class="artist-card ${selected ? 'selected' : ''}"><button class="artist-pick" type="button" data-mix-pick="${escapeHtml(stable)}" data-artist-preview-image="${catalogImage(card)}" data-artist-preview-tag="${escapeHtml(card.tag)}" data-artist-preview-prompt="artist: ${escapeHtml(card.tag)}"${replaceBlocked ? ' disabled aria-disabled="true"' : ''}><span class="card-image"><span class="card-skeleton" aria-hidden="true"></span><img src="${catalogImage(card)}" alt="${escapeHtml(card.tag)}" loading="lazy"></span><b>${escapeHtml(card.tag)}</b></button></article>`; }).join('') || '<p class="empty-inline">No V5 artists match this search.</p>';
+  bindPreviewFade(grid);
   grid.scrollTop = 0;
   document.querySelector<HTMLElement>('#mix-picker-count')?.replaceChildren(document.createTextNode(`${page.filteredCount.toLocaleString()} of ${catalog.artists.length.toLocaleString()} cards`));
   const pageStatus = document.querySelector<HTMLElement>('#mix-artist-page-status');

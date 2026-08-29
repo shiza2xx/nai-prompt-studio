@@ -11,6 +11,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
+// Electron patches node:fs so paths below an outer .asar are interpreted as
+// virtual archive entries.  Component and legacy archives are real files in
+// the profile, so use original-fs for those outer-file operations.  Keeping
+// the patched fs alias above is intentional: native ASAR reads such as
+// `archive.asar/inner/path` rely on Electron's integration.
+let outerFs = fs;
+try { outerFs = require('original-fs'); } catch { /* plain Node/test runtime */ }
+
 const COMPONENT_VERSION = '0.6.3';
 const COMPONENTS = Object.freeze({
   artists: Object.freeze({ id: 'artists', filename: 'nai-v5-artists.asar', expectedRoot: 'cards/artist', count: 4198, version: COMPONENT_VERSION, trustedUrl: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${COMPONENT_VERSION}/nai-v5-artists.asar` }),
@@ -104,12 +112,13 @@ function componentIdentity(descriptor) {
 function hashFile(file, signal) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha512');
-    const stream = fs.createReadStream(file);
-    const abort = () => { stream.destroy(new Error('Catalog component verification cancelled')); };
+    const stream = outerFs.createReadStream(file);
+    const abort = () => { stream.destroy(abortError()); };
     signal?.addEventListener('abort', abort, { once: true });
     stream.on('data', chunk => hash.update(chunk));
     stream.on('error', error => { signal?.removeEventListener('abort', abort); reject(error); });
     stream.on('end', () => { signal?.removeEventListener('abort', abort); resolve(hash.digest('hex')); });
+    if (signal?.aborted) abort();
   });
 }
 
@@ -167,14 +176,17 @@ function validateArchiveShape(file, descriptor, { inspector } = {}) {
 
 async function verifyComponent(file, descriptor, { signal, archiveInspector } = {}) {
   const normalized = normalizeDescriptor(descriptor, descriptor?.id);
-  if (!fs.existsSync(file)) throw new Error(`Catalog component ${normalized.id} is missing`);
-  const linkStat = fs.lstatSync(file);
+  throwIfAborted(signal);
+  if (!outerFs.existsSync(file)) throw new Error(`Catalog component ${normalized.id} is missing`);
+  const linkStat = outerFs.lstatSync(file);
   if (!linkStat.isFile() || linkStat.isSymbolicLink()) throw new Error(`Catalog component ${normalized.id} must be a regular file`);
   const stat = linkStat;
   if (stat.size !== normalized.size) throw new Error(`Catalog component ${normalized.id} size mismatch`);
   const digest = await hashFile(file, signal);
+  throwIfAborted(signal);
   if (digest.toLowerCase() !== normalized.sha512.toLowerCase()) throw new Error(`Catalog component ${normalized.id} SHA-512 mismatch`);
   const shape = validateArchiveShape(file, normalized, { inspector: archiveInspector });
+  throwIfAborted(signal);
   return { ...normalized, path: file, status: 'Installed', verifiedSize: stat.size, verifiedSha512: digest, verifiedMtimeMs: stat.mtimeMs, archiveMetadata: shape.metadata };
 }
 
@@ -218,24 +230,70 @@ function componentRecordMatchesFacts(record, stat, item) {
     && validSha512(record.sha512);
 }
 
+function installedStateRecord(item, stat, sha512) {
+  return {
+    status: 'Installed',
+    filename: item.filename,
+    size: stat.size,
+    sha512,
+    mtimeMs: stat.mtimeMs,
+    version: item.version,
+    expectedRoot: item.expectedRoot,
+    count: item.count,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function persistInstalledState(catalogDir, verified, file = verified.path) {
+  const item = normalizeDescriptor(verified, verified?.id);
+  const stat = outerFs.statSync(file);
+  const digest = String(verified.verifiedSha512 || verified.sha512 || '').toLowerCase();
+  if (stat.size !== item.size || !validSha512(digest)) throw new Error(`Catalog component ${item.id} verification facts are invalid`);
+  const state = loadState(catalogDir);
+  state.components[item.id] = installedStateRecord(item, stat, digest);
+  saveState(catalogDir, state);
+  return { ...item, path: file, status: 'Installed', verifiedSize: stat.size, verifiedSha512: digest, verifiedMtimeMs: stat.mtimeMs };
+}
+
+function removeMatchingPartial(catalogDir, item, activePath) {
+  const partial = partialFile(catalogDir, item);
+  if (path.resolve(partial) === path.resolve(activePath)) return;
+  try { outerFs.rmSync(partial, { force: true }); } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+function activateVerifiedComponent(catalogDir, verified, { removePartial = false, signal } = {}) {
+  throwIfAborted(signal);
+  const activated = activateComponent(catalogDir, verified, { signal });
+  throwIfAborted(signal);
+  const result = persistInstalledState(catalogDir, verified, activated.path);
+  throwIfAborted(signal);
+  if (removePartial) {
+    throwIfAborted(signal);
+    removeMatchingPartial(catalogDir, result, activated.path);
+  }
+  return result;
+}
+
 function statusForComponent(catalogDir, descriptor) {
   const item = normalizeDescriptor(descriptor, descriptor?.id);
   const file = componentFile(catalogDir, item);
   const record = loadState(catalogDir).components[item.id];
   try {
-    const stat = fs.lstatSync(file);
+    const stat = outerFs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink()) return { ...item, path: file, status: 'Damaged', sizeOnDisk: stat.size, error: stat.isSymbolicLink() ? 'Symbolic links are not allowed' : 'Component must be a regular file' };
     if (componentRecordMatchesFacts(record, stat, item)) return { ...item, path: file, status: 'Installed', sizeOnDisk: stat.size, verifiedSize: record.size, verifiedSha512: record.sha512, verifiedMtimeMs: record.mtimeMs };
     if (record?.status === 'Installed') return { ...item, path: file, status: 'Damaged', sizeOnDisk: stat.size, error: 'Installed component changed; repair is required' };
     return { ...item, path: file, status: 'Damaged', sizeOnDisk: stat.size, error: 'Component has not been verified' };
   } catch (error) {
-    const fileExists = fs.existsSync(file);
+    const fileExists = outerFs.existsSync(file);
     if (fileExists) return { ...item, path: file, status: 'Damaged', error: error instanceof Error ? error.message : String(error) };
     // A stale state record cannot make a missing target Installed. Keep the
     // Downloading label only while a real resumable partial is present.
     let resumable = false;
     if (record?.status === 'Downloading') {
-      try { const partial = partialFile(catalogDir, item); const partialStat = fs.lstatSync(partial); resumable = partialStat.isFile() && !partialStat.isSymbolicLink() && partialStat.size > 0; } catch { resumable = false; }
+      try { const partial = partialFile(catalogDir, item); const partialStat = outerFs.lstatSync(partial); resumable = partialStat.isFile() && !partialStat.isSymbolicLink() && partialStat.size > 0; } catch { resumable = false; }
     }
     const status = resumable ? 'Downloading' : 'Missing';
     return { ...item, path: file, status, error: record?.error || '' };
@@ -256,13 +314,14 @@ function statuses(catalogDir, descriptors, { archiveInspector } = {}) {
   });
 }
 
-async function inspectComponent(catalogDir, descriptor, { force = false, archiveInspector } = {}) {
+async function inspectComponent(catalogDir, descriptor, { force = false, archiveInspector, signal } = {}) {
   const item = normalizeDescriptor(descriptor, descriptor?.id);
   const file = componentFile(catalogDir, item);
   const state = loadState(catalogDir);
   const record = state.components[item.id];
   try {
-    const stat = fs.lstatSync(file);
+    throwIfAborted(signal);
+    const stat = outerFs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Catalog component must be a regular file');
     // A valid activated pack remains valid when a later app descriptor changes.
     // Rehash only after file facts change or when Repair explicitly requests it.
@@ -270,20 +329,36 @@ async function inspectComponent(catalogDir, descriptor, { force = false, archive
       return { ...item, path: file, status: 'Installed', verifiedSize: record.size, verifiedSha512: record.sha512, verifiedMtimeMs: record.mtimeMs };
     }
     if (!force && record?.status === 'Installed' && record.filename === item.filename && validSha512(record.sha512)) {
-      const digest = await hashFile(file);
+      const digest = await hashFile(file, signal);
+      throwIfAborted(signal);
       if (digest.toLowerCase() === record.sha512.toLowerCase()) {
+        throwIfAborted(signal);
         state.components[item.id] = { ...record, status: 'Installed', size: stat.size, mtimeMs: stat.mtimeMs, sha512: digest, updatedAt: new Date().toISOString() };
         saveState(catalogDir, state);
         return { ...item, path: file, status: 'Installed', verifiedSize: stat.size, verifiedSha512: digest, verifiedMtimeMs: stat.mtimeMs };
       }
     }
-    return await verifyComponent(file, item, { archiveInspector, signal: undefined });
+    throwIfAborted(signal);
+    const verified = await verifyComponent(file, item, { archiveInspector, signal });
+    throwIfAborted(signal);
+    // A successful local verification is authoritative. Repair explicitly
+    // discards only this component's matching stale partial after the target
+    // facts have been persisted.
+    throwIfAborted(signal);
+    const result = persistInstalledState(catalogDir, verified, file);
+    throwIfAborted(signal);
+    if (force) {
+      throwIfAborted(signal);
+      removeMatchingPartial(catalogDir, item, file);
+    }
+    return result;
   } catch (error) {
-    return { ...item, path: file, status: fs.existsSync(file) ? 'Damaged' : (record?.status === 'Downloading' ? 'Downloading' : 'Missing'), error: error instanceof Error ? error.message : String(error) };
+    if (error?.code === 'ABORT_ERR' || signal?.aborted) throw error?.code === 'ABORT_ERR' ? error : abortError();
+    return { ...item, path: file, status: outerFs.existsSync(file) ? 'Damaged' : (record?.status === 'Downloading' ? 'Downloading' : 'Missing'), error: error instanceof Error ? error.message : String(error) };
   }
 }
 
-function responseStatus(response) { return Number(response?.status || 0); }
+function responseStatus(response) { return Number(response?.status ?? response?.statusCode ?? 0); }
 function responseBody(response) {
   if (response?.body && typeof response.body[Symbol.asyncIterator] === 'function') return response.body;
   return null;
@@ -316,6 +391,7 @@ function releaseResponse(response) {
   } catch { /* best effort */ }
 }
 function abortError() { return Object.assign(new Error('Catalog component download cancelled'), { code: 'ABORT_ERR' }); }
+function throwIfAborted(signal) { if (signal?.aborted) throw abortError(); }
 function readResponseChunk(iterator, signal, timeoutMs) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -355,17 +431,62 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
   let preservedRecord = null;
   let targetPresent = false;
   try {
-    const stat = fs.lstatSync(target);
+    const stat = outerFs.lstatSync(target);
     targetPresent = true;
     if (stat.isFile() && !stat.isSymbolicLink() && componentRecordMatchesFacts(priorRecord, stat, item)) preservedRecord = { ...priorRecord };
   } catch { /* a missing/unverified target has no state to preserve */ }
   const failureStatus = targetPresent ? 'Damaged' : 'Missing';
   const failureRecord = error => ({ status: failureStatus, filename: item.filename, error: error instanceof Error ? error.message : String(error), updatedAt: new Date().toISOString() });
   const cancelledRecord = () => ({ status: failureStatus, filename: item.filename, error: 'Download cancelled', updatedAt: new Date().toISOString() });
-  try { const stat = fs.lstatSync(partial); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Catalog component partial must be a regular file'); }
+  const cancelDownload = () => {
+    const state = loadState(catalogDir);
+    state.components[item.id] = preservedRecord || cancelledRecord();
+    saveState(catalogDir, state);
+    throw abortError();
+  };
+  const checkDownloadAbort = () => { if (signal?.aborted) cancelDownload(); };
+  // Record a pre-aborted direct download as cancelled without touching an
+  // existing partial; callers can retry that resumable file later.
+  checkDownloadAbort();
+  try { const stat = outerFs.lstatSync(partial); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Catalog component partial must be a regular file'); }
   catch (error) { if (error?.code !== 'ENOENT') throw error; }
+
+  const resetPartial = () => {
+    try { outerFs.truncateSync(partial, 0); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  };
+  const activateVerified = verified => activateVerifiedComponent(catalogDir, verified, { removePartial: true, signal });
+
+  // A complete partial is a usable offline download. Verify it before making
+  // any request so an exact Range at EOF cannot trigger an unnecessary 416.
+  let partialSize = 0;
+  checkDownloadAbort();
+  try { partialSize = outerFs.statSync(partial).size; } catch { partialSize = 0; }
+  checkDownloadAbort();
+  if (partialSize > item.size) {
+    checkDownloadAbort();
+    resetPartial();
+  }
+  else if (partialSize === item.size && partialSize > 0) {
+    try {
+      checkDownloadAbort();
+      const verified = await verifyComponent(partial, item, { signal, archiveInspector });
+      checkDownloadAbort();
+      onProgress({ id: item.id, phase: 'Verifying', completed: item.size, total: item.size, percent: 100, attempt: 0 });
+      checkDownloadAbort();
+      return activateVerified(verified);
+    } catch (error) {
+      if (error?.code === 'ABORT_ERR' || signal?.aborted) cancelDownload();
+      // A complete but corrupt partial must never become the active target.
+      checkDownloadAbort();
+      resetPartial();
+    }
+  }
+  checkDownloadAbort();
   const transferState = loadState(catalogDir);
   transferState.components[item.id] = { status: 'Downloading', filename: item.filename, updatedAt: new Date().toISOString() };
+  checkDownloadAbort();
   saveState(catalogDir, transferState);
   let attempt = 0;
   while (true) {
@@ -376,9 +497,14 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
       throw Object.assign(new Error('Catalog component download cancelled'), { code: 'ABORT_ERR' });
     }
     try {
+      throwIfAborted(signal);
       let offset = 0;
-      try { offset = fs.statSync(partial).size; } catch { offset = 0; }
-      if (offset > item.size) { fs.truncateSync(partial, 0); offset = 0; }
+      try { offset = outerFs.statSync(partial).size; } catch { offset = 0; }
+      throwIfAborted(signal);
+      if (offset > item.size) { throwIfAborted(signal); resetPartial(); offset = 0; }
+      let freshRangeRetry = false;
+      while (true) {
+      checkDownloadAbort();
       const headers = offset ? { Range: `bytes=${offset}-` } : {};
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -387,11 +513,44 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
       let response;
       try { response = await request(item.url, { headers, signal: controller.signal }); }
       finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+      if (signal?.aborted) { releaseResponse(response); throw abortError(); }
       const statusCode = responseStatus(response);
       if (response?.url) {
         let finalUrl;
         try { finalUrl = new URL(String(response.url)); } catch { releaseResponse(response); throw new Error('Catalog component response URL is invalid'); }
         if (finalUrl.protocol !== 'https:' || !TRUSTED_REDIRECT_HOSTS.has(finalUrl.hostname)) { releaseResponse(response); throw new Error('Catalog component response host is not trusted'); }
+      }
+      throwIfAborted(signal);
+      if (statusCode === 416) {
+        // Some servers reject an EOF range even though the partial is already
+        // complete. Verify/promote that file when possible; otherwise clear
+        // the incomplete/corrupt partial and retry exactly once from zero.
+        releaseResponse(response);
+        throwIfAborted(signal);
+        if (offset === item.size) {
+          try {
+            throwIfAborted(signal);
+            const verified = await verifyComponent(partial, item, { signal, archiveInspector });
+            throwIfAborted(signal);
+            onProgress({ id: item.id, phase: 'Verifying', completed: item.size, total: item.size, percent: 100, attempt });
+            throwIfAborted(signal);
+            return activateVerified(verified);
+          } catch (error) {
+            if (error?.code === 'ABORT_ERR' || signal?.aborted) throw error?.code === 'ABORT_ERR' ? error : abortError();
+            throwIfAborted(signal);
+            resetPartial();
+          }
+        } else {
+          throwIfAborted(signal);
+          resetPartial();
+        }
+        if (offset > 0 && !freshRangeRetry) {
+          throwIfAborted(signal);
+          freshRangeRetry = true;
+          offset = 0;
+          continue;
+        }
+        throw new Error('Catalog component request failed: HTTP 416');
       }
       if (response?.ok === false || (statusCode && (statusCode < 200 || statusCode >= 300) && statusCode !== 206)) {
         releaseResponse(response);
@@ -401,14 +560,15 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
       const contentLengthHeader = responseHeader(response, 'content-length');
       const contentLength = contentLengthHeader && /^\d+$/.test(contentLengthHeader) ? Number(contentLengthHeader) : null;
       if (statusCode === 206 && (!contentRange || contentRange.start !== offset || contentRange.total !== item.size || (contentLength !== null && contentLength !== contentRange.length))) {
-        try { fs.truncateSync(partial, 0); } catch { /* retry path will report the failure */ }
         releaseResponse(response);
+        throwIfAborted(signal);
+        try { resetPartial(); } catch { /* retry path will report the failure */ }
         throw new Error('Catalog component resume Content-Range is invalid');
       }
-      if (offset && responseStatus(response) !== 206) { fs.truncateSync(partial, 0); offset = 0; }
+      if (offset && responseStatus(response) !== 206) { throwIfAborted(signal); resetPartial(); offset = 0; }
       const body = responseBody(response);
       if (body) {
-        const stream = fs.createWriteStream(partial, { flags: offset ? 'a' : 'w' });
+        const stream = outerFs.createWriteStream(partial, { flags: offset ? 'a' : 'w' });
         let received = offset;
         let iterator;
         let completed = false;
@@ -426,11 +586,13 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
             });
             onProgress({ id: item.id, phase: 'Downloading', completed: received, total: item.size, percent: Math.floor(received / item.size * 100), attempt });
           }
+          throwIfAborted(signal);
           if (contentRange && received - offset !== contentRange.length) throw new Error('Catalog component response Content-Range length mismatch');
           await new Promise((resolve, reject) => {
             try { stream.end(error => error ? reject(error) : resolve()); }
             catch (error) { reject(error); }
           });
+          throwIfAborted(signal);
           completed = true;
         } finally {
           if (!completed) {
@@ -440,31 +602,34 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
         }
       } else {
         const bytes = await responseBytes(response);
+        throwIfAborted(signal);
         if (contentRange && bytes.length !== contentRange.length) {
-          try { fs.truncateSync(partial, 0); } catch { /* retry path will report the failure */ }
+          throwIfAborted(signal);
+          try { resetPartial(); } catch { /* retry path will report the failure */ }
           throw new Error('Catalog component response Content-Range length mismatch');
         }
-        if (offset && responseStatus(response) === 206) fs.appendFileSync(partial, bytes); else fs.writeFileSync(partial, bytes);
-        const completed = fs.statSync(partial).size;
+        throwIfAborted(signal);
+        if (offset && responseStatus(response) === 206) outerFs.appendFileSync(partial, bytes); else outerFs.writeFileSync(partial, bytes);
+        const completed = outerFs.statSync(partial).size;
         onProgress({ id: item.id, phase: 'Downloading', completed, total: item.size, percent: Math.floor(completed / item.size * 100), attempt });
+        throwIfAborted(signal);
       }
+      throwIfAborted(signal);
       const verified = await verifyComponent(partial, item, { signal, archiveInspector });
+      throwIfAborted(signal);
       onProgress({ id: item.id, phase: 'Verifying', completed: item.size, total: item.size, percent: 100, attempt });
-      const activated = activateComponent(catalogDir, verified);
-      const state = loadState(catalogDir);
-      const installedStat = fs.statSync(activated.path);
-      state.components[item.id] = { status: 'Installed', filename: item.filename, size: installedStat.size, sha512: item.sha512, mtimeMs: installedStat.mtimeMs, version: item.version, expectedRoot: item.expectedRoot, count: item.count, updatedAt: new Date().toISOString() };
-      saveState(catalogDir, state);
-      return activated;
+      throwIfAborted(signal);
+      return activateVerified(verified);
+      }
     } catch (error) {
       if (error?.code === 'ABORT_ERR' || signal?.aborted) {
         const state = loadState(catalogDir);
         state.components[item.id] = preservedRecord || cancelledRecord();
         saveState(catalogDir, state);
-        throw error;
+        throw error?.code === 'ABORT_ERR' ? error : abortError();
       }
       if (/(?:SHA-512|size mismatch|not a readable ASAR|expected root|version mismatch|count mismatch|Content-Range|exceeds descriptor size)/i.test(String(error?.message || ''))) {
-        try { fs.truncateSync(partial, 0); } catch { /* next attempt starts from zero */ }
+        try { resetPartial(); } catch { /* next attempt starts from zero */ }
       }
       attempt += 1;
       if (attempt > retries) {
@@ -480,9 +645,12 @@ async function downloadComponent({ catalogDir, descriptor, request = fetch, sign
 
 async function ensureComponent({ catalogDir, descriptor, request = fetch, signal, onProgress = () => {}, timeoutMs = 30_000, retries = 2, repair = false, archiveInspector }) {
   const item = normalizeDescriptor(descriptor, descriptor?.id);
-  const current = await inspectComponent(catalogDir, item, { force: repair, archiveInspector });
-  if (current.status === 'Installed' && !repair) return current;
+  throwIfAborted(signal);
+  const current = await inspectComponent(catalogDir, item, { force: repair, archiveInspector, signal });
+  throwIfAborted(signal);
+  if (current.status === 'Installed') return current;
   onProgress({ id: item.id, phase: 'Checking', completed: 0, total: item.size, percent: 0 });
+  throwIfAborted(signal);
   return downloadComponent({ catalogDir, descriptor: item, request, signal, onProgress, timeoutMs, retries, archiveInspector });
 }
 
@@ -509,50 +677,63 @@ async function ensureSelectedComponents({ catalogDir, dataDir, descriptors, requ
   const total = chosen.reduce((sum, item) => sum + item.size, 0);
   let completed = 0;
   const results = [];
-  // A preserved 0.6.2 fat ASAR contains all three catalog roots.  It is a
-  // validated source for every selected component and must suppress all
-  // component downloads, including on a fresh 0.6.3 launch.
+  // A preserved 0.6.2 fat ASAR is only a per-component fallback. An installed
+  // current component remains authoritative even while that archive exists.
   let migrated = null;
   try { migrated = validateLegacyArchive(componentPaths(catalogDir).legacyPack, { inspector: archiveInspector }); } catch { /* no valid migration */ }
-  if (migrated) {
-    for (const descriptor of chosen) {
-      onProgress({ id: descriptor.id, phase: 'Checking', completed, total, percent: total ? Math.floor(completed / total * 100) : 100 });
-      results.push({ ...descriptor, path: migrated.file, status: 'Migrated', verifiedSize: migrated.size });
-      completed += descriptor.size;
-      onProgress({ id: descriptor.id, phase: 'Opening', completed, total, percent: total ? Math.floor(completed / total * 100) : 100 });
-    }
-    return { selected, results, total, migrated: true };
-  }
   for (const descriptor of chosen) {
-    const result = await ensureComponent({ catalogDir, descriptor, request, signal, timeoutMs, retries, archiveInspector, onProgress: event => {
+    onProgress({ id: descriptor.id, phase: 'Checking', completed, total, percent: total ? Math.floor(completed / total * 100) : 100 });
+    throwIfAborted(signal);
+    const current = await inspectComponent(catalogDir, descriptor, { archiveInspector, signal });
+    throwIfAborted(signal);
+    let result;
+    if (current.status === 'Installed') result = current;
+    else if (migrated) result = { ...descriptor, path: migrated.file, status: 'Migrated', verifiedSize: migrated.size };
+    else result = await ensureComponent({ catalogDir, descriptor, request, signal, timeoutMs, retries, archiveInspector, onProgress: event => {
       const local = Math.max(0, Math.min(descriptor.size, Number(event.completed) || 0));
       onProgress({ ...event, completed: completed + local, total, percent: total ? Math.floor((completed + local) / total * 100) : 100 });
     } });
     results.push(result);
     completed += descriptor.size;
+    throwIfAborted(signal);
     onProgress({ id: descriptor.id, phase: 'Opening', completed, total, percent: total ? Math.floor(completed / total * 100) : 100 });
   }
-  return { selected, results, total };
+  return { selected, results, total, ...(migrated ? { migrated: true } : {}) };
 }
 
-function activateComponent(catalogDir, verified) {
+function activateComponent(catalogDir, verified, { signal } = {}) {
   const item = normalizeDescriptor(verified, verified?.id);
   const source = verified.path || partialFile(catalogDir, item);
   const target = componentFile(catalogDir, item);
   const backup = `${target}.previous-${Date.now()}-${process.pid}`;
+  let movedTarget = false;
+  let movedSource = false;
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  if (fs.existsSync(target)) {
-    fs.renameSync(target, backup);
-  }
-  try { fs.renameSync(source, target); }
-  catch (error) {
-    if (!fs.existsSync(target) && fs.existsSync(backup)) fs.renameSync(backup, target);
-    throw error;
+  try {
+    throwIfAborted(signal);
+    if (outerFs.existsSync(target)) {
+      outerFs.renameSync(target, backup);
+      movedTarget = true;
+    }
+    throwIfAborted(signal);
+    outerFs.renameSync(source, target);
+    movedSource = true;
+    throwIfAborted(signal);
+  } catch (error) {
+    if (error?.code === 'ABORT_ERR' || signal?.aborted) {
+      // A cancellation after either rename must restore both the old target
+      // and the resumable source before surfacing ABORT_ERR.
+      try {
+        if (movedSource && outerFs.existsSync(target)) outerFs.renameSync(target, source);
+        if (movedTarget && outerFs.existsSync(backup)) outerFs.renameSync(backup, target);
+      } catch { /* preserve the original cancellation error */ }
+    } else if (!outerFs.existsSync(target) && outerFs.existsSync(backup)) outerFs.renameSync(backup, target);
+    throw error?.code === 'ABORT_ERR' ? error : (signal?.aborted ? abortError() : error);
   }
   // The verified target is now authoritative. Remove only this exact backup;
   // unrelated files in the component directory remain untouched.
-  if (fs.existsSync(backup)) {
-    try { fs.rmSync(backup, { force: true }); } catch (error) { throw new Error(`Catalog component backup cleanup failed: ${error instanceof Error ? error.message : String(error)}`); }
+  if (outerFs.existsSync(backup)) {
+    try { outerFs.rmSync(backup, { force: true }); } catch (error) { throw new Error(`Catalog component backup cleanup failed: ${error instanceof Error ? error.message : String(error)}`); }
   }
   return { ...item, path: target, status: 'Installed' };
 }
@@ -568,14 +749,14 @@ function resolveComponentAsset(catalogDir, relative, { allowLegacy = true } = {}
   const paths = componentPaths(catalogDir);
   const installed = componentFile(catalogDir, match);
   let installedError = null;
-  if (fs.existsSync(installed)) {
-    const installedStat = fs.lstatSync(installed);
+  if (outerFs.existsSync(installed)) {
+    const installedStat = outerFs.lstatSync(installed);
     const record = loadState(catalogDir).components[match.id];
     if (!installedStat.isFile() || installedStat.isSymbolicLink()) installedError = `Catalog component ${match.id} must be a regular file`;
     else if (!componentRecordMatchesFacts(record, installedStat, match)) installedError = `Catalog component ${match.id} is not verified`;
     else return `${installed}${path.sep}${normalized}`;
   }
-  if (allowLegacy && fs.existsSync(paths.legacyPack)) {
+  if (allowLegacy && outerFs.existsSync(paths.legacyPack)) {
     try {
       validateLegacyArchive(paths.legacyPack);
       return `${paths.legacyPack}${path.sep}dist${path.sep}catalog${path.sep}${normalized}`;
@@ -585,8 +766,8 @@ function resolveComponentAsset(catalogDir, relative, { allowLegacy = true } = {}
 }
 
 function validateLegacyArchive(file, { expectedRoots = ['dist/catalog/catalog.json', 'dist/catalog/cards/artist', 'dist/catalog/cards/character', 'dist/catalog/guide'], inspector } = {}) {
-  if (!fs.existsSync(file) || !fs.lstatSync(file).isFile() || fs.lstatSync(file).isSymbolicLink()) throw new Error('Legacy catalog archive is missing');
-  const stat = fs.statSync(file);
+  if (!outerFs.existsSync(file) || !outerFs.lstatSync(file).isFile() || outerFs.lstatSync(file).isSymbolicLink()) throw new Error('Legacy catalog archive is missing');
+  const stat = outerFs.statSync(file);
   const cacheKey = `${file}|${stat.size}|${stat.mtimeMs}|${expectedRoots.join('|')}`;
   if (legacyValidationCache.has(cacheKey)) return legacyValidationCache.get(cacheKey);
   const entries = inspector ? archiveEntries(file, { inspector }) : null;
