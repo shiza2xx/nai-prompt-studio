@@ -5,23 +5,25 @@ import { configureArtistCardPreview } from './artist-card-preview';
 import { artistDisplayName, canonicalArtistIdentity, customArtistCatalogId, mergeArtistCatalog, migrateArtistAliases, migrateArtistMixAliases, migrateFavoriteAliases } from './artist-catalog';
 import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from './artist-mix-layout';
 import { paginateArtists, paginateCharacters } from './catalog-browser';
-import { buildWarmupPlan, scheduleIdleWarmup, uniqueWarmupItems } from './catalog-warmup';
+import { buildWarmupPlan, scheduleIdleCallback, scheduleIdleWarmup, uniqueWarmupItems } from './catalog-warmup';
 import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } from './metadata-workspace';
 import { PreviewCache, PREVIEW_IMAGE_SELECTOR, type PreviewImageLike, type PreviewLease, type PreviewPriority, type PreviewRootLike } from './preview-cache';
 import { createOfficialArtistThumbnail } from './artist-thumbnail';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
+import { classifyCustomTagDrop, type CustomTagDropFileDescriptor } from './custom-tag-dnd';
 import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
-import { canonicalCustomTagIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
-import { deleteLibraryImage, hasExistingProfile, loadArtistMix, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage } from './storage';
-import { PREVIEW_CACHE_BUDGETS, type AnimationMode, type AppSettings, type ArtistMixDraft, type BasePrompt, type CatalogCard, type Character, type CustomTag, type CustomTagKind, type CustomTagPreset, type GuideExample, type OfflineCatalog, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedLibraryItem, type SavedPromptData, type SavedPromptSnapshot, type WeightedTag } from './types';
+import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
+import { deleteLibraryImage, exportCustomTags, hasExistingProfile, importCustomTags, importCustomTagsPath, loadArtistMix, loadCustomTagLibraryWarning, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage, transactCustomTags } from './storage';
+import { CUSTOM_TAG_MAX_LENGTH, PREVIEW_CACHE_BUDGETS, type AnimationMode, type AppSettings, type ArtistMixDraft, type BasePrompt, type CatalogCard, type Character, type CustomTag, type CustomTagKind, type CustomTagPackResult, type CustomTagPreset, type CustomTagZone, type GuideExample, type OfflineCatalog, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedCharacterItem, type SavedLibraryItem, type SavedPromptData, type SavedPromptSnapshot, type WeightedTag } from './types';
 import type { CatalogComponentProgress, CatalogComponentStatus, UpdateManifest, UpdateProgress } from './global';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
-type Modal = 'artists' | 'characters' | 'character-details' | 'constructor' | 'saved-library' | null;
+type Modal = 'artists' | 'characters' | 'character-details' | 'character-remove' | 'constructor' | 'saved-library' | null;
+type ConstructorTarget = { kind: 'base'; zone: ConstructorZone } | { kind: 'character'; characterId: string };
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.5';
+const APP_VERSION = '0.6.6';
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -55,6 +57,7 @@ let randomNotice = '';
 let mixNotice = '';
 let modal: Modal = null;
 let detailCharacterId: string | null = null;
+let characterModalReturnFocus: HTMLElement | null = null;
 let artistPickerTrigger: HTMLElement | null = null;
 let mixPickerTrigger: HTMLElement | null = null;
 let characterPickerTrigger: HTMLElement | null = null;
@@ -97,6 +100,7 @@ const hoverPreviewCache = new PreviewCache({ variant: 'official-artist-original'
 // Keep this name as a local compatibility alias for startup/catalog callers.
 const previewCache = gridPreviewCache;
 let previewIdleCancel: (() => void) | null = null;
+let startupWarmupLastInputAt = 0;
 let currentArtistPageLease: PreviewLease | null = null;
 let currentMixPageLease: PreviewLease | null = null;
 const recentArtistPageLeases = new Map<string, PreviewLease>();
@@ -131,7 +135,7 @@ let mixTransitionActive = false;
 let mixTransitionToken = 0;
 let mixTransitionTimer: number | undefined;
 let mixTransitionRevealFrame: number | undefined;
-let constructorZone: ConstructorZone | null = null;
+let constructorTarget: ConstructorTarget | null = null;
 let constructorTrigger: HTMLElement | null = null;
 let constructorSearch = '';
 const CONSTRUCTOR_IMAGE_CONCURRENCY = 6;
@@ -146,26 +150,33 @@ const constructorFolderOpenState: Record<ConstructorZone, Record<string, boolean
   scene: {},
   render: {}
 };
+const characterConstructorFolderOpenState: Record<string, Record<string, boolean>> = {};
 let guideCards: ConstructorCard[] = [];
 let guideState: 'loading' | 'ready' | 'error' = 'loading';
 let customTagPresets: CustomTagPreset[] = loadCustomTagPresets();
 let customTags: CustomTag[] = loadCustomTags();
+let appliedCustomArtistSignature = '';
+let customTagLibraryWarning = loadCustomTagLibraryWarning();
+if (customTagLibraryWarning) console.warn(`[custom-tags] ${customTagLibraryWarning}`);
 let selectedCustomPresetId = DEFAULT_CUSTOM_TAG_PRESET_ID;
 let customTagSearch = '';
-let customTagFilter: ConstructorZone | 'artist' | 'all' = 'all';
+let customTagFilter: CustomTagZone | 'artist' | 'all' = 'all';
 let customTagFormKind: CustomTagKind = 'tag';
 let editingCustomTagId: string | null = null;
 let creatingCustomPreset = false;
 let renamingCustomPresetId: string | null = null;
 let deletingCustomPresetId: string | null = null;
+let customPresetDeleteError = '';
 let customImageBytes: Uint8Array | null = null;
 let customImageMime: CustomTag['mime'] | null = null;
 let customImageName = '';
+let customTagPackStatus = '';
+let customTagPackStatusKind: 'success' | 'error' | 'cancelled' | '' = '';
 const customImageUrls = new Map<string, string>();
 const savedLibraryImageUrls = new Map<string, string>();
 let savedLibrarySearch = '';
-let savedLibraryFilter: 'all' | 'prompt' | 'artist-mix' = 'all';
-let libraryModalMode: 'save-prompt' | 'save-mix' | 'edit' | 'delete' | null = null;
+let savedLibraryFilter: 'all' | 'prompt' | 'artist-mix' | 'character' = 'all';
+let libraryModalMode: 'save-prompt' | 'save-mix' | 'save-character' | 'edit' | 'delete' | null = null;
 let libraryModalItemId: string | null = null;
 let libraryCoverBytes: Uint8Array | null = null;
 let libraryCoverMime: SavedLibraryItem['mime'] = undefined;
@@ -177,6 +188,7 @@ let libraryFormName = '';
 let libraryFormDescription = '';
 let libraryFormPrompt: SavedPromptData = { positive: '', negative: '', characters: [] };
 let libraryFormMix: SavedArtistMixData = { artists: [], serializedPrompt: '' };
+let libraryFormCharacter: SavedCharacterData = { positive: '', negative: '' };
 let libraryFormScrollTop = 0;
 let searchDebounceTimer: number | undefined;
 const workspaceScrollTop = new Map<string, number>();
@@ -184,7 +196,7 @@ const viewScrollTop = new Map<string, number>();
 let renderedWorkspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings' = activeWorkspace;
 const libraryPolarities = new Map<string, { base: 'positive' | 'negative'; characters: Array<'positive' | 'negative'> }>();
 // Legacy compatibility marker: new MetadataWorkspace(() => catalog.artists)
-const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card), saveMetadataToLibrary);
+const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card), saveMetadataToLibrary, () => customTagPresets, saveMetadataTagToCustomTags, savedMetadataId);
 
 function scheduleSearch(callback: () => void): void {
   if (searchDebounceTimer !== undefined) window.clearTimeout(searchDebounceTimer);
@@ -301,6 +313,10 @@ function clearHoverPreviewCache(): void {
   clearArtistCardPreview();
   hoverPreviewCache.clear();
   activeHoverOriginalSource = '';
+}
+function cancelStartupIdlePreviews(): void {
+  previewIdleCancel?.();
+  previewIdleCancel = null;
 }
 function invalidateOfficialPreviewCatalog(revision: string): void {
   // Grid thumbnails and hover originals share catalog ownership but never
@@ -703,7 +719,7 @@ function artistMixWorkspace(): string {
   const poolSize = mixPool().length;
   const status = `<p class="random-notice" id="mix-notice" role="status"${mixNotice ? '' : ' hidden'}>${escapeHtml(mixNotice)}</p>`;
   const panelLabel = focusMode ? 'aria-label="Artist Mix"' : 'aria-labelledby="artist-mix-tab"';
-  return `<section id="artist-mix-panel" class="artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><div class="mix-behavior-toggles" role="group" aria-label="Mix behavior"><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><button class="chip mix-lock-toggle ${artistMix.anchorWeightsLocked ? 'on' : ''}" id="mix-anchor-weights-lock" type="button" aria-pressed="${artistMix.anchorWeightsLocked}"><span class="mix-lock-switch" aria-hidden="true"></span>Lock anchor strength</button></div><div class="mix-actions"><button class="primary" id="mix-artists" type="button" ${mixTransitionActive ? 'disabled aria-busy="true"' : ''}>${mixTransitionActive ? 'Mixing artists...' : 'Mix artists'}</button><button class="secondary" id="mix-reroll-strength" type="button">Reroll strength</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div>${status}</section><section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
+  return `<section id="artist-mix-panel" class="${workspacePanelClass('artist-mix')} artist-mix-workspace ${focusMode ? 'is-focus' : ''}" role="tabpanel" ${panelLabel}><section class="mix-random-settings" aria-label="Artist Mix random settings"><div><p class="eyebrow">ARTIST MIX</p><h3>Constellation controls</h3><small>Total artists, including anchors</small></div><label>From <input id="mix-random-min" type="number" min="2" max="${maxTotal}" value="${range.min}"></label><label>to <input id="mix-random-max" type="number" min="2" max="${maxTotal}" value="${range.max}"></label><div class="mix-behavior-toggles" role="group" aria-label="Mix behavior"><button class="chip ${artistMix.favoritesOnly ? 'on' : ''}" id="mix-favorites-only" type="button" aria-pressed="${artistMix.favoritesOnly}">★ Favorites (${poolSize})</button><button class="chip mix-lock-toggle ${artistMix.anchorWeightsLocked ? 'on' : ''}" id="mix-anchor-weights-lock" type="button" aria-pressed="${artistMix.anchorWeightsLocked}"><span class="mix-lock-switch" aria-hidden="true"></span>Lock anchor strength</button></div><div class="mix-actions"><button class="primary" id="mix-artists" type="button" ${mixTransitionActive ? 'disabled aria-busy="true"' : ''}>${mixTransitionActive ? 'Mixing artists...' : 'Mix artists'}</button><button class="secondary" id="mix-reroll-strength" type="button">Reroll strength</button><button class="secondary mix-focus-button" id="${focusMode ? 'exit-mix-focus' : 'enter-mix-focus'}" type="button">${focusMode ? 'Exit focus' : 'Focus'}</button></div>${status}</section><section class="mix-stage" aria-label="Artist Mix selected artists"><div class="mix-stage-heading"><div><p class="eyebrow">CENTER STAGE</p><h3>${artistMix.anchors.length} anchor${artistMix.anchors.length === 1 ? '' : 's'} + ${artistMix.companions.length} companions</h3></div><div class="mix-stage-tools"><button class="secondary" id="open-mix-primary-picker" type="button">Add anchor</button><button class="secondary" id="open-mix-companion-picker" type="button">Add companion</button></div></div>${mixOrbitMarkup()}</section><section class="mix-output"><div><p class="eyebrow">ARTIST PROMPT</p><code id="mix-prompt-output">${escapeHtml(buildArtistsPrompt(total))}</code></div><div class="mix-output-actions"><button class="primary" id="copy-mix-prompt" type="button">Copy artists prompt</button><button class="secondary" id="save-mix-library" type="button">Save artist mix</button></div></section></section>`;
 }
 
 function mixPickerMarkup(): string {
@@ -762,7 +778,7 @@ function componentSettingsMarkup(browserOnly: boolean): string {
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
   const catalogControls = browserOnly ? '' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`;
-  return `<section id="settings-panel" class="settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">PREVIEWS</p><h3>Memory budget</h3><label class="settings-field">Artist preview cache<select id="preview-cache-preset"><option value="large"${settings.previewCachePreset === 'large' ? ' selected' : ''}>Large · 1.5 GB total</option><option value="balanced"${settings.previewCachePreset === 'balanced' ? ' selected' : ''}>Balanced · 576 MB total</option></select></label><p class="settings-help">Official artist cards use runtime thumbnails; originals are kept only while hovering.</p></section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
+  return `<section id="settings-panel" class="${workspacePanelClass('settings')} settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">PREVIEWS</p><h3>Memory budget</h3><label class="settings-field">Artist preview cache<select id="preview-cache-preset"><option value="large"${settings.previewCachePreset === 'large' ? ' selected' : ''}>Large · 1.5 GB total</option><option value="balanced"${settings.previewCachePreset === 'balanced' ? ' selected' : ''}>Balanced · 576 MB total</option></select></label><p class="settings-help">Official artist cards use runtime thumbnails; originals are kept only while hovering.</p></section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -775,7 +791,7 @@ function characterCard(card: CatalogCard): string {
 }
 
 function charactersZone(): string {
-  return `<aside class="zone zone-right" aria-label="Character workflow"><div class="zone-heading"><div><p class="eyebrow">V4.5 CHARACTERS</p><h2>Characters <span id="character-total">${characters.length}</span></h2><p>Separate NovelAI character blocks. Character text never enters the base copy.</p></div><div class="character-entry-actions"><button class="primary" id="add-character" type="button">＋ Add manually</button><button class="secondary" id="open-character-picker" type="button">Browse ${catalog.characters.length.toLocaleString()} cards</button></div></div><div class="character-list">${characters.length ? characters.map(characterBlock).join('') : '<p class="empty-inline">Add a character from the catalog or browse the full catalog.</p>'}</div></aside>`;
+  return `<aside class="zone zone-right" aria-label="Character workflow"><div class="zone-heading"><div><p class="eyebrow">CHARACTERS</p><h2>Characters <span id="character-total">${characters.length}</span></h2><p>Separate NovelAI character blocks. Character text never enters the base copy.</p></div><div class="character-entry-actions"><button class="secondary" id="character-details" type="button">Details</button><button class="primary" id="add-character" type="button">＋ Add manually</button><button class="secondary" id="open-character-picker" type="button">Browse ${catalog.characters.length.toLocaleString()} cards</button></div></div><div class="character-list">${characters.length ? characters.map(characterBlock).join('') : '<p class="empty-inline">Add a character from the catalog or browse the full catalog.</p>'}</div></aside>`;
 }
 
 function characterPickerStatus(page: ReturnType<typeof paginateCharacters>): string {
@@ -794,15 +810,24 @@ function characterPickerMarkup(): string {
   return `<div class="modal-backdrop character-picker-backdrop" id="character-picker-backdrop" hidden><section class="picker-modal character-picker-modal" id="character-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="character-picker-title" aria-describedby="character-picker-status"><header><div><p class="eyebrow">V4.5 CHARACTERS · OFFLINE</p><h2 id="character-picker-title">Browse character cards</h2><p id="character-picker-count">${count}</p></div><button class="icon-button" id="close-character-picker" type="button" aria-label="Close character picker">×</button></header><div class="picker-tools"><input id="character-search" value="${escapeHtml(characterSearch)}" placeholder="Search all V4.5 characters..." aria-label="Search all V4.5 characters"><button class="chip ${characterFavoritesOnly ? 'on' : ''}" id="character-favorites" type="button" aria-pressed="${characterFavoritesOnly}">★ Favorites</button></div><div id="character-picker-status">${characterPickerStatus(page)}</div><div class="character-grid character-picker-grid" id="character-grid">${page.cards.map(characterCard).join('')}</div><footer class="catalog-pagination"><button class="secondary" id="character-previous" type="button" ${page.hasPrevious ? '' : 'disabled'}>Previous</button><span id="character-page-status" role="status" aria-live="polite">${pageLabel}</span><button class="secondary" id="character-next" type="button" ${page.hasNext ? '' : 'disabled'}>Next</button></footer></section></div>`;
 }
 
+function characterPromptEditor(character: Character): string {
+  const editorId = `editor-character-${character.id}`;
+  return `<div class="manual-editor character-prompt-editor"><div class="prompt-editor-toolbar"><label class="prompt-editor-label" for="${editorId}">Character positive</label><button class="secondary constructor-open" type="button" data-open-character-constructor="${escapeHtml(character.id)}" aria-label="Browse character tags for ${escapeHtml(character.label)}">✦ Browse character tags</button></div><textarea id="${editorId}" data-editor="character" data-editor-id="${escapeHtml(character.id)}" placeholder="girl, blue eyes, short hair" spellcheck="false">${escapeHtml(character.prompt)}</textarea><div class="suggestions" data-suggestions="character:${escapeHtml(character.id)}"></div></div>`;
+}
+
 function characterBlock(character: Character, index: number): string {
-  return `<article class="character-block"><header><div class="character-title"><span class="number">${index + 1}</span><input class="character-name" value="${escapeHtml(character.label)}" data-character-name="${character.id}" aria-label="Character name"></div><div class="character-actions"><button class="small" data-character-details="${character.id}">Details</button><button class="small" data-copy-character="${character.id}">Copy</button><button class="icon-button" data-remove-character="${character.id}" aria-label="Remove character">×</button></div></header>${editor('character', character.id, character.prompt, 'Character prompt', 'girl, blue eyes, short hair')}${editor('undesired', character.id, character.undesired, 'Character undesired', 'hat, blurry')}</article>`;
+  return `<article class="character-block"><header><div class="character-title"><span class="number">${index + 1}</span><input class="character-name" value="${escapeHtml(character.label)}" data-character-name="${character.id}" aria-label="Character name"></div><div class="character-actions"><button class="small" type="button" data-save-character="${escapeHtml(character.id)}">Save character</button><button class="small" type="button" data-copy-character="${escapeHtml(character.id)}">Copy</button><button class="icon-button" type="button" data-remove-character="${escapeHtml(character.id)}" aria-label="Remove character">×</button></div></header>${characterPromptEditor(character)}${editor('undesired', character.id, character.undesired, 'Character undesired', 'hat, blurry')}</article>`;
 }
 
 function savedLibraryItems(): SavedLibraryItem[] {
   const query = savedLibrarySearch.trim().toLocaleLowerCase();
   return savedLibrary.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).filter(item => {
     const typeMatch = savedLibraryFilter === 'all' || item.kind === savedLibraryFilter;
-    const detailText = item.kind === 'prompt' ? `${item.data?.positive ?? ''} ${item.data?.negative ?? ''} ${item.data?.characters.map(character => `${character.label} ${character.positive} ${character.negative}`).join(' ') ?? ''}` : `${item.data?.serializedPrompt ?? ''} ${item.data?.artists.map(artist => artist.tag).join(' ') ?? ''}`;
+    const detailText = item.kind === 'prompt'
+      ? `${item.data?.positive ?? ''} ${item.data?.negative ?? ''} ${item.data?.characters.map(character => `${character.label} ${character.positive} ${character.negative}`).join(' ') ?? ''}`
+      : item.kind === 'artist-mix'
+        ? `${item.data?.serializedPrompt ?? ''} ${item.data?.artists.map(artist => artist.tag).join(' ') ?? ''}`
+        : `${item.data?.positive ?? ''} ${item.data?.negative ?? ''}`;
     const textMatch = !query || `${item.name} ${item.description ?? ''} ${item.prompt} ${item.originalName ?? ''} ${detailText}`.toLocaleLowerCase().includes(query);
     return typeMatch && textMatch;
   });
@@ -810,7 +835,7 @@ function savedLibraryItems(): SavedLibraryItem[] {
 
 function savedLibraryCardMarkup(item: SavedLibraryItem): string {
   const image = libraryImageUrl(item);
-  const label = item.kind === 'artist-mix' ? 'Artist Mix' : 'Prompt';
+  const label = item.kind === 'artist-mix' ? 'Artist Mix' : item.kind === 'character' ? 'Character' : 'Prompt';
   const date = new Date(item.updatedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   const polarity = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: (item.kind === 'prompt' ? item.data?.characters ?? [] : []).map(() => 'positive' as const) };
   libraryPolarities.set(item.id, polarity);
@@ -822,15 +847,18 @@ function savedLibraryCardMarkup(item: SavedLibraryItem): string {
   const generationMarkup = generationValues.length ? `<div class="saved-library-generation"><span>Generation metadata</span><code>${escapeHtml(generationValues.join(' | '))}</code></div>` : '';
   const details = item.kind === 'prompt'
     ? `<details class="saved-library-details"><summary>Prompt details</summary>${promptBlock('Base prompt', { positive: item.data?.positive ?? item.prompt, negative: item.data?.negative ?? '' }, -1, polarity.base)}${(item.data?.characters ?? []).map((character, index) => promptBlock(character.label, character, index, polarity.characters[index] ?? 'positive')).join('')}${generationMarkup}</details>`
-    : `<details class="saved-library-details"><summary>Artist details</summary><code>${escapeHtml(item.data?.artists.map(artist => `${artist.tag} (${artist.weight})`).join(', ') || 'No structured artists')}</code></details>`;
-  const previewAttrs = image ? ` tabindex="0" role="img" aria-label="Preview cover for ${escapeHtml(item.name)}" data-library-preview-image="${escapeHtml(image)}" data-library-preview-tag="${escapeHtml(item.name)}" data-library-preview-prompt="${escapeHtml(item.kind === 'prompt' ? item.data?.positive ?? item.prompt : item.data?.serializedPrompt ?? item.prompt)}" data-library-preview-description="${escapeHtml(item.description ?? '')}"` : '';
+    : item.kind === 'artist-mix'
+      ? `<details class="saved-library-details"><summary>Artist details</summary><code>${escapeHtml(item.data?.artists.map(artist => `${artist.tag} (${artist.weight})`).join(', ') || 'No structured artists')}</code></details>`
+      : `<details class="saved-library-details"><summary>Character details</summary>${promptBlock(item.name, item.data, -1, polarity.base)}</details>`;
+  const previewPrompt = item.kind === 'prompt' ? item.data?.positive ?? item.prompt : item.kind === 'artist-mix' ? item.data?.serializedPrompt ?? item.prompt : item.data.positive;
+  const previewAttrs = image ? ` tabindex="0" role="img" aria-label="Preview cover for ${escapeHtml(item.name)}" data-library-preview-image="${escapeHtml(image)}" data-library-preview-tag="${escapeHtml(item.name)}" data-library-preview-prompt="${escapeHtml(previewPrompt)}" data-library-preview-description="${escapeHtml(item.description ?? '')}"` : '';
   return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}"${previewAttrs}>${image ? `<img data-preview-cache="content" data-preview-src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><p class="saved-library-description">${escapeHtml(item.description || 'No description.')}</p>${details}<div class="saved-library-actions"><button class="secondary saved-library-rounded" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="secondary saved-library-rounded" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
 }
 
 function savedLibraryWorkspace(): string {
   const items = savedLibraryItems();
-  const emptyCopy = savedLibrary.length ? 'Try a different name or type filter.' : 'Create an independent prompt or Artist Mix record.';
-  return `<section id="saved-library-panel" class="saved-library-workspace" role="tabpanel" aria-labelledby="saved-library-tab"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="saved-library-title">Saved Library</h2><p>Create independent prompt and Artist Mix records on this device.</p></div><div class="saved-library-header-actions"><button class="primary" id="save-library-prompt" type="button">＋ New Prompt</button><button class="secondary" id="save-library-mix" type="button">＋ New Artist Mix</button></div></header><div class="saved-library-tools"><input id="saved-library-search" value="${escapeHtml(savedLibrarySearch)}" placeholder="Search saved items..." aria-label="Search Saved Library"><div class="saved-library-filter" role="group" aria-label="Filter Saved Library"><button class="chip ${savedLibraryFilter === 'all' ? 'on' : ''}" type="button" data-library-filter="all">All</button><button class="chip ${savedLibraryFilter === 'prompt' ? 'on' : ''}" type="button" data-library-filter="prompt">Prompts</button><button class="chip ${savedLibraryFilter === 'artist-mix' ? 'on' : ''}" type="button" data-library-filter="artist-mix">Artist Mix</button></div></div><div class="saved-library-grid" id="saved-library-grid">${items.length ? items.map(savedLibraryCardMarkup).join('') : `<div class="saved-library-empty"><span class="brand-mark">✦</span><h3>${savedLibrary.length ? 'No saved items match this search.' : 'Your Saved Library is ready.'}</h3><p>${emptyCopy}</p><button class="secondary" type="button" id="save-library-empty">New Prompt</button></div>`}</div></section>`;
+  const emptyCopy = savedLibrary.length ? 'Try a different name or type filter.' : 'Create an independent prompt, Artist Mix, or Character record.';
+  return `<section id="saved-library-panel" class="${workspacePanelClass('saved-library')} saved-library-workspace" role="tabpanel" aria-labelledby="saved-library-tab"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="saved-library-title">Saved Library</h2><p>Create independent prompt, Artist Mix, and Character records on this device.</p></div><div class="saved-library-header-actions"><button class="primary" id="save-library-prompt" type="button">＋ New Prompt</button><button class="secondary" id="save-library-mix" type="button">＋ New Artist Mix</button><button class="secondary" id="save-library-character" type="button">＋ New Character</button></div></header><div class="saved-library-tools"><input id="saved-library-search" value="${escapeHtml(savedLibrarySearch)}" placeholder="Search saved items..." aria-label="Search Saved Library"><div class="saved-library-filter" role="group" aria-label="Filter Saved Library"><button class="chip ${savedLibraryFilter === 'all' ? 'on' : ''}" type="button" data-library-filter="all">All</button><button class="chip ${savedLibraryFilter === 'prompt' ? 'on' : ''}" type="button" data-library-filter="prompt">Prompts</button><button class="chip ${savedLibraryFilter === 'artist-mix' ? 'on' : ''}" type="button" data-library-filter="artist-mix">Artist Mix</button><button class="chip ${savedLibraryFilter === 'character' ? 'on' : ''}" type="button" data-library-filter="character">Characters</button></div></div><div class="saved-library-grid" id="saved-library-grid">${items.length ? items.map(savedLibraryCardMarkup).join('') : `<div class="saved-library-empty"><span class="brand-mark">✦</span><h3>${savedLibrary.length ? 'No saved items match this search.' : 'Your Saved Library is ready.'}</h3><p>${emptyCopy}</p><button class="secondary" type="button" id="save-library-empty">New Prompt</button></div>`}</div></section>`;
 }
 
 function savedLibraryModalMarkup(): string {
@@ -840,13 +868,16 @@ function savedLibraryModalMarkup(): string {
     return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="detail-modal saved-library-confirm" role="dialog" aria-modal="true" aria-labelledby="saved-library-confirm-title"><header><div><p class="eyebrow">SAVED LIBRARY</p><h2 id="saved-library-confirm-title">Delete this saved item?</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><p>Delete <b>${escapeHtml(item?.name ?? 'this item')}</b>? Its cover image will also be removed from this device.</p><div class="saved-library-modal-actions"><button class="danger-button" id="confirm-library-action" type="button">Delete item</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></section></div>`;
   }
   const editing = libraryModalMode === 'edit';
-  const kind = editing ? item?.kind : libraryModalMode === 'save-mix' ? 'artist-mix' : 'prompt';
+  const kind: SavedLibraryItem['kind'] = editing ? item?.kind ?? 'prompt' : libraryModalMode === 'save-mix' ? 'artist-mix' : libraryModalMode === 'save-character' ? 'character' : 'prompt';
   const currentImage = libraryCoverRemoved ? '' : libraryCoverBytes && libraryCoverMime ? savedLibraryImageUrls.get('__draft__') ?? '' : item ? libraryImageUrl(item) : '';
   const imagePreview = currentImage ? `<div class="saved-library-cover-preview"><img src="${escapeHtml(currentImage)}" alt="Selected cover preview"><button class="tiny-copy" id="remove-library-cover" type="button">Remove cover</button></div>` : '<p class="saved-library-cover-empty">Optional PNG, JPEG, or WebP cover up to 20 MiB.</p>';
   const promptFields = kind === 'prompt'
     ? `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Base positive</span><textarea id="saved-library-positive">${escapeHtml(libraryFormPrompt.positive)}</textarea></label><label class="field"><span>Base negative</span><textarea id="saved-library-negative">${escapeHtml(libraryFormPrompt.negative)}</textarea></label><div class="saved-library-characters">${libraryFormPrompt.characters.map((character, index) => `<section data-library-character-section="${escapeHtml(character.id)}"><div class="saved-library-character-heading"><b>${escapeHtml(character.label || `Character ${index + 1}`)}</b><button class="saved-library-character-remove" type="button" data-remove-library-character="${escapeHtml(character.id)}" aria-label="Remove ${escapeHtml(character.label || `Character ${index + 1}`)}" title="Remove character"><span aria-hidden="true">−</span></button></div><label class="field"><span>Character label</span><input data-library-character-label="${index}" value="${escapeHtml(character.label)}"></label><label class="field"><span>Character positive</span><textarea data-library-character-positive="${index}">${escapeHtml(character.positive)}</textarea></label><label class="field"><span>Character negative</span><textarea data-library-character-negative="${index}">${escapeHtml(character.negative)}</textarea></label></section>`).join('')}<button class="secondary saved-library-character-add" id="add-library-character" type="button">Add character</button></div>`
-    : `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Artist prompt</span><textarea id="saved-library-mix-prompt">${escapeHtml(libraryFormMix.serializedPrompt)}</textarea></label>`;
-  return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="picker-modal saved-library-form-modal" role="dialog" aria-modal="true" aria-labelledby="saved-library-form-title"><header><div><p class="eyebrow">${editing ? 'EDIT SAVED ITEM' : kind === 'artist-mix' ? 'SAVE ARTIST MIX' : 'SAVE PROMPT'}</p><h2 id="saved-library-form-title">${editing ? 'Edit Saved Library item' : 'Create an independent record'}</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><form id="saved-library-form"><div class="saved-library-form-scroll" data-library-form-scroll><label class="field"><span>Name</span><input id="saved-library-name" maxlength="120" required value="${escapeHtml(libraryFormName)}" placeholder="e.g. Soft portrait setup"></label>${promptFields}<label class="field saved-library-cover-field"><span>Preview <i>Optional</i></span><div class="saved-library-cover-drop${currentImage ? ' has-image' : ''}" id="saved-library-cover-drop"><input id="saved-library-cover-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" hidden><button type="button" class="secondary" id="choose-library-cover">Choose preview</button><span>or drop an image here</span>${imagePreview}</div><p class="saved-library-cover-error" id="saved-library-cover-error" role="alert">${escapeHtml(libraryCoverError)}</p></label></div><div class="saved-library-modal-actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Save to library'}</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></form></section></div>`;
+    : kind === 'artist-mix'
+      ? `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Artist prompt</span><textarea id="saved-library-mix-prompt">${escapeHtml(libraryFormMix.serializedPrompt)}</textarea></label>`
+      : `<label class="field"><span>Description</span><textarea id="saved-library-description">${escapeHtml(libraryFormDescription)}</textarea></label><label class="field"><span>Character positive</span><textarea id="saved-library-character-positive">${escapeHtml(libraryFormCharacter.positive)}</textarea></label><label class="field"><span>Character negative</span><textarea id="saved-library-character-negative">${escapeHtml(libraryFormCharacter.negative)}</textarea></label>`;
+  const formEyebrow = editing ? 'EDIT SAVED ITEM' : kind === 'artist-mix' ? 'SAVE ARTIST MIX' : kind === 'character' ? 'SAVE CHARACTER' : 'SAVE PROMPT';
+  return `<div class="modal-backdrop saved-library-modal-backdrop"><section class="picker-modal saved-library-form-modal" role="dialog" aria-modal="true" aria-labelledby="saved-library-form-title"><header><div><p class="eyebrow">${formEyebrow}</p><h2 id="saved-library-form-title">${editing ? 'Edit Saved Library item' : 'Create an independent record'}</h2></div><button class="icon-button" id="close-library-modal" type="button" aria-label="Close">×</button></header><form id="saved-library-form"><div class="saved-library-form-scroll" data-library-form-scroll><label class="field"><span>Name</span><input id="saved-library-name" maxlength="120" required value="${escapeHtml(libraryFormName)}" placeholder="e.g. Soft portrait setup"></label>${promptFields}<label class="field saved-library-cover-field"><span>Preview <i>Optional</i></span><div class="saved-library-cover-drop${currentImage ? ' has-image' : ''}" id="saved-library-cover-drop"><input id="saved-library-cover-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" hidden><button type="button" class="secondary" id="choose-library-cover">Choose preview</button><span>or drop an image here</span>${imagePreview}</div><p class="saved-library-cover-error" id="saved-library-cover-error" role="alert">${escapeHtml(libraryCoverError)}</p></label></div><div class="saved-library-modal-actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Save to library'}</button><button class="secondary" id="cancel-library-action" type="button">Cancel</button></div></form></section></div>`;
 }
 
 function customTagImageUrl(tag: CustomTag): string {
@@ -865,7 +896,8 @@ function customTagPresetId(tag: CustomTag): string {
 
 function customCard(tag: CustomTag): ConstructorCard {
   const preset = customPreset(customTagPresetId(tag));
-  return { id: `custom-${tag.id}`, tag: tag.tag, tags: splitTagGroup(tag.tag), zone: tag.zone, section: 'Custom', image: customTagImageUrl(tag), kind: 'tag', presetId: preset.id, group: preset.name, description: tag.description ?? '' };
+  const zone = tag.zone === 'character' ? 'frame' : tag.zone;
+  return { id: `custom-${tag.id}`, tag: tag.tag, tags: splitTagGroup(tag.tag), zone, section: 'Custom', image: customTagImageUrl(tag), kind: 'tag', presetId: preset.id, group: preset.name, description: tag.description ?? '' };
 }
 
 function rebuildEffectiveArtistCatalog(): void {
@@ -873,6 +905,9 @@ function rebuildEffectiveArtistCatalog(): void {
   artistCatalogAliases = merged.aliases;
   shadowedCustomArtistIds = merged.shadowedCustomIds;
   catalog.artists = merged.cards;
+  // Keep the snapshot fast path correct even before the first library
+  // transaction, when the initial catalog load has already reconciled tags.
+  appliedCustomArtistSignature = customArtistSignature(customTags);
 
   const previousArtists = JSON.stringify(base.artists);
   const previousMix = JSON.stringify(artistMix);
@@ -900,16 +935,24 @@ function setZonePrompt(zone: ConstructorZone, value: string): void {
 }
 
 function constructorCards(zone: ConstructorZone): ConstructorCard[] {
-  const custom = customTags.filter(tag => tag.kind !== 'artist' && tag.zone === zone).map(customCard);
+  const custom = customTags.filter(tag => tag.kind !== 'artist' && tag.zone !== 'character' && tag.zone === zone).map(customCard);
   return mergeConstructorCards(guideCards.filter(card => card.zone === zone), custom);
+}
+
+function characterConstructorCards(characterId: string): ConstructorCard[] {
+  // Character constructors intentionally contain only user-authored character
+  // cards. Built-in guide cards stay classified as frame, scene, or render.
+  return customTags.filter(tag => tag.kind !== 'artist' && tag.zone === 'character').map(customCard);
 }
 
 function constructorPresetFolders(): ConstructorPresetFolder[] {
   return customTagPresets.map(preset => ({ id: preset.id, name: preset.name }));
 }
 
-function constructorFolderViews(zone: ConstructorZone): ReturnType<typeof searchConstructorFolders> {
-  const folders = groupConstructorCards(constructorCards(zone), constructorPresetFolders());
+function constructorFolderViews(target: ConstructorTarget): ReturnType<typeof searchConstructorFolders> {
+  const cards = target.kind === 'character' ? characterConstructorCards(target.characterId) : constructorCards(target.zone);
+  const presets = target.kind === 'character' ? customTagPresets.map(preset => ({ id: preset.id, name: preset.name })) : constructorPresetFolders();
+  const folders = groupConstructorCards(cards, presets).filter(folder => target.kind !== 'character' || folder.id !== 'builtin:hothottuk');
   return searchConstructorFolders(folders, constructorSearch);
 }
 
@@ -917,9 +960,22 @@ function constructorFolderDomId(folderId: string): string {
   return `constructor-folder-${folderId.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
 }
 
-function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): string {
+function constructorTargetPrompt(target: ConstructorTarget): string {
+  if (target.kind === 'base') return zonePrompt(target.zone);
+  return characters.find(character => character.id === target.characterId)?.prompt ?? '';
+}
+
+function setConstructorTargetPrompt(target: ConstructorTarget, value: string): void {
+  if (target.kind === 'base') setZonePrompt(target.zone, value);
+  else {
+    const character = characters.find(item => item.id === target.characterId);
+    if (character) character.prompt = value;
+  }
+}
+
+function constructorCardMarkup(card: ConstructorCard, target: ConstructorTarget): string {
   const tags = card.kind === 'preset' ? (card.tags ?? qualityPresetTags()) : constructorCardTags(card);
-  const selected = hasPromptTagGroup(zonePrompt(zone), tags);
+  const selected = hasPromptTagGroup(constructorTargetPrompt(target), tags);
   const hasImage = Boolean(card.image);
   const image = hasImage ? (card.image!.startsWith('nai-custom://') ? card.image : guideImage(card.image)) : '';
   const description = card.description?.trim() ?? '';
@@ -927,21 +983,27 @@ function constructorCardMarkup(card: ConstructorCard, zone: ConstructorZone): st
   return `<article class="constructor-card ${selected ? 'selected' : ''} ${card.kind === 'preset' ? 'preset' : ''}" data-constructor-card="${escapeHtml(card.id)}"><button class="constructor-card-pick" type="button" data-constructor-tag="${escapeHtml(card.id)}" ${hasImage ? `data-constructor-preview-image="${escapeHtml(image)}"` : 'data-constructor-preview-no-image="true"'} data-constructor-preview-tag="${escapeHtml(card.tag)}" data-constructor-preview-description="${escapeHtml(description)}" aria-pressed="${selected}"><span class="constructor-card-image ${hasImage ? '' : 'no-image'}">${visual}</span><b>${escapeHtml(card.tag)}</b><small>${escapeHtml(card.group ?? 'Custom')}</small></button></article>`;
 }
 
-function constructorFolderMarkup(folder: ConstructorFolder, zone: ConstructorZone, folderNameMatch: boolean): string {
+function constructorOpenState(target: ConstructorTarget): Record<string, boolean> {
+  if (target.kind === 'base') return constructorFolderOpenState[target.zone];
+  return characterConstructorFolderOpenState[target.characterId] ?? (characterConstructorFolderOpenState[target.characterId] = {});
+}
+
+function constructorFolderMarkup(folder: ConstructorFolder, target: ConstructorTarget, folderNameMatch: boolean): string {
   const searching = Boolean(constructorSearch.trim());
-  const open = searching || Boolean(constructorFolderOpenState[zone][folder.id]);
+  const open = searching || Boolean(constructorOpenState(target)[folder.id]);
   const domId = constructorFolderDomId(folder.id);
   const countLabel = `${folder.cards.length} ${folder.cards.length === 1 ? 'card' : 'cards'}`;
-  return `<section class="constructor-folder${open ? ' is-open' : ''}${folderNameMatch ? ' name-match' : ''}" data-constructor-folder-shell="${escapeHtml(folder.id)}"><button class="constructor-folder-toggle" type="button" data-constructor-folder="${escapeHtml(folder.id)}" aria-expanded="${open}" aria-controls="${domId}-cards"><span class="constructor-folder-icon" aria-hidden="true"></span><span class="constructor-folder-heading"><b>${escapeHtml(folder.name)}</b><small>${countLabel}</small></span><span class="constructor-folder-chevron" aria-hidden="true">⌄</span></button><div class="constructor-folder-reveal" id="${domId}-cards" aria-hidden="${!open}"${open ? '' : ' inert'}><div class="constructor-folder-cards">${folder.cards.map(card => constructorCardMarkup(card, zone)).join('')}</div></div></section>`;
+  return `<section class="constructor-folder${open ? ' is-open' : ''}${folderNameMatch ? ' name-match' : ''}" data-constructor-folder-shell="${escapeHtml(folder.id)}"><button class="constructor-folder-toggle" type="button" data-constructor-folder="${escapeHtml(folder.id)}" aria-expanded="${open}" aria-controls="${domId}-cards"><span class="constructor-folder-icon" aria-hidden="true"></span><span class="constructor-folder-heading"><b>${escapeHtml(folder.name)}</b><small>${countLabel}</small></span><span class="constructor-folder-chevron" aria-hidden="true">⌄</span></button><div class="constructor-folder-reveal" id="${domId}-cards" aria-hidden="${!open}"${open ? '' : ' inert'}><div class="constructor-folder-cards">${folder.cards.map(card => constructorCardMarkup(card, target)).join('')}</div></div></section>`;
 }
 
 function constructorModalMarkup(): string {
-  if (!constructorZone) return '';
-  const folders = constructorFolderViews(constructorZone);
+  if (!constructorTarget) return '';
+  const target = constructorTarget;
+  const folders = constructorFolderViews(target);
   const cardCount = folders.reduce((total, folder) => total + folder.cards.length, 0);
-  const title = constructorZone === 'frame' ? 'Frame constructor' : constructorZone === 'scene' ? 'Scene constructor' : 'Render and quality constructor';
+  const title = target.kind === 'character' ? `${characters.find(character => character.id === target.characterId)?.label ?? 'Character'} constructor` : target.zone === 'frame' ? 'Frame constructor' : target.zone === 'scene' ? 'Scene constructor' : 'Render and quality constructor';
   const empty = '<p class="empty-inline">No constructor cards match this search.</p>';
-  return `<div class="modal-backdrop constructor-backdrop" id="constructor-backdrop"><section class="picker-modal constructor-modal" role="dialog" aria-modal="true" aria-labelledby="constructor-title"><header><div><p class="eyebrow">CUSTOM PROMPT BUILDER</p><h2 id="constructor-title">${title}</h2><p>Click a card to add or remove it. The dialog stays open while you build.</p></div><button class="icon-button" id="close-constructor" type="button" aria-label="Close constructor">×</button></header><div class="picker-tools"><input id="constructor-search" value="${escapeHtml(constructorSearch)}" placeholder="Search tags, folders and descriptions..." aria-label="Search constructor tags"><span class="constructor-count">${cardCount.toLocaleString()} cards</span></div><div class="constructor-grid" id="constructor-grid">${folders.length ? folders.map(folder => constructorFolderMarkup(folder, constructorZone!, folder.folderNameMatch)).join('') : empty}</div><footer class="constructor-footer"><span>Selected tags are written directly into the prompt row.</span><button class="primary" id="done-constructor" type="button">Done</button></footer></section></div>`;
+  return `<div class="modal-backdrop constructor-backdrop" id="constructor-backdrop"><section class="picker-modal constructor-modal" role="dialog" aria-modal="true" aria-labelledby="constructor-title"><header><div><p class="eyebrow">CUSTOM PROMPT BUILDER</p><h2 id="constructor-title">${title}</h2><p>Click a card to add or remove it. The dialog stays open while you build.</p></div><button class="icon-button" id="close-constructor" type="button" aria-label="Close constructor">×</button></header><div class="picker-tools"><input id="constructor-search" value="${escapeHtml(constructorSearch)}" placeholder="Search tags, folders and descriptions..." aria-label="Search constructor tags"><span class="constructor-count">${cardCount.toLocaleString()} cards</span></div><div class="constructor-grid" id="constructor-grid">${folders.length ? folders.map(folder => constructorFolderMarkup(folder, target, folder.folderNameMatch)).join('') : empty}</div><footer class="constructor-footer"><span>Selected tags are written directly into the prompt row.</span><button class="primary" id="done-constructor" type="button">Done</button></footer></section></div>`;
 }
 
 
@@ -954,14 +1016,18 @@ function customPresetMarkup(preset: CustomTagPreset): string {
   const selected = selectedCustomPresetId === preset.id;
   const renaming = renamingCustomPresetId === preset.id;
   const isDefault = preset.id === DEFAULT_CUSTOM_TAG_PRESET_ID;
-  const controls = selected && !isDefault ? `<div class="preset-actions" aria-label="Actions for ${escapeHtml(preset.name)}"><button class="icon-button preset-action-icon" type="button" data-rename-preset="${escapeHtml(preset.id)}" aria-label="Rename ${escapeHtml(preset.name)}" title="Rename preset">✎</button><button class="icon-button preset-action-icon danger-copy" type="button" data-delete-preset="${escapeHtml(preset.id)}" aria-label="Delete ${escapeHtml(preset.name)}" title="Delete preset">×</button></div>` : '';
+  const selectedPresetControls = selected && !isDefault;
+  const packAvailable = Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags);
+  const exportAction = !isDefault && customPresetCount(preset.id) > 0 ? `<button class="icon-button preset-action-icon" type="button" data-export-preset="${escapeHtml(preset.id)}" aria-label="Export ${escapeHtml(preset.name)} as a .naipack" title="${packAvailable ? 'Export .naipack' : 'Export is available in the desktop app'}"${packAvailable ? '' : ' disabled'}>⇩</button>` : '';
+  const controls = selectedPresetControls ? `<div class="preset-actions" aria-label="Actions for ${escapeHtml(preset.name)}"><button class="icon-button preset-action-icon" type="button" data-rename-preset="${escapeHtml(preset.id)}" aria-label="Rename ${escapeHtml(preset.name)}" title="Rename preset">✎</button><button class="icon-button preset-action-icon danger-copy" type="button" data-delete-preset="${escapeHtml(preset.id)}" aria-label="Delete ${escapeHtml(preset.name)}" title="Delete preset">×</button></div>` : '<div class="preset-actions" aria-hidden="true"></div>';
   const content = renaming
     ? `<form class="preset-rename-form" data-preset-rename-form="${escapeHtml(preset.id)}"><input id="preset-rename-${escapeHtml(preset.id)}" value="${escapeHtml(preset.name)}" maxlength="80" aria-label="Rename ${escapeHtml(preset.name)}"><button class="tiny-copy" type="submit">Save</button><button class="tiny-copy" type="button" data-cancel-rename="${escapeHtml(preset.id)}">Cancel</button></form>`
-    : `<div class="preset-select-shell"><button class="preset-select" type="button" data-select-preset="${escapeHtml(preset.id)}" aria-pressed="${selected}"><span><b>${escapeHtml(preset.name)}</b><small>${customPresetCount(preset.id)} ${customPresetCount(preset.id) === 1 ? 'card' : 'cards'}</small></span></button>${controls}<span class="preset-check" aria-hidden="true">${selected ? '●' : '○'}</span></div>`;
-  return `<div class="preset-row ${selected ? 'selected' : ''} ${isDefault ? 'default' : ''}">${content}</div>`;
+    : `<div class="preset-row-top"><button class="preset-select" type="button" data-select-preset="${escapeHtml(preset.id)}" aria-pressed="${selected}"><span><b>${escapeHtml(preset.name)}</b><small>${customPresetCount(preset.id)} ${customPresetCount(preset.id) === 1 ? 'card' : 'cards'}</small></span></button>${controls}<span class="preset-check" aria-hidden="true">${selected ? '●' : '○'}</span></div>`;
+  const exportFooter = exportAction ? `<button class="preset-export-footer" type="button" data-export-preset="${escapeHtml(preset.id)}" aria-label="Export ${escapeHtml(preset.name)} as a .naipack" title="${packAvailable ? 'Export .naipack' : 'Export is available in the desktop app'}"${packAvailable ? '' : ' disabled'}>Export .naipack</button>` : '';
+  return `<div class="preset-row ${selected ? 'selected' : ''} ${isDefault ? 'default' : ''}">${content}${exportFooter}</div>`;
 }
 
-function customZoneChoice(zone: ConstructorZone, current: ConstructorZone): string {
+function customZoneChoice(zone: CustomTagZone, current: CustomTagZone): string {
   const label = zone === 'render' ? 'Render / Quality' : zone[0].toUpperCase() + zone.slice(1);
   return `<label class="zone-choice ${current === zone ? 'selected' : ''}"><input type="radio" name="custom-tag-zone" value="${zone}" data-custom-zone="${zone}"${current === zone ? ' checked' : ''}><span>${label}</span></label>`;
 }
@@ -971,7 +1037,7 @@ function customTypeSelector(kind: CustomTagKind): string {
   return `<label class="field custom-type-select"><span>Card type</span><select id="custom-card-kind" aria-label="Custom card type"><option value="tag"${kind === 'tag' ? ' selected' : ''}>Prompt tag</option><option value="artist"${kind === 'artist' ? ' selected' : ''}>Artist</option></select></label>`;
 }
 
-function customTagsWorkspace(): string {
+function customTagsWorkspaceContent(): string {
   const editing = customTags.find(item => item.id === editingCustomTagId);
   const kind = customTagKind(editing);
   const destination = customPreset(selectedCustomPresetId);
@@ -991,13 +1057,23 @@ function customTagsWorkspace(): string {
     ? `<div class="custom-image-preview is-loaded" id="custom-image-preview"><img src="${escapeHtml(imageUrl)}" alt="${editing ? escapeHtml(editing.tag) : 'Selected custom tag image preview'}"></div>`
     : '<div class="custom-image-preview is-empty" id="custom-image-preview"><span class="custom-image-empty">Choose an image to preview it here.</span></div>';
   const deletePreset = deletingCustomPresetId ? customPreset(deletingCustomPresetId) : null;
-  const deletePrompt = deletePreset ? `<div class="preset-delete-confirm" role="alert"><b>Delete ${escapeHtml(deletePreset.name)}?</b><p>${customPresetCount(deletePreset.id)} ${customPresetCount(deletePreset.id) === 1 ? 'card returns' : 'cards return'} to My Tags. Images stay safe.</p><div><button class="danger-button" type="button" data-confirm-delete-preset="${escapeHtml(deletePreset.id)}">Delete preset</button><button class="tiny-copy" type="button" id="cancel-delete-preset">Keep preset</button></div></div>` : '';
+  const deletePrompt = deletePreset ? `<div class="preset-delete-confirm" role="alert"><b>Delete ${escapeHtml(deletePreset.name)}?</b><p>${customPresetCount(deletePreset.id)} ${customPresetCount(deletePreset.id) === 1 ? 'card is' : 'cards are'} in this folder. Choose whether to move them to My Tags or delete them with the folder.</p>${customPresetDeleteError ? `<p class="preset-delete-error">${escapeHtml(customPresetDeleteError)}</p>` : ''}<div><button class="danger-button" type="button" data-confirm-delete-preset="${escapeHtml(deletePreset.id)}" data-delete-mode="move">Delete folder only</button><button class="danger-button" type="button" data-confirm-delete-preset="${escapeHtml(deletePreset.id)}" data-delete-mode="delete">Delete folder and cards</button><button class="tiny-copy" type="button" id="cancel-delete-preset">Cancel</button></div></div>` : '';
   const imageHelp = kind === 'artist' ? 'Optional PNG, JPEG, or WebP card, up to 20 MiB' : 'PNG, JPEG, or WebP, up to 20 MiB';
   const imageStatus = kind === 'artist' ? 'Optional. Without an image, the artist uses the plus-card placeholder.' : 'Click or press Enter to choose an image.';
   const nameLabel = kind === 'artist' ? 'Artist name' : 'Tag';
   const namePlaceholder = kind === 'artist' ? 'artist name' : '1girl, upper body, looking at viewer';
-  const constructor = kind === 'artist' ? '<p class="custom-artist-note">Artist cards appear in Add Artist, random pools, Artist Mix, and metadata highlights.</p>' : `<fieldset class="field constructor-choices"><legend>Constructor</legend><div class="zone-choice-grid">${customZoneChoice('frame', editing?.zone ?? 'frame')}${customZoneChoice('scene', editing?.zone ?? 'frame')}${customZoneChoice('render', editing?.zone ?? 'frame')}</div></fieldset>`;
-  return `<section class="custom-tags-workspace" aria-labelledby="custom-tags-title"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="custom-tags-title">Custom Tag Builder</h2><p>Build prompt tags and artist cards for your studio.</p></div></header><div class="custom-tags-layout"><aside class="custom-preset-sidebar" aria-label="Custom tag presets"><div class="preset-sidebar-heading"><div><p class="eyebrow">PRESET FOLDERS</p><h3>My presets</h3></div><span class="preset-total">${customTags.length}</span></div><button class="preset-all ${selectedCustomPresetId === 'all' ? 'selected' : ''}" type="button" data-select-preset="all" aria-pressed="${selectedCustomPresetId === 'all'}"><span><b>All Tags</b><small>${customTags.length} ${customTags.length === 1 ? 'card' : 'cards'}</small></span><span aria-hidden="true">${selectedCustomPresetId === 'all' ? '●' : '○'}</span></button><div class="custom-preset-list">${customTagPresets.map(customPresetMarkup).join('')}</div>${creatingCustomPreset ? `<form class="preset-create-form" id="custom-preset-form"><label class="field"><span>New preset folder</span><input id="custom-preset-name" maxlength="80" placeholder="A short folder name" required></label><div><button class="primary" type="submit">Create preset</button><button class="tiny-copy" type="button" id="cancel-create-preset">Cancel</button></div></form>` : '<button class="secondary preset-create-button" type="button" id="create-preset">＋ New preset</button>'}${deletePrompt}</aside><form class="custom-tag-form" id="custom-tag-form"><div class="form-heading"><div><p class="eyebrow">CREATE OR EDIT</p><h3>${editing ? `Edit custom ${kind}` : `New custom ${kind}`}</h3></div>${editing ? '<button class="tiny-copy" type="button" id="cancel-custom-edit">Cancel edit</button>' : ''}</div><p class="custom-destination" role="status">Destination: <b>${escapeHtml(destination.name)}</b>${selectedCustomPresetId === 'all' ? ' <small>All Tags is a view. New cards go to My Tags.</small>' : ''}</p>${customTypeSelector(kind)}<div class="field image-field"><span>Image <i>${imageHelp}</i></span><div class="custom-image-drop${hasImage ? ' has-image' : ''}" id="custom-image-drop" aria-describedby="custom-image-status"><input id="custom-tag-image" class="custom-file-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" tabindex="-1"><button class="custom-image-empty-content" type="button" id="custom-tag-choose"${hasImage ? ' hidden' : ''}><span class="drop-icon" aria-hidden="true">＋</span><b>Drop an image here</b><span>or</span><span class="secondary choose-image-label">Choose image</span></button>${imagePreview}</div><p class="custom-image-status" id="custom-image-status">${imageStatus}</p></div><label class="field"><span>${nameLabel}</span><input id="custom-tag-name" value="${escapeHtml(editing?.tag ?? '')}" required maxlength="180" placeholder="${namePlaceholder}"></label>${constructor}<label class="field"><span>Description / guide <i>(optional)</i></span><textarea id="custom-tag-description" maxlength="2000" placeholder="Explain what this card changes or when to use it.">${escapeHtml(editing?.description ?? '')}</textarea></label><p class="custom-tag-status" id="custom-tag-status" role="status" aria-live="polite"></p><button class="primary custom-save-button" type="submit">${editing ? 'Save changes' : `Save custom ${kind}`}</button></form><section class="custom-tag-library"><div class="subheading"><div><p class="eyebrow">SAVED CARDS</p><h3>${visibleCards.length} shown <span>·</span> ${customTags.length} total</h3></div><div class="custom-library-tools"><input id="custom-tag-search" value="${escapeHtml(customTagSearch)}" placeholder="Search your cards..." aria-label="Search custom cards"><div class="custom-zone-filter" role="group" aria-label="Filter saved cards"><button type="button" class="chip ${customTagFilter === 'all' ? 'on' : ''}" data-custom-filter="all" aria-pressed="${customTagFilter === 'all'}">All</button><button type="button" class="chip ${customTagFilter === 'artist' ? 'on' : ''}" data-custom-filter="artist" aria-pressed="${customTagFilter === 'artist'}">Artists</button><button type="button" class="chip ${customTagFilter === 'frame' ? 'on' : ''}" data-custom-filter="frame" aria-pressed="${customTagFilter === 'frame'}">Frame</button><button type="button" class="chip ${customTagFilter === 'scene' ? 'on' : ''}" data-custom-filter="scene" aria-pressed="${customTagFilter === 'scene'}">Scene</button><button type="button" class="chip ${customTagFilter === 'render' ? 'on' : ''}" data-custom-filter="render" aria-pressed="${customTagFilter === 'render'}">Render</button></div></div></div><div class="custom-tag-grid" id="custom-tag-grid" tabindex="0">${visibleCards.length ? visibleCards.map(customLibraryCardMarkup).join('') : '<p class="empty-inline">No saved cards match this preset and filter yet.</p>'}</div></section></div></section>`;
+  const constructor = kind === 'artist' ? '<p class="custom-artist-note">Artist cards appear in Add Artist, random pools, Artist Mix, and metadata highlights.</p>' : `<fieldset class="field constructor-choices"><legend>Constructor</legend><div class="zone-choice-grid">${customZoneChoice('frame', editing?.zone ?? 'frame')}${customZoneChoice('scene', editing?.zone ?? 'frame')}${customZoneChoice('render', editing?.zone ?? 'frame')}${customZoneChoice('character', editing?.zone ?? 'frame')}</div><small class="custom-character-note">Character cards are saved for Custom Tags and are not used by Prompt Builder yet.</small></fieldset>`;
+  const packAvailable = Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags);
+  const packStatus = customTagPackStatus ? `<p id="custom-tag-pack-status" class="custom-tag-pack-status ${customTagPackStatusKind}" role="status" aria-live="polite">${escapeHtml(customTagPackStatus)}</p>` : '<p id="custom-tag-pack-status" class="custom-tag-pack-status" role="status" aria-live="polite"></p>';
+  const packControls = `<div class="custom-tag-pack-tools"><button class="secondary custom-tag-import" id="custom-tag-import" type="button" ${packAvailable ? '' : 'disabled'} aria-describedby="custom-tag-pack-help">⇧ Import .naipack</button><span id="custom-tag-pack-help">${packAvailable ? 'Import a shared Custom Tags preset.' : 'Import/export packs are available in the desktop app.'}</span></div>`;
+  return `<section class="custom-tags-workspace" aria-labelledby="custom-tags-title"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="custom-tags-title">Custom Tag Builder</h2><p>Build prompt tags and artist cards for your studio.</p></div>${packControls}</header>${packStatus}<div class="custom-tags-layout"><aside class="custom-preset-sidebar" aria-label="Custom tag presets"><div class="preset-sidebar-heading"><div><p class="eyebrow">PRESET FOLDERS</p><h3>My presets</h3></div><span class="preset-total">${customTags.length}</span></div><button class="preset-all ${selectedCustomPresetId === 'all' ? 'selected' : ''}" type="button" data-select-preset="all" aria-pressed="${selectedCustomPresetId === 'all'}"><span><b>All Tags</b><small>${customTags.length} ${customTags.length === 1 ? 'card' : 'cards'}</small></span><span aria-hidden="true">${selectedCustomPresetId === 'all' ? '●' : '○'}</span></button><div class="custom-preset-list">${customTagPresets.map(customPresetMarkup).join('')}</div>${creatingCustomPreset ? `<form class="preset-create-form" id="custom-preset-form"><label class="field"><span>New preset folder</span><input id="custom-preset-name" maxlength="80" placeholder="A short folder name" required></label><div><button class="primary" type="submit">Create preset</button><button class="tiny-copy" type="button" id="cancel-create-preset">Cancel</button></div></form>` : '<button class="secondary preset-create-button" type="button" id="create-preset">＋ New preset</button>'}${deletePrompt}</aside><form class="custom-tag-form" id="custom-tag-form"><div class="form-heading"><div><p class="eyebrow">CREATE OR EDIT</p><h3>${editing ? `Edit custom ${kind}` : `New custom ${kind}`}</h3></div>${editing ? '<button class="tiny-copy" type="button" id="cancel-custom-edit">Cancel edit</button>' : ''}</div><p class="custom-destination" role="status">Destination: <b>${escapeHtml(destination.name)}</b>${selectedCustomPresetId === 'all' ? ' <small>All Tags is a view. New cards go to My Tags.</small>' : ''}</p>${customTypeSelector(kind)}<div class="field image-field"><span>Image <i>${imageHelp}</i></span><div class="custom-image-drop${hasImage ? ' has-image' : ''}" id="custom-image-drop" aria-describedby="custom-image-status"><input id="custom-tag-image" class="custom-file-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" tabindex="-1"><button class="custom-image-empty-content" type="button" id="custom-tag-choose"${hasImage ? ' hidden' : ''}><span class="drop-icon" aria-hidden="true">＋</span><b>Drop an image here</b><span>or</span><span class="secondary choose-image-label">Choose image</span></button>${imagePreview}</div><p class="custom-image-status" id="custom-image-status">${imageStatus}</p></div><label class="field"><span>${nameLabel}</span><input id="custom-tag-name" value="${escapeHtml(editing?.tag ?? '')}" required maxlength="${CUSTOM_TAG_MAX_LENGTH}" placeholder="${namePlaceholder}"></label>${constructor}<label class="field"><span>Description / guide <i>(optional)</i></span><textarea id="custom-tag-description" maxlength="2000" placeholder="Explain what this card changes or when to use it.">${escapeHtml(editing?.description ?? '')}</textarea></label><p class="custom-tag-status" id="custom-tag-status" role="status" aria-live="polite"></p><button class="primary custom-save-button" type="submit">${editing ? 'Save changes' : `Save custom ${kind}`}</button></form><section class="custom-tag-library"><div class="subheading"><div><p class="eyebrow">SAVED CARDS</p><h3>${visibleCards.length} shown <span>·</span> ${customTags.length} total</h3></div><div class="custom-library-tools"><input id="custom-tag-search" value="${escapeHtml(customTagSearch)}" placeholder="Search your cards..." aria-label="Search custom cards"><div class="custom-zone-filter" role="group" aria-label="Filter saved cards"><button type="button" class="chip ${customTagFilter === 'all' ? 'on' : ''}" data-custom-filter="all" aria-pressed="${customTagFilter === 'all'}">All</button><button type="button" class="chip ${customTagFilter === 'artist' ? 'on' : ''}" data-custom-filter="artist" aria-pressed="${customTagFilter === 'artist'}">Artists</button><button type="button" class="chip ${customTagFilter === 'frame' ? 'on' : ''}" data-custom-filter="frame" aria-pressed="${customTagFilter === 'frame'}">Frame</button><button type="button" class="chip ${customTagFilter === 'scene' ? 'on' : ''}" data-custom-filter="scene" aria-pressed="${customTagFilter === 'scene'}">Scene</button><button type="button" class="chip ${customTagFilter === 'render' ? 'on' : ''}" data-custom-filter="render" aria-pressed="${customTagFilter === 'render'}">Render</button><button type="button" class="chip ${customTagFilter === 'character' ? 'on' : ''}" data-custom-filter="character" aria-pressed="${customTagFilter === 'character'}">Character</button></div></div></div><div class="custom-tag-grid" id="custom-tag-grid" tabindex="0">${visibleCards.length ? visibleCards.map(customLibraryCardMarkup).join('') : '<p class="empty-inline">No saved cards match this preset and filter yet.</p>'}</div></section></div><div id="custom-tag-pack-drop-overlay" class="custom-tag-pack-drop-toast" hidden aria-hidden="true" role="status" aria-live="polite"><b>Drop .naipack to import</b><span>One Custom Tags pack will be imported.</span></div></section>`;
+}
+
+function customTagsWorkspace(): string {
+  const content = customTagsWorkspaceContent();
+  if (!customTagLibraryWarning) return content;
+  const warning = `<p class="custom-tag-status" role="alert">${escapeHtml(customTagLibraryWarning)}</p>`;
+  return content.replace('<div class="custom-tags-layout">', `${warning}<div class="custom-tags-layout">`);
 }
 
 function customLibraryCardMarkup(item: CustomTag): string {
@@ -1016,6 +1092,8 @@ function workspacePanelClass(workspace: 'prompt' | 'artist-mix' | 'saved-library
 
 function switchWorkspace(workspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings'): void {
   if (workspace === activeWorkspace) return;
+  cancelStartupIdlePreviews();
+  if (activeWorkspace === 'metadata') metadataWorkspace.deactivate();
   clearHoverPreviewCache();
   focusMode = false;
   activeWorkspace = workspace;
@@ -1050,7 +1128,8 @@ function render(): void {
     : activeWorkspace === 'metadata' ? `<section id="metadata-panel" class="${workspacePanelClass('metadata')}" role="tabpanel" aria-labelledby="metadata-tab">${metadataWorkspace.markup()}</section>`
     : settingsWorkspace();
   const shellClass = `${focusMode ? 'app-shell focus-shell' : 'app-shell'}${startupEntryPending ? ' startup-entry' : ''}`;
-  app.innerHTML = `<main class="${shellClass}"><header class="topbar"${focusMode ? ' hidden' : ''}><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
+  const chrome = focusMode ? '' : `<div class="app-chrome"><header class="topbar"><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}</div>`;
+  app.innerHTML = `<main class="${shellClass}">${chrome}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${activeWorkspace === 'metadata' ? metadataWorkspace.overlayMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
   pendingWorkspaceTransition = null;
   bindEvents();
   bindPreviewFade(app.querySelector<HTMLElement>('.app-shell') ?? app);
@@ -1147,7 +1226,7 @@ function handleModalKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
     if (modal === 'characters') { event.preventDefault(); closeCharacterPicker(); }
     else if (modal === 'artists') { event.preventDefault(); if (document.querySelector<HTMLElement>('#mix-picker-backdrop:not([hidden])')) closeMixPicker(); else closeArtistPicker(); }
-    else if (modal === 'character-details') { event.preventDefault(); closeDetails(); }
+    else if (modal === 'character-details' || modal === 'character-remove') { event.preventDefault(); closeDetails(); }
     else if (modal === 'constructor') { event.preventDefault(); closeConstructor(); }
     else if (modal === 'saved-library') { event.preventDefault(); closeLibraryModal(); }
     else if (!modal && focusMode && activeWorkspace === 'artist-mix') { event.preventDefault(); focusMode = false; render(); }
@@ -1164,17 +1243,26 @@ function handleModalKeydown(event: KeyboardEvent): void {
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
 }
 
+function closeRenderedDialog(selector: string, complete: () => void): void {
+  const dialog = document.querySelector<HTMLElement>(selector);
+  if (!dialog || animationMode === 'off' || (typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) { complete(); return; }
+  dialog.classList.add('is-closing');
+  window.setTimeout(complete, 150);
+}
+
 function closeLibraryModal(): void {
-  if (savedLibraryImageUrls.has('__draft__')) revokeSavedLibraryImageUrl('__draft__');
-  libraryModalMode = null;
-  libraryModalItemId = null;
-  libraryCoverBytes = null;
-  libraryCoverMime = undefined;
-  libraryCoverName = '';
-  libraryCoverError = '';
-  libraryCoverRemoved = false;
-  if (modal === 'saved-library') modal = null;
-  render();
+  closeRenderedDialog('.saved-library-modal-backdrop', () => {
+    if (savedLibraryImageUrls.has('__draft__')) revokeSavedLibraryImageUrl('__draft__');
+    libraryModalMode = null;
+    libraryModalItemId = null;
+    libraryCoverBytes = null;
+    libraryCoverMime = undefined;
+    libraryCoverName = '';
+    libraryCoverError = '';
+    libraryCoverRemoved = false;
+    if (modal === 'saved-library') modal = null;
+    render();
+  });
 }
 
 function promptDataFromBuilder(): SavedPromptData { return { positive: buildBasePrompt(base), negative: base.undesired, characters: characters.map(character => ({ id: character.id, label: character.label, positive: character.prompt, negative: character.undesired })) }; }
@@ -1208,11 +1296,16 @@ function captureLibraryFormDraft(): void {
     }))
   };
   libraryFormMix = { ...libraryFormMix, serializedPrompt: document.querySelector<HTMLTextAreaElement>('#saved-library-mix-prompt')?.value ?? libraryFormMix.serializedPrompt };
+  libraryFormCharacter = {
+    positive: document.querySelector<HTMLTextAreaElement>('#saved-library-character-positive')?.value ?? libraryFormCharacter.positive,
+    negative: document.querySelector<HTMLTextAreaElement>('#saved-library-character-negative')?.value ?? libraryFormCharacter.negative
+  };
   libraryFormScrollTop = document.querySelector<HTMLElement>('[data-library-form-scroll]')?.scrollTop ?? libraryFormScrollTop;
 }
 
-function openLibrarySaveModal(kind: 'prompt' | 'artist-mix', source: SavedLibraryItem['source'] = 'manual'): void {
-  libraryModalMode = kind === 'artist-mix' ? 'save-mix' : 'save-prompt';
+function openLibrarySaveModal(kind: 'prompt' | 'artist-mix' | 'character', source: SavedLibraryItem['source'] = 'manual', character?: Character): void {
+  cancelStartupIdlePreviews();
+  libraryModalMode = kind === 'artist-mix' ? 'save-mix' : kind === 'character' ? 'save-character' : 'save-prompt';
   libraryModalItemId = null;
   libraryCoverBytes = null;
   libraryCoverMime = undefined;
@@ -1220,11 +1313,14 @@ function openLibrarySaveModal(kind: 'prompt' | 'artist-mix', source: SavedLibrar
   libraryCoverError = '';
   libraryCoverRemoved = false;
   libraryFormSource = source;
-  libraryFormName = '';
+  libraryFormName = character?.label ?? '';
   libraryFormDescription = '';
   libraryFormScrollTop = 0;
   libraryFormPrompt = kind === 'prompt' && source === 'prompt-builder' ? promptDataFromBuilder() : { positive: '', negative: '', characters: [] };
   libraryFormMix = kind === 'artist-mix' && source === 'artist-mix' ? mixDataFromBuilder() : { artists: [], serializedPrompt: '' };
+  libraryFormCharacter = character
+    ? { positive: character.prompt, negative: character.undesired }
+    : { positive: '', negative: '' };
   modal = 'saved-library';
   render();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#saved-library-name')?.focus(), 0);
@@ -1239,6 +1335,7 @@ function openLibraryEditModal(itemId: string): void {
   libraryFormScrollTop = 0;
   libraryFormPrompt = item.kind === 'prompt' ? JSON.parse(JSON.stringify(item.data ?? { positive: item.prompt, negative: '', characters: [] })) : { positive: '', negative: '', characters: [] };
   libraryFormMix = item.kind === 'artist-mix' ? JSON.parse(JSON.stringify(item.data ?? { artists: [], serializedPrompt: item.prompt })) : { artists: [], serializedPrompt: '' };
+  libraryFormCharacter = item.kind === 'character' ? JSON.parse(JSON.stringify(item.data)) : { positive: '', negative: '' };
   libraryModalMode = 'edit'; libraryModalItemId = itemId; libraryCoverBytes = null; libraryCoverMime = undefined; libraryCoverName = ''; libraryCoverError = ''; libraryCoverRemoved = false; modal = 'saved-library'; render();
   window.setTimeout(() => document.querySelector<HTMLInputElement>('#saved-library-name')?.focus(), 0);
 }
@@ -1292,10 +1389,12 @@ async function saveLibraryItemFromForm(): Promise<void> {
       imageAsset = undefined; mime = undefined; originalName = undefined;
     }
     const description = libraryFormDescription.trim().slice(0, 2000);
-    const common = { version: 4 as const, id: existing?.id ?? id(), kind: libraryModalMode === 'save-mix' || existing?.kind === 'artist-mix' ? 'artist-mix' as const : 'prompt' as const, source: existing?.source ?? libraryFormSource, name, ...(description ? { description } : {}), createdAt: existing?.createdAt ?? now, updatedAt: now, ...(imageAsset ? { imageAsset, mime, originalName } : {}) };
+    const common = { version: 4 as const, id: existing?.id ?? id(), kind: libraryModalMode === 'save-mix' || existing?.kind === 'artist-mix' ? 'artist-mix' as const : libraryModalMode === 'save-character' || existing?.kind === 'character' ? 'character' as const : 'prompt' as const, source: existing?.source ?? libraryFormSource, name, ...(description ? { description } : {}), createdAt: existing?.createdAt ?? now, updatedAt: now, ...(imageAsset ? { imageAsset, mime, originalName } : {}) };
     const item: SavedLibraryItem = common.kind === 'artist-mix'
       ? (() => { const serializedPrompt = libraryFormMix.serializedPrompt; return { ...common, kind: 'artist-mix' as const, prompt: serializedPrompt, data: { ...libraryFormMix, artists: libraryFormMix.artists.length ? libraryFormMix.artists : structuredArtistsFromPrompt(serializedPrompt), serializedPrompt }, snapshot: existing?.kind === 'artist-mix' ? existing.snapshot : normalizeArtistMix({ anchors: [], companions: [] }) }; })()
-      : { ...common, kind: 'prompt', prompt: libraryFormPrompt.positive, data: { ...libraryFormPrompt, characters: libraryFormPrompt.characters.map(character => ({ ...character })) }, ...(existing?.kind === 'prompt' && existing.snapshot ? { snapshot: existing.snapshot } : {}) };
+      : common.kind === 'character'
+        ? { ...common, kind: 'character' as const, prompt: libraryFormCharacter.positive, data: { ...libraryFormCharacter } }
+        : { ...common, kind: 'prompt', prompt: libraryFormPrompt.positive, data: { ...libraryFormPrompt, characters: libraryFormPrompt.characters.map(character => ({ ...character })) }, ...(existing?.kind === 'prompt' && existing.snapshot ? { snapshot: existing.snapshot } : {}) };
     savedLibrary = [item, ...savedLibrary.filter(value => value.id !== item.id)];
     saveSavedLibrary(savedLibrary);
     closeLibraryModal();
@@ -1312,7 +1411,12 @@ async function deleteLibraryItem(item: SavedLibraryItem): Promise<void> {
   closeLibraryModal();
 }
 
-async function saveMetadataToLibrary(kind: MetadataSaveKind, payload: MetadataSavePayload): Promise<boolean> {
+function savedMetadataId(idValue: string): boolean {
+  return savedLibrary.some(item => item.id === idValue);
+}
+
+async function saveMetadataToLibrary(kind: MetadataSaveKind, payload: MetadataSavePayload): Promise<string | null> {
+  if (kind === 'artist-mix' && !payload.artistMix) return null;
   const now = new Date().toISOString();
   const idValue = id();
   const cover = await saveLibraryImage({ id: idValue, mime: payload.preview.mime, originalName: payload.preview.originalName }, payload.preview.bytes);
@@ -1322,10 +1426,19 @@ async function saveMetadataToLibrary(kind: MetadataSaveKind, payload: MetadataSa
     : { version: 4, id: idValue, kind: 'prompt', source: 'metadata', name: filenameName, prompt: payload.prompt.positive, data: payload.prompt, createdAt: now, updatedAt: now, ...cover };
   savedLibrary = [item, ...savedLibrary];
   saveSavedLibrary(savedLibrary);
+  return idValue;
+}
+
+async function saveMetadataTagToCustomTags(payload: { tag: string; category: 'frame' | 'scene' | 'render' | 'character'; presetId: string; preview: MetadataSavePayload['preview'] }): Promise<boolean> {
+  const now = new Date().toISOString();
+  const snapshot = await transactCustomTags('card:upsert', { id: id(), kind: 'tag', tag: payload.tag.trim(), zone: payload.category === 'character' ? 'character' : payload.category, presetId: payload.presetId, description: '', mime: payload.preview.mime, originalName: payload.preview.originalName, createdAt: now, updatedAt: now }, payload.preview.bytes);
+  if (!snapshot) throw new Error('Custom Tags require the desktop app.');
+  applyCustomTagSnapshot(snapshot);
   return true;
 }
 
 function libraryPromptSide(item: SavedLibraryItem, index: number, polarity: 'positive' | 'negative'): string {
+  if (item.kind === 'character') return item.data[polarity];
   if (item.kind !== 'prompt') return '';
   if (index < 0) return polarity === 'positive' ? item.data?.positive ?? item.prompt : item.data?.negative ?? '';
   return item.data?.characters[index]?.[polarity] ?? '';
@@ -1333,10 +1446,10 @@ function libraryPromptSide(item: SavedLibraryItem, index: number, polarity: 'pos
 
 function patchLibraryPromptBlock(button: HTMLButtonElement): void {
   const item = savedLibrary.find(value => value.id === button.dataset.libraryPolarity);
-  if (!item || item.kind !== 'prompt') return;
+  if (!item || (item.kind !== 'prompt' && item.kind !== 'character')) return;
   const index = Number(button.dataset.libraryIndex);
   const polarity = button.dataset.polarity === 'negative' ? 'negative' : 'positive';
-  const state = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: item.data?.characters.map(() => 'positive' as const) ?? [] };
+  const state = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: item.kind === 'prompt' ? item.data?.characters.map(() => 'positive' as const) ?? [] : [] };
   if (index < 0) state.base = polarity; else state.characters[index] = polarity;
   libraryPolarities.set(item.id, state);
   const block = button.closest<HTMLElement>('[data-library-block]');
@@ -1351,7 +1464,7 @@ function patchLibraryPromptBlock(button: HTMLButtonElement): void {
   if (pre) pre.textContent = value || '(No prompt recorded for this side.)';
   const copyButton = block.querySelector<HTMLButtonElement>('[data-library-copy]');
   if (copyButton) {
-    const label = index < 0 ? 'Base prompt' : item.data?.characters[index]?.label ?? `Character ${index + 1}`;
+    const label = index < 0 ? item.kind === 'character' ? item.name : 'Base prompt' : item.kind === 'prompt' ? item.data?.characters[index]?.label ?? `Character ${index + 1}` : `Character ${index + 1}`;
     const copyLabel = `Copy ${label} ${polarity} prompt`;
     copyButton.disabled = !value;
     copyButton.setAttribute('aria-label', copyLabel);
@@ -1380,6 +1493,7 @@ function bindSavedLibraryEvents(): void {
   document.querySelector('#saved-library-tab')?.addEventListener('click', () => switchWorkspace('saved-library'));
   document.querySelector('#save-library-prompt')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
   document.querySelector('#save-library-mix')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'manual'));
+  document.querySelector('#save-library-character')?.addEventListener('click', () => openLibrarySaveModal('character', 'manual'));
   document.querySelector('#save-library-empty')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
   document.querySelector('#saved-library-search')?.addEventListener('input', event => { savedLibrarySearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
   document.querySelectorAll<HTMLButtonElement>('[data-library-filter]').forEach(button => button.addEventListener('click', () => { savedLibraryFilter = button.dataset.libraryFilter as typeof savedLibraryFilter; render(); }));
@@ -1388,6 +1502,7 @@ function bindSavedLibraryEvents(): void {
     if (!item) return;
     const index = Number(button.dataset.libraryIndex);
     const polarity = index < 0 ? libraryPolarities.get(item.id)?.base ?? 'positive' : libraryPolarities.get(item.id)?.characters[index] ?? 'positive';
+    if (item.kind !== 'prompt' && item.kind !== 'character') return;
     const value = libraryPromptSide(item, index, polarity);
     if (value) void copy(value, `[data-library-copy="${item.id}"][data-library-index="${index}"]`);
   }));
@@ -1489,7 +1604,7 @@ function bindEvents(): void {
   });
   document.querySelectorAll<HTMLButtonElement>('[data-copy-set]').forEach(button => button.addEventListener('click', () => { const set = sets.find(item => item.id === button.dataset.copySet); if (set) void copy(set.prompt, `[data-copy-set="${set.id}"]`); }));
   document.querySelectorAll<HTMLButtonElement>('[data-delete-set]').forEach(button => button.addEventListener('click', () => { sets = sets.filter(item => item.id !== button.dataset.deleteSet); saveSets(sets); render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-open-constructor]').forEach(button => button.addEventListener('click', event => openConstructor((button.dataset.openConstructor as ConstructorZone), event.currentTarget as HTMLElement)));
+  document.querySelectorAll<HTMLButtonElement>('[data-open-constructor]').forEach(button => button.addEventListener('click', event => openConstructor({ kind: 'base', zone: button.dataset.openConstructor as ConstructorZone }, event.currentTarget as HTMLElement)));
   document.querySelector('#close-constructor')?.addEventListener('click', closeConstructor);
   document.querySelector('#done-constructor')?.addEventListener('click', closeConstructor);
   document.querySelector('#constructor-backdrop')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeConstructor(); });
@@ -1502,6 +1617,7 @@ function bindEvents(): void {
 function openArtistPicker(trigger?: HTMLElement): void {
   const picker = document.querySelector<HTMLElement>('#artist-picker-backdrop');
   if (!picker) return;
+  cancelStartupIdlePreviews();
   artistPickerTrigger = trigger ?? document.activeElement as HTMLElement;
   modal = 'artists';
   picker.hidden = false;
@@ -1509,8 +1625,9 @@ function openArtistPicker(trigger?: HTMLElement): void {
   document.querySelector<HTMLInputElement>('#artist-search')?.focus();
 }
 
-function openConstructor(zone: ConstructorZone, trigger?: HTMLElement): void {
-  constructorZone = zone;
+function openConstructor(target: ConstructorTarget, trigger?: HTMLElement): void {
+  cancelStartupIdlePreviews();
+  constructorTarget = target;
   constructorTrigger = trigger ?? document.activeElement as HTMLElement;
   constructorSearch = '';
   modal = 'constructor';
@@ -1522,18 +1639,20 @@ function openConstructor(zone: ConstructorZone, trigger?: HTMLElement): void {
 function closeConstructor(): void {
   clearConstructorImageWarmup();
   const trigger = constructorTrigger;
-  const zone = constructorZone;
-  constructorZone = null;
-  constructorTrigger = null;
-  if (modal === 'constructor') modal = null;
-  render();
-  const nextTrigger = trigger?.isConnected ? trigger : (zone ? document.querySelector<HTMLElement>(`[data-open-constructor="${zone}"]`) : null);
-  if (nextTrigger) nextTrigger.focus();
+  const target = constructorTarget;
+  closeRenderedDialog('#constructor-backdrop', () => {
+    constructorTarget = null;
+    constructorTrigger = null;
+    if (modal === 'constructor') modal = null;
+    render();
+    const nextTrigger = trigger?.isConnected ? trigger : target?.kind === 'base' ? document.querySelector<HTMLElement>(`[data-open-constructor="${target.zone}"]`) : document.querySelector<HTMLElement>(`[data-open-character-constructor="${target?.characterId ?? ''}"]`);
+    if (nextTrigger) nextTrigger.focus();
+  });
 }
 
 function bindConstructorGridEvents(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-constructor-folder]').forEach(button => button.addEventListener('click', () => toggleConstructorFolder(button.dataset.constructorFolder!, button)));
-  document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]').forEach(button => button.addEventListener('click', () => toggleConstructorCard(button.dataset.constructorTag!)));
+  document.querySelectorAll<HTMLButtonElement>('[data-constructor-tag]').forEach(button => button.addEventListener('click', event => toggleConstructorCard(button.dataset.constructorTag!, event)));
   bindArtistCardPreview();
 }
 
@@ -1591,25 +1710,26 @@ function restoreConstructorGridFocus(target: string | null): void {
   element?.focus({ preventScroll: true });
 }
 
-function refreshConstructorGrid(): void {
-  if (!constructorZone) return;
+// Legacy compatibility marker: function refreshConstructorGrid(): void {
+function refreshConstructorGrid(options: { restoreFocus?: boolean } = {}): void {
+  if (!constructorTarget) return;
   const grid = document.querySelector<HTMLElement>('#constructor-grid');
   if (!grid) return;
   const scrollTop = grid.scrollTop;
   const focusTarget = constructorGridFocusTarget();
   clearArtistCardPreview();
-  const folders = constructorFolderViews(constructorZone);
-  grid.innerHTML = folders.map(folder => constructorFolderMarkup(folder, constructorZone!, folder.folderNameMatch)).join('') || '<p class="empty-inline">No constructor cards match this search.</p>';
+  const folders = constructorFolderViews(constructorTarget);
+  grid.innerHTML = folders.map(folder => constructorFolderMarkup(folder, constructorTarget!, folder.folderNameMatch)).join('') || '<p class="empty-inline">No constructor cards match this search.</p>';
   grid.scrollTop = scrollTop;
   bindConstructorGridEvents();
-  restoreConstructorGridFocus(focusTarget);
+  if (options.restoreFocus !== false) restoreConstructorGridFocus(focusTarget);
   warmConstructorImages(grid);
 }
 
 function toggleConstructorFolder(folderId: string, button?: HTMLButtonElement): void {
-  if (!constructorZone || constructorSearch.trim()) return;
+  if (!constructorTarget || constructorSearch.trim()) return;
   clearArtistCardPreview();
-  const state = constructorFolderOpenState[constructorZone];
+  const state = constructorOpenState(constructorTarget);
   const open = !state[folderId];
   state[folderId] = open;
   const toggle = button ?? document.querySelector<HTMLButtonElement>(`[data-constructor-folder="${CSS.escape(folderId)}"]`);
@@ -1623,15 +1743,20 @@ function toggleConstructorFolder(folderId: string, button?: HTMLButtonElement): 
   if (open) warmConstructorImages(reveal, true);
 }
 
-function toggleConstructorCard(cardId: string): void {
-  if (!constructorZone) return;
-  const card = constructorCards(constructorZone).find(item => item.id === cardId) ?? guideCards.find(item => item.id === cardId);
+function toggleConstructorCard(cardId: string, activation?: MouseEvent): void {
+  if (!constructorTarget) return;
+  // A pointer click first focuses the old card and then replaces it. Clear the
+  // shared preview before that mutation and leave focus on the document rather
+  // than restoring it to a replacement that would pin the preview again.
+  const pointerActivation = Boolean(activation && activation.detail > 0);
+  clearArtistCardPreview();
+  const card = (constructorTarget.kind === 'character' ? characterConstructorCards(constructorTarget.characterId) : constructorCards(constructorTarget.zone)).find(item => item.id === cardId) ?? guideCards.find(item => item.id === cardId);
   if (!card) return;
   const tags = card.kind === 'preset' ? (card.tags ?? qualityPresetTags()) : constructorCardTags(card);
-  setZonePrompt(constructorZone, togglePromptTagGroup(zonePrompt(constructorZone), tags));
+  setConstructorTargetPrompt(constructorTarget, togglePromptTagGroup(constructorTargetPrompt(constructorTarget), tags));
   updatePrompt();
   saveSoon();
-  refreshConstructorGrid();
+  refreshConstructorGrid({ restoreFocus: !pointerActivation });
 }
 
 function customImageError(message: string): void {
@@ -1648,7 +1773,27 @@ function imageMime(bytes: Uint8Array): CustomTag['mime'] | null {
 
 function presetNameKey(value: string): string { return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase(); }
 
-function createCustomPreset(): void {
+function customArtistSignature(tags: readonly CustomTag[]): string {
+  return tags
+    .filter(tag => tag.kind === 'artist')
+    .map(tag => [tag.id, tag.tag, tag.presetId ?? '', tag.imageAsset ?? '', tag.mime ?? '', tag.description ?? '', tag.updatedAt].join('\u001f'))
+    .sort()
+    .join('\u001e');
+}
+
+function applyCustomTagSnapshot(snapshot: { presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string }): void {
+  const nextArtistSignature = customArtistSignature(snapshot.tags);
+  customTagPresets = snapshot.presets;
+  customTags = snapshot.tags;
+  if (nextArtistSignature !== appliedCustomArtistSignature) {
+    appliedCustomArtistSignature = nextArtistSignature;
+    rebuildEffectiveArtistCatalog();
+  }
+  customTagLibraryWarning = snapshot.warning ?? '';
+  if (snapshot.warning) console.warn(`[custom-tags] ${snapshot.warning}`);
+}
+
+async function createCustomPreset(): Promise<void> {
   const input = document.querySelector<HTMLInputElement>('#custom-preset-name');
   const name = input?.value.trim().replace(/\s+/g, ' ').slice(0, 80) ?? '';
   if (!name) { input?.focus(); return; }
@@ -1660,14 +1805,15 @@ function createCustomPreset(): void {
   input?.setCustomValidity('');
   const now = new Date().toISOString();
   const preset: CustomTagPreset = { id: `preset-${id()}`, name, createdAt: now, updatedAt: now };
-  customTagPresets = [...customTagPresets, preset];
-  saveCustomTagPresets(customTagPresets);
+  const snapshot = await transactCustomTags('preset:create', preset);
+  if (snapshot) applyCustomTagSnapshot(snapshot);
+  else { customTagPresets = [...customTagPresets, preset]; saveCustomTagPresets(customTagPresets); }
   selectedCustomPresetId = preset.id;
   creatingCustomPreset = false;
   render();
 }
 
-function renameCustomPreset(presetId: string): void {
+async function renameCustomPreset(presetId: string): Promise<void> {
   if (presetId === DEFAULT_CUSTOM_TAG_PRESET_ID) { renamingCustomPresetId = null; render(); return; }
   const input = document.querySelector<HTMLInputElement>(`#preset-rename-${presetId}`);
   const name = input?.value.trim().replace(/\s+/g, ' ').slice(0, 80) ?? '';
@@ -1678,27 +1824,75 @@ function renameCustomPreset(presetId: string): void {
     return;
   }
   const now = new Date().toISOString();
-  customTagPresets = customTagPresets.map(preset => preset.id === presetId ? { ...preset, name, updatedAt: now } : preset);
-  saveCustomTagPresets(customTagPresets);
+  const snapshot = await transactCustomTags('preset:update', { id: presetId, name, updatedAt: now });
+  if (snapshot) applyCustomTagSnapshot(snapshot);
+  else { customTagPresets = customTagPresets.map(preset => preset.id === presetId ? { ...preset, name, updatedAt: now } : preset); saveCustomTagPresets(customTagPresets); }
   renamingCustomPresetId = null;
   render();
 }
 
-function deleteCustomPreset(presetId: string): void {
+function reconcileDeletedCustomTags(deletedTags: readonly CustomTag[], shadowedArtistIds: ReadonlySet<string>): void {
+  if (!deletedTags.length) return;
+  const previewSources = deletedTags.map(item => customImageUrls.get(item.id) ?? (item.imageAsset ? customTagImageUrl(item) : '')).filter(Boolean);
+  for (const item of deletedTags) revokeCustomImageUrl(item.id);
+  if (previewSources.length) {
+    gridPreviewCache.invalidateSources(previewSources);
+    contentPreviewCache.invalidateSources(previewSources);
+    hoverPreviewCache.invalidateSources(previewSources);
+  }
+  const activeDeletedArtists = deletedTags.filter(item => item.kind === 'artist' && !shadowedArtistIds.has(item.id));
+  if (!activeDeletedArtists.length) return;
+  const deletedIds = new Set(activeDeletedArtists.map(item => customArtistCatalogId(item.id)));
+  const deletedNames = new Set(activeDeletedArtists.map(item => canonicalArtistIdentity(item.tag)));
+  const isDeletedReference = (item: WeightedTag): boolean => deletedIds.has(item.catalogId ?? item.id) || deletedNames.has(canonicalArtistIdentity(item.tag));
+  const previousArtists = JSON.stringify(base.artists);
+  const previousFavorites = new Set(artistFavorites);
+  const previousMix = JSON.stringify(artistMix);
+  base.artists = base.artists.filter(item => !isDeletedReference(item));
+  artistFavorites = new Set([...artistFavorites].filter(idValue => !deletedIds.has(idValue)));
+  artistMix = {
+    ...artistMix,
+    anchors: artistMix.anchors.filter(item => !isDeletedReference(item)),
+    companions: artistMix.companions.filter(item => !isDeletedReference(item))
+  };
+  if (JSON.stringify(base.artists) !== previousArtists) saveDraft(currentDraft());
+  if (artistFavorites.size !== previousFavorites.size || [...artistFavorites].some(idValue => !previousFavorites.has(idValue))) saveFavorites(artistFavorites, 'artists');
+  if (JSON.stringify(artistMix) !== previousMix) saveArtistMix(artistMix);
+}
+
+async function deleteCustomPreset(presetId: string, mode: 'move' | 'delete' = 'move'): Promise<void> {
   if (presetId === DEFAULT_CUSTOM_TAG_PRESET_ID || !customTagPresets.some(preset => preset.id === presetId)) return;
-  customTags = customTags.map(item => customTagPresetId(item) === presetId ? { ...item, presetId: DEFAULT_CUSTOM_TAG_PRESET_ID, updatedAt: new Date().toISOString() } : item);
-  customTagPresets = customTagPresets.filter(preset => preset.id !== presetId);
+  const previousTags = customTags;
+  const previousShadowed = new Set(shadowedCustomArtistIds);
+  customPresetDeleteError = '';
+  try {
+    const snapshot = await transactCustomTags('preset:delete', { id: presetId, mode });
+    if (snapshot) applyCustomTagSnapshot(snapshot);
+    else {
+      customTags = mode === 'delete'
+        ? customTags.filter(item => customTagPresetId(item) !== presetId)
+        : customTags.map(item => customTagPresetId(item) === presetId ? { ...item, presetId: DEFAULT_CUSTOM_TAG_PRESET_ID, updatedAt: new Date().toISOString() } : item);
+      customTagPresets = customTagPresets.filter(preset => preset.id !== presetId);
+      rebuildEffectiveArtistCatalog();
+      saveCustomTagPresets(customTagPresets); saveCustomTags(customTags);
+    }
+    const retainedIds = new Set(customTags.map(item => item.id));
+    reconcileDeletedCustomTags(previousTags.filter(item => !retainedIds.has(item.id)), previousShadowed);
+  } catch (error) {
+    customPresetDeleteError = error instanceof Error ? error.message : String(error);
+    render();
+    return;
+  }
   selectedCustomPresetId = DEFAULT_CUSTOM_TAG_PRESET_ID;
   deletingCustomPresetId = null;
-  saveCustomTagPresets(customTagPresets);
-  saveCustomTags(customTags);
   render();
 }
 
 function bindCustomTagEvents(): void {
   if (activeWorkspace !== 'custom-tags') return;
+  bindCustomTagPackEvents();
   document.querySelector('#custom-tag-search')?.addEventListener('input', event => { customTagSearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
-  document.querySelectorAll<HTMLButtonElement>('[data-custom-filter]').forEach(button => button.addEventListener('click', () => { customTagFilter = button.dataset.customFilter as ConstructorZone | 'artist' | 'all'; render(); }));
+  document.querySelectorAll<HTMLButtonElement>('[data-custom-filter]').forEach(button => button.addEventListener('click', () => { customTagFilter = button.dataset.customFilter as CustomTagZone | 'artist' | 'all'; render(); }));
   document.querySelectorAll<HTMLButtonElement>('[data-select-preset]').forEach(button => button.addEventListener('click', () => {
     selectedCustomPresetId = button.dataset.selectPreset === 'all' ? 'all' : (button.dataset.selectPreset ?? DEFAULT_CUSTOM_TAG_PRESET_ID);
     deletingCustomPresetId = null;
@@ -1706,13 +1900,13 @@ function bindCustomTagEvents(): void {
   }));
   document.querySelector('#create-preset')?.addEventListener('click', () => { creatingCustomPreset = true; render(); window.setTimeout(() => document.querySelector<HTMLInputElement>('#custom-preset-name')?.focus(), 0); });
   document.querySelector('#cancel-create-preset')?.addEventListener('click', () => { creatingCustomPreset = false; render(); });
-  document.querySelector<HTMLFormElement>('#custom-preset-form')?.addEventListener('submit', event => { event.preventDefault(); createCustomPreset(); });
+  document.querySelector<HTMLFormElement>('#custom-preset-form')?.addEventListener('submit', event => { event.preventDefault(); void createCustomPreset(); });
   document.querySelectorAll<HTMLButtonElement>('[data-rename-preset]').forEach(button => button.addEventListener('click', () => { renamingCustomPresetId = button.dataset.renamePreset!; deletingCustomPresetId = null; render(); window.setTimeout(() => document.getElementById(`preset-rename-${renamingCustomPresetId!}`)?.focus(), 0); }));
   document.querySelectorAll<HTMLButtonElement>('[data-cancel-rename]').forEach(button => button.addEventListener('click', () => { renamingCustomPresetId = null; render(); }));
-  document.querySelectorAll<HTMLFormElement>('[data-preset-rename-form]').forEach(form => form.addEventListener('submit', event => { event.preventDefault(); renameCustomPreset(form.dataset.presetRenameForm!); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-delete-preset]').forEach(button => button.addEventListener('click', () => { deletingCustomPresetId = button.dataset.deletePreset!; renamingCustomPresetId = null; render(); }));
-  document.querySelector('#cancel-delete-preset')?.addEventListener('click', () => { deletingCustomPresetId = null; render(); });
-  document.querySelector<HTMLButtonElement>('[data-confirm-delete-preset]')?.addEventListener('click', () => deleteCustomPreset(document.querySelector<HTMLButtonElement>('[data-confirm-delete-preset]')!.dataset.confirmDeletePreset!));
+  document.querySelectorAll<HTMLFormElement>('[data-preset-rename-form]').forEach(form => form.addEventListener('submit', event => { event.preventDefault(); void renameCustomPreset(form.dataset.presetRenameForm!); }));
+  document.querySelectorAll<HTMLButtonElement>('[data-delete-preset]').forEach(button => button.addEventListener('click', () => { deletingCustomPresetId = button.dataset.deletePreset!; customPresetDeleteError = ''; renamingCustomPresetId = null; render(); }));
+  document.querySelector('#cancel-delete-preset')?.addEventListener('click', () => { deletingCustomPresetId = null; customPresetDeleteError = ''; render(); });
+  document.querySelectorAll<HTMLButtonElement>('[data-confirm-delete-preset]').forEach(button => button.addEventListener('click', () => { void deleteCustomPreset(button.dataset.confirmDeletePreset!, button.dataset.deleteMode === 'delete' ? 'delete' : 'move'); }));
   document.querySelector('#cancel-custom-edit')?.addEventListener('click', () => { editingCustomTagId = null; customTagFormKind = 'tag'; customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); });
   document.querySelectorAll<HTMLButtonElement>('[data-edit-custom-tag]').forEach(button => button.addEventListener('click', () => { const item = customTags.find(tag => tag.id === button.dataset.editCustomTag); if (!item) return; editingCustomTagId = item.id; customTagFormKind = item.kind === 'artist' ? 'artist' : 'tag'; selectedCustomPresetId = customTagPresetId(item); customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); }));
   document.querySelectorAll<HTMLButtonElement>('[data-delete-custom-tag]').forEach(button => button.addEventListener('click', () => void deleteCustomTag(button.dataset.deleteCustomTag!)));
@@ -1762,43 +1956,40 @@ async function readCustomImage(file?: File): Promise<void> {
 async function saveCustomTagFromForm(): Promise<void> {
   const kind: CustomTagKind = document.querySelector<HTMLSelectElement>('#custom-card-kind')?.value === 'artist' ? 'artist' : 'tag';
   const rawTag = document.querySelector<HTMLInputElement>('#custom-tag-name')?.value.trim() ?? '';
+  if (rawTag.length > CUSTOM_TAG_MAX_LENGTH) { customImageError(`Tags must be ${CUSTOM_TAG_MAX_LENGTH.toLocaleString()} characters or fewer.`); return; }
   const tag = kind === 'artist' ? artistDisplayName(rawTag) : rawTag;
-  const zone = document.querySelector<HTMLInputElement>('[data-custom-zone]:checked')?.value as ConstructorZone;
+  const zone = document.querySelector<HTMLInputElement>('[data-custom-zone]:checked')?.value as CustomTagZone;
   const description = document.querySelector<HTMLTextAreaElement>('#custom-tag-description')?.value ?? '';
   const existing = customTags.find(item => item.id === editingCustomTagId);
   const group = splitTagGroup(tag);
-  const validZone = ['frame', 'scene', 'render'].includes(zone);
+  const validZone = ['frame', 'scene', 'render', 'character'].includes(zone);
   if (!tag || (kind === 'tag' && (!group.length || !validZone))) { customImageError(kind === 'artist' ? 'Artist name is required.' : 'Tag and constructor are required.'); return; }
   if (kind === 'tag' && !existing?.imageAsset && !customImageBytes) { customImageError('Choose an image before saving a prompt tag.'); return; }
   const duplicate = customTags.find(item => {
     if (item.id === existing?.id || (item.kind === 'artist') !== (kind === 'artist')) return false;
     return kind === 'artist'
       ? canonicalArtistIdentity(item.tag) === canonicalArtistIdentity(tag)
-      : canonicalCustomTagIdentity(item.zone, item.tag) === canonicalCustomTagIdentity(zone, tag);
+      : (item.zone === 'character' ? `character:${canonicalGroupIdentity(item.tag)}` : canonicalCustomTagIdentity(item.zone, item.tag)) === (zone === 'character' ? `character:${canonicalGroupIdentity(tag)}` : canonicalCustomTagIdentity(zone as ConstructorZone, tag));
   });
   if (duplicate) { customImageError('A custom tag with this name already exists in that constructor.'); return; }
   const now = new Date().toISOString();
   const destinationPresetId = selectedCustomPresetId === 'all' ? DEFAULT_CUSTOM_TAG_PRESET_ID : customPreset(selectedCustomPresetId).id;
   const effectiveZone = validZone ? zone : existing?.zone ?? 'frame';
   let saved: CustomTag = existing ? { ...existing, kind, tag, zone: effectiveZone, presetId: destinationPresetId, description, updatedAt: now } : { id: id(), kind, tag, zone: effectiveZone, presetId: destinationPresetId, description, ...(customImageBytes && customImageMime ? { imageAsset: `memory-${id()}`, mime: customImageMime, originalName: customImageName } : {}), createdAt: now, updatedAt: now };
-  if (customImageBytes && customImageMime) {
-    if (window.naiStorage?.saveCustomTag) {
-      const previousAsset = existing?.imageAsset;
-      try {
-        saved = await window.naiStorage.saveCustomTag({ id: saved.id, kind, tag, zone: effectiveZone, presetId: destinationPresetId, description, mime: customImageMime, originalName: customImageName, createdAt: saved.createdAt, updatedAt: now }, customImageBytes);
-        if (previousAsset && previousAsset !== saved.imageAsset) await window.naiStorage.deleteCustomTag?.(previousAsset);
-      }
-      catch (error) { customImageError(error instanceof Error ? error.message : 'The image could not be saved.'); return; }
-    } else {
+  if (window.naiStorage?.transactCustomTags) {
+    try {
+      const snapshot = await transactCustomTags('card:upsert', { id: saved.id, kind, tag, zone: effectiveZone, presetId: destinationPresetId, description, mime: customImageMime ?? saved.mime, originalName: customImageName || saved.originalName, createdAt: saved.createdAt, updatedAt: now }, customImageBytes ?? undefined);
+      if (!snapshot) throw new Error('Custom Tags transaction is unavailable.');
+      applyCustomTagSnapshot(snapshot);
+      saved = customTags.find(item => item.id === saved.id) ?? saved;
+    } catch (error) { customImageError(error instanceof Error ? error.message : 'The card could not be saved.'); return; }
+  } else {
+    if (customImageBytes && customImageMime) {
       const draftUrl = customImageUrls.get('__draft__');
       if (draftUrl) setCustomImageUrl(saved.id, draftUrl);
     }
-  }
-  customTags = [...customTags.filter(item => item.id !== saved.id), saved];
-  rebuildEffectiveArtistCatalog();
-  saveCustomTags(customTags);
-  if (window.naiStorage?.saveCustomTag) clearDraftCustomImage();
-  else {
+    customTags = [...customTags.filter(item => item.id !== saved.id), saved];
+    rebuildEffectiveArtistCatalog(); saveCustomTags(customTags);
     // The browser session keeps its blob URL as the card's live image. Drop
     // only the draft alias so saving does not revoke the image still in use.
     customImageUrls.delete('__draft__');
@@ -1807,13 +1998,163 @@ async function saveCustomTagFromForm(): Promise<void> {
   render();
 }
 
+function setCustomTagPackStatus(message: string, kind: 'success' | 'error' | 'cancelled' | '' = ''): void {
+  customTagPackStatus = message;
+  customTagPackStatusKind = kind;
+  const status = document.querySelector<HTMLElement>('#custom-tag-pack-status');
+  if (status) { status.textContent = message; status.className = `custom-tag-pack-status ${kind}`; }
+}
+
+function finishCustomTagPackResult(result: CustomTagPackResult | null): void {
+  if (!result) { setCustomTagPackStatus('Import and export packs require the desktop app.', 'error'); return; }
+  if (result.status === 'imported') {
+    applyCustomTagSnapshot(result.snapshot);
+    selectedCustomPresetId = result.presetId;
+    setCustomTagPackStatus(`Imported ${result.imported} card${result.imported === 1 ? '' : 's'} into ${result.name}; ${result.skipped} duplicate${result.skipped === 1 ? '' : 's'} skipped.`, 'success');
+    render();
+    return;
+  }
+  if (result.status === 'no-new-cards') {
+    applyCustomTagSnapshot(result.snapshot);
+    setCustomTagPackStatus(`No new cards were imported; ${result.skipped} duplicate${result.skipped === 1 ? '' : 's'} skipped.`, 'cancelled');
+    render();
+    return;
+  }
+  if (result.status === 'exported') { setCustomTagPackStatus(`Exported ${result.cardCount} card${result.cardCount === 1 ? '' : 's'} from ${result.name}.`, 'success'); render(); return; }
+  if (result.status === 'cancelled') { setCustomTagPackStatus('Import or export cancelled.', 'cancelled'); render(); return; }
+  setCustomTagPackStatus(result.message || 'The .naipack operation failed.', 'error');
+  render();
+}
+
+function customTagPackError(error: unknown): CustomTagPackResult {
+  return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+}
+
+function isCustomTagPackFile(file?: File): boolean {
+  return Boolean(file && file.name && file.name.toLocaleLowerCase().endsWith('.naipack'));
+}
+
+async function importDroppedCustomTagPack(file?: File): Promise<void> {
+  if (!isCustomTagPackFile(file)) return;
+  const getPath = window.naiStorage?.getPathForFile;
+  const filePath = getPath?.(file!);
+  if (!filePath) { setCustomTagPackStatus('This .naipack could not be opened by the desktop bridge.', 'error'); render(); return; }
+  setCustomTagPackStatus('Validating .naipack…');
+  try { finishCustomTagPackResult(await importCustomTagsPath(filePath)); }
+  catch (error) { finishCustomTagPackResult(customTagPackError(error)); }
+}
+
+function bindCustomTagPackEvents(): void {
+  const workspace = document.querySelector<HTMLElement>('.custom-tags-workspace');
+  if (!workspace) return;
+  document.querySelector<HTMLButtonElement>('#custom-tag-import')?.addEventListener('click', () => {
+    setCustomTagPackStatus('Opening .naipack…');
+    void importCustomTags().then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error)));
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-export-preset]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    setCustomTagPackStatus('Preparing .naipack…');
+    void exportCustomTags(button.dataset.exportPreset!).then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error)));
+  }));
+  const overlay = workspace.querySelector<HTMLElement>('#custom-tag-pack-drop-overlay');
+  let packDragDepth = 0;
+  const showPackDropToast = () => {
+    overlay?.removeAttribute('hidden');
+    overlay?.setAttribute('aria-hidden', 'false');
+  };
+  const hidePackDropToast = () => {
+    packDragDepth = 0;
+    overlay?.setAttribute('hidden', '');
+    overlay?.setAttribute('aria-hidden', 'true');
+  };
+  const dropDescriptors = (event: DragEvent): { types: string[]; files?: CustomTagDropFileDescriptor[]; itemCount?: number } => {
+    const dataTransfer = event.dataTransfer;
+    const types = dataTransfer ? Array.from(dataTransfer.types ?? [], type => String(type)) : [];
+    const actualFiles = dataTransfer?.files;
+    if (actualFiles && actualFiles.length > 0) return { types, files: Array.from(actualFiles, file => ({ name: file.name, type: file.type })) };
+    const fileItems = dataTransfer?.items ? Array.from(dataTransfer.items).filter(item => item.kind === 'file') : [];
+    if (!fileItems.length) return { types, itemCount: 0 };
+    const exposed = fileItems.map(item => {
+      try { const file = item.getAsFile(); return file ? { name: file.name, type: file.type } : undefined; } catch { return undefined; }
+    });
+    return exposed.every(Boolean) ? { types, files: exposed as CustomTagDropFileDescriptor[], itemCount: fileItems.length } : { types, itemCount: fileItems.length };
+  };
+  const dropFile = (event: DragEvent): File | undefined => {
+    const files = event.dataTransfer?.files;
+    if (files?.length === 1) return files[0];
+    const items = event.dataTransfer?.items;
+    if (!items) return undefined;
+    const fileItems = Array.from(items).filter(item => item.kind === 'file');
+    if (fileItems.length !== 1) return undefined;
+    try { return fileItems[0].getAsFile() ?? undefined; } catch { return undefined; }
+  };
+  const isInsideImageDrop = (event: DragEvent): boolean => {
+    const imageDrop = workspace.querySelector<HTMLElement>('#custom-image-drop');
+    return Boolean(imageDrop && event.target instanceof Node && imageDrop.contains(event.target));
+  };
+  const classify = (event: DragEvent, phase: 'drag' | 'drop') => classifyCustomTagDrop({ phase, targetInsideImageDrop: isInsideImageDrop(event), ...dropDescriptors(event) });
+  const dropError = (event: DragEvent): string => {
+    const details = dropDescriptors(event);
+    const count = details.files?.length ?? details.itemCount;
+    return count != null && count > 1 ? 'Drop only one .naipack file at a time.' : 'Drop one .naipack file to import.';
+  };
+  const capture = true;
+  workspace.addEventListener('dragenter', event => {
+    const dragEvent = event as DragEvent;
+    const decision = classify(dragEvent, 'drag');
+    if (decision === 'ignore') { hidePackDropToast(); return; }
+    event.preventDefault();
+    event.stopPropagation();
+    if (decision === 'candidate') { packDragDepth += 1; showPackDropToast(); }
+  }, capture);
+  workspace.addEventListener('dragover', event => {
+    const dragEvent = event as DragEvent;
+    const decision = classify(dragEvent, 'drag');
+    if (decision === 'ignore') { hidePackDropToast(); return; }
+    event.preventDefault();
+    event.stopPropagation();
+    try { dragEvent.dataTransfer!.dropEffect = decision === 'candidate' ? 'copy' : 'none'; } catch { /* DataTransfer may be read-only in tests. */ }
+    if (decision === 'candidate') showPackDropToast();
+    else hidePackDropToast();
+  }, capture);
+  workspace.addEventListener('dragleave', event => {
+    const dragEvent = event as DragEvent;
+    const decision = classify(dragEvent, 'drag');
+    const related = dragEvent.relatedTarget as Node | null;
+    if (related && workspace.contains(related)) {
+      if (decision !== 'ignore') packDragDepth = Math.max(0, packDragDepth - 1);
+      return;
+    }
+    hidePackDropToast();
+  }, capture);
+  // Chromium can end an external Windows drag without delivering a final
+  // leave/drop to the element beneath the pointer. Always clear the compact
+  // affordance when that drag is cancelled or completes elsewhere.
+  workspace.addEventListener('dragend', hidePackDropToast, capture);
+  workspace.addEventListener('drop', event => {
+    const dropEvent = event as DragEvent;
+    const decision = classify(dropEvent, 'drop');
+    hidePackDropToast();
+    if (decision === 'ignore') return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (decision !== 'pack') { setCustomTagPackStatus(dropError(dropEvent), 'error'); return; }
+    const file = dropFile(dropEvent);
+    if (!file) { setCustomTagPackStatus('The dropped .naipack file could not be opened.', 'error'); return; }
+    void importDroppedCustomTagPack(file);
+  }, capture);
+}
+
 async function deleteCustomTag(tagId: string): Promise<void> {
   const item = customTags.find(tag => tag.id === tagId);
   if (!item) return;
   const customArtistId = item.kind === 'artist' ? customArtistCatalogId(item.id) : null;
   const shadowed = item.kind === 'artist' && shadowedCustomArtistIds.has(item.id);
-  if (window.naiStorage?.deleteCustomTag && item.imageAsset && !item.imageAsset.startsWith('memory-')) await window.naiStorage.deleteCustomTag(item.imageAsset);
-  customTags = customTags.filter(tag => tag.id !== tagId);
+  let snapshotApplied = false;
+  if (window.naiStorage?.transactCustomTags) {
+    try { const snapshot = await transactCustomTags('card:delete', { id: tagId }); if (!snapshot) return; applyCustomTagSnapshot(snapshot); snapshotApplied = true; }
+    catch (error) { console.error(`[custom-tags] ${error instanceof Error ? error.message : String(error)}`); return; }
+  } else customTags = customTags.filter(tag => tag.id !== tagId);
   if (customArtistId && !shadowed) {
     base.artists = base.artists.filter(item => (item.catalogId ?? item.id) !== customArtistId);
     artistFavorites.delete(customArtistId);
@@ -1824,7 +2165,7 @@ async function deleteCustomTag(tagId: string): Promise<void> {
     };
     saveFavorites(artistFavorites, 'artists');
   }
-  rebuildEffectiveArtistCatalog();
+  if (!snapshotApplied) rebuildEffectiveArtistCatalog();
   revokeCustomImageUrl(tagId);
   if (editingCustomTagId === tagId) {
     editingCustomTagId = null; customTagFormKind = 'tag';
@@ -1851,6 +2192,7 @@ function closeArtistPicker(): void {
 function openCharacterPicker(trigger?: HTMLElement): void {
   const picker = document.querySelector<HTMLElement>('#character-picker-backdrop');
   if (!picker) return;
+  cancelStartupIdlePreviews();
   characterPickerTrigger = trigger ?? document.activeElement as HTMLElement;
   modal = 'characters';
   picker.hidden = false;
@@ -1918,9 +2260,14 @@ function bindCharacterBlockEvents(): void {
     }, 150));
   });
   document.querySelectorAll<HTMLInputElement>('[data-character-name]').forEach(input => input.addEventListener('input', () => { const item = characters.find(character => character.id === input.dataset.characterName); if (item) { item.label = input.value; saveSoon(); } }));
+  document.querySelectorAll<HTMLButtonElement>('[data-save-character]').forEach(button => button.addEventListener('click', () => {
+    const character = characters.find(item => item.id === button.dataset.saveCharacter);
+    if (character) openLibrarySaveModal('character', 'prompt-builder', character);
+  }));
   document.querySelectorAll<HTMLButtonElement>('[data-copy-character]').forEach(button => button.addEventListener('click', () => { const item = characters.find(character => character.id === button.dataset.copyCharacter); if (item) void copy(buildCharacterPrompt(item), `[data-copy-character="${item.id}"]`); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-remove-character]').forEach(button => button.addEventListener('click', () => { characters = characters.filter(item => item.id !== button.dataset.removeCharacter); render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-character-details]').forEach(button => button.addEventListener('click', () => { detailCharacterId = button.dataset.characterDetails!; modal = 'character-details'; renderDetailsModal(); }));
+  document.querySelectorAll<HTMLButtonElement>('[data-open-character-constructor]').forEach(button => button.addEventListener('click', event => openConstructor({ kind: 'character', characterId: button.dataset.openCharacterConstructor! }, event.currentTarget as HTMLElement)));
+  document.querySelectorAll<HTMLButtonElement>('[data-remove-character]').forEach(button => button.addEventListener('click', () => requestCharacterRemoval(button.dataset.removeCharacter!, button)));
+  document.querySelector<HTMLButtonElement>('#character-details')?.addEventListener('click', event => { characterModalReturnFocus = event.currentTarget as HTMLElement; modal = 'character-details'; renderDetailsModal(); });
 }
 function bindCharacterPickerEvents(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-pick-character]').forEach(button => button.addEventListener('click', () => {
@@ -1929,7 +2276,6 @@ function bindCharacterPickerEvents(): void {
     characters.push(newCharacter(card.tag, `girl, ${card.tag}`));
     saveSoon();
     renderCharacterList();
-    refreshCharacterPicker();
     focusField('#character-search');
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-favorite-character]').forEach(button => button.addEventListener('click', event => {
@@ -1941,6 +2287,7 @@ function bindCharacterPickerEvents(): void {
 function refreshArtistGrid(options: { preserveScroll?: boolean; resetScroll?: boolean; focusFavoriteId?: string } = {}): void {
   const grid = document.querySelector<HTMLElement>('#artist-grid');
   if (!grid) return;
+  cancelStartupIdlePreviews();
   clearHoverPreviewCache();
   const requestToken = ++previewPageToken;
   const previousScrollTop = options.resetScroll ? 0 : options.preserveScroll ? grid.scrollTop : viewScrollTop.get(grid.id) ?? grid.scrollTop;
@@ -1997,6 +2344,7 @@ function refreshCharacterPicker(options: { resetScroll?: boolean } = {}): void {
   const previous = document.querySelector<HTMLButtonElement>('#character-previous');
   const next = document.querySelector<HTMLButtonElement>('#character-next');
   if (!grid || !status || !count || !pageStatus || !previous || !next) return;
+  cancelStartupIdlePreviews();
   clearHoverPreviewCache();
   const requestToken = ++previewPageToken;
   const previousScrollTop = options.resetScroll ? 0 : viewScrollTop.get(grid.id) ?? grid.scrollTop;
@@ -2180,6 +2528,7 @@ function openMixPicker(mode: 'primary' | 'companion' | 'replace-anchor' = 'prima
   if (mixTransitionActive) return;
   const picker = document.querySelector<HTMLElement>('#mix-picker-backdrop');
   if (!picker) return;
+  cancelStartupIdlePreviews();
   mixPickerMode = mode;
   mixPickerReplaceTarget = mode === 'replace-anchor' ? replaceTarget ?? null : null;
   mixPickerTrigger = trigger ?? document.activeElement as HTMLElement;
@@ -2191,6 +2540,7 @@ function openMixPicker(mode: 'primary' | 'companion' | 'replace-anchor' = 'prima
 function refreshMixPicker(options: { resetScroll?: boolean } = {}): void {
   const grid = document.querySelector<HTMLElement>('#mix-artist-grid');
   if (!grid) return;
+  cancelStartupIdlePreviews();
   clearHoverPreviewCache();
   const requestToken = ++previewPageToken;
   const previousScrollTop = options.resetScroll ? 0 : viewScrollTop.get(grid.id) ?? grid.scrollTop;
@@ -2456,10 +2806,12 @@ async function installAppUpdate(): Promise<void> {
 }
 async function startCatalogUpdate(): Promise<void> {
   if (!window.naiCatalog || catalogUpdateBusy) return;
+  cancelStartupIdlePreviews();
   catalogUpdateBusy = true;
   catalogUpdateError = '';
   catalogUpdateStatus = 'Discovering current V5 gallery pages...';
-  render();
+  const catalogStatusVisible = (): boolean => activeWorkspace === 'settings' && Boolean(document.querySelector('#catalog-update-status'));
+  if (catalogStatusVisible()) render();
   try {
     const result = await window.naiCatalog.update();
     const previousArtists = officialArtists;
@@ -2473,22 +2825,23 @@ async function startCatalogUpdate(): Promise<void> {
       const previous = previousById.get(card.catalogId ?? card.id);
       return !previous || previous.sourceUrl !== card.sourceUrl || previous.image !== card.image;
     });
-    if (changedCards.length) {
-      catalogUpdateStatus = `Warming ${changedCards.length} new or changed previews...`;
-      const status = document.querySelector<HTMLElement>('#catalog-update-status');
-      if (status) status.textContent = catalogUpdateStatus;
+    // The revision invalidation above already drops all catalog-owned cache
+    // entries. Only queue cards that the user can currently see or has
+    // selected; everything else remains lazy and is hydrated by its page.
+    const visibleSources = new Set(Array.from(document.querySelectorAll<HTMLImageElement>('img[data-preview-src]')).map(image => image.dataset.previewSrc).filter((source): source is string => Boolean(source)));
+    const selectedIds = new Set([
+      ...base.artists.map(item => item.catalogId ?? item.id),
+      ...artistMix.anchors.map(item => item.catalogId ?? item.id),
+      ...artistMix.companions.map(item => item.catalogId ?? item.id)
+    ]);
+    const visibleChanged = changedCards.filter(card => selectedIds.has(card.catalogId ?? card.id) || visibleSources.has(catalogImage(card)));
+    if (visibleChanged.length) {
+      catalogUpdateStatus = `Catalog updated; preparing ${visibleChanged.length} visible preview${visibleChanged.length === 1 ? '' : 's'}...`;
+      scheduleStartupIdlePreviews(visibleChanged, []);
     }
-    for (const card of changedCards) {
-      const cache = isOfficialArtistCard(card) ? gridPreviewCache : contentPreviewCache;
-      cache.invalidateSources([catalogImage(card)]);
-    }
-    const previewResult = { failed: [] as CatalogCard[] };
-    await Promise.all(changedCards.slice(0, 144).map(async card => {
-      const ok = await decodePreview(card, 'background');
-      if (!ok) previewResult.failed.push(card);
-    }));
     randomRange = normalizeRange(randomRange, catalog.artists.length);
-    catalogUpdateStatus = `${result.added ? `+${result.added} artists` : '0 new artists'}${previewResult.failed.length ? `. ${previewResult.failed.length} preview${previewResult.failed.length === 1 ? '' : 's'} failed.` : ''}`;
+    if (!visibleChanged.length) catalogUpdateStatus = `${result.added ? `+${result.added} artists` : '0 new artists'} · previews load as needed`;
+    else catalogUpdateStatus = `${result.added ? `+${result.added} artists` : '0 new artists'} · visible previews queued`;
     randomNotice = result.added ? `Catalog refreshed with +${result.added} artists.` : 'Catalog is already up to date.';
     saveSoon(); saveArtistMixSoon();
   } catch (error) {
@@ -2496,7 +2849,7 @@ async function startCatalogUpdate(): Promise<void> {
     catalogUpdateError = error instanceof Error ? error.message : 'The V5 catalog update failed.';
   } finally {
     catalogUpdateBusy = false;
-    render();
+    if (catalogStatusVisible()) render();
   }
 }
 function randomizeArtists(): void {
@@ -2587,15 +2940,51 @@ function saveCurrentSet(): void {
 }
 
 function renderDetailsModal(): void {
-  const character = characters.find(item => item.id === detailCharacterId);
-  if (!character) return;
   const root = document.querySelector<HTMLDivElement>('#modal-root') ?? document.body.appendChild(document.createElement('div'));
   root.id = 'modal-root';
-  root.innerHTML = `<div class="modal-backdrop"><section class="detail-modal" role="dialog" aria-modal="true" aria-label="Character details"><header><div><p class="eyebrow">CHARACTER PROMPT</p><h2>${escapeHtml(character.label)}</h2></div><button class="icon-button" id="close-details" aria-label="Close">×</button></header><p>Keep character prompt and character undesired content separate from the base prompt.</p><button class="primary" id="done-details">Done</button></section></div>`;
+  root.innerHTML = `<div class="modal-backdrop"><section class="detail-modal" role="dialog" aria-modal="true" aria-label="Character details"><header><div><p class="eyebrow">CHARACTER GUIDE</p><h2>Character details</h2></div><button class="icon-button" id="close-details" aria-label="Close">×</button></header><p>Use positive prompt for appearance, clothing, pose, and identity. Use undesired for exclusions affecting only that character. The constructor changes only the active character.</p><button class="primary" id="done-details">Done</button></section></div>`;
   document.querySelector('#close-details')?.addEventListener('click', closeDetails);
   document.querySelector('#done-details')?.addEventListener('click', closeDetails);
 }
-function closeDetails(): void { modal = null; const root = document.querySelector('#modal-root'); if (root) root.innerHTML = ''; }
+
+function requestCharacterRemoval(characterId: string, trigger?: HTMLElement): void {
+  const character = characters.find(item => item.id === characterId);
+  if (!character) return;
+  if (!character.prompt.trim() && !character.undesired.trim()) {
+    characters = characters.filter(item => item.id !== characterId);
+    saveSoon();
+    render();
+    return;
+  }
+  detailCharacterId = characterId;
+  characterModalReturnFocus = trigger ?? null;
+  modal = 'character-remove';
+  const root = document.querySelector<HTMLDivElement>('#modal-root') ?? document.body.appendChild(document.createElement('div'));
+  root.id = 'modal-root';
+  root.innerHTML = `<div class="modal-backdrop"><section class="detail-modal character-remove-confirm" role="dialog" aria-modal="true" aria-labelledby="character-remove-title"><header><div><p class="eyebrow">CHARACTER BLOCK</p><h2 id="character-remove-title">Remove this character?</h2></div><button class="icon-button" id="close-details" aria-label="Close">×</button></header><p>Remove <b>${escapeHtml(character.label)}</b> and its positive and undesired text?</p><div class="saved-library-modal-actions"><button class="danger-button" id="confirm-character-remove" type="button">Remove character</button><button class="secondary" id="done-details" type="button">Cancel</button></div></section></div>`;
+  document.querySelector('#close-details')?.addEventListener('click', closeDetails);
+  document.querySelector('#done-details')?.addEventListener('click', closeDetails);
+  document.querySelector('#confirm-character-remove')?.addEventListener('click', () => {
+    characters = characters.filter(item => item.id !== characterId);
+    saveSoon();
+    closeDetails();
+    render();
+  });
+}
+function closeDetails(): void {
+  const trigger = characterModalReturnFocus;
+  closeRenderedDialog('#modal-root .modal-backdrop', () => {
+    characterModalReturnFocus = null;
+    modal = null;
+    detailCharacterId = null;
+    const root = document.querySelector('#modal-root');
+    if (root) root.innerHTML = '';
+    window.setTimeout(() => {
+      const fallback = trigger?.isConnected ? trigger : document.querySelector<HTMLElement>('#character-details');
+      fallback?.focus({ preventScroll: true });
+    }, 0);
+  });
+}
 
 async function loadCatalog(): Promise<void> {
   try {
@@ -2689,14 +3078,21 @@ async function preloadCards(cards: CatalogCard[], phase: string, priority: Previ
   renderStartup();
   const failed: CatalogCard[] = [];
   let completed = 0;
-  await Promise.all(cards.map(async card => {
-    let ok = false;
-    try { ok = await decodePreview(card, priority); } catch { ok = false; }
-    if (!ok) failed.push(card);
-    completed += 1;
-    startupCompleted = completedBeforePhase + completed;
-    renderStartup();
-  }));
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < cards.length) {
+      const card = cards[nextIndex++];
+      let ok = false;
+      try { ok = await decodePreview(card, priority); } catch { ok = false; }
+      if (!ok) failed.push(card);
+      completed += 1;
+      startupCompleted = completedBeforePhase + completed;
+      // Keep progress updates bounded while the cache performs its own
+      // foreground decode limiting. The final update is always emitted.
+      if (completed === cards.length || completed % 8 === 0) renderStartup();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, cards.length) }, () => worker()));
   const result = { failed, completed, total: cards.length };
   startupFailedCards = [...startupFailedCards, ...result.failed];
   startupFailures = startupFailedCards.map(card => card.tag);
@@ -2813,7 +3209,7 @@ function prefetchAdjacentCharacterPages(page: ReturnType<typeof paginateCharacte
 }
 
 function scheduleStartupIdlePreviews(cards: readonly CatalogCard[], sources: readonly string[]): void {
-  previewIdleCancel?.();
+  cancelStartupIdlePreviews();
   const warmupJobs: Array<{ source: string; card?: CatalogCard }> = [
     ...cards.map(card => ({ source: catalogImage(card), card })),
     ...sources.map(source => ({ source, card: undefined }))
@@ -2825,10 +3221,21 @@ function scheduleStartupIdlePreviews(cards: readonly CatalogCard[], sources: rea
       return (await cache.load(job.source, 'background')).state === 'ready';
     }
     catch { return false; }
-  }, 0, callback => window.setTimeout(callback, 16), 1);
+  }, 0, callback => scheduleIdleCallback(callback, 64, 1800), 1, {
+    initialGraceMs: 900,
+    backoffMs: 400,
+    onePerSlice: true,
+    shouldBackoff: () => Date.now() - startupWarmupLastInputAt < 900
+  });
   previewIdleCancel = run.cancel;
   run.startIdle();
 }
+
+// Background startup work yields to real user activity. The scheduler also
+// checks this timestamp before every slice, so a long interaction cannot be
+// followed by a burst of queued thumbnail work.
+function noteStartupUserActivity(): void { startupWarmupLastInputAt = Date.now(); }
+for (const eventName of ['pointerdown', 'keydown', 'input', 'wheel']) window.addEventListener(eventName, noteStartupUserActivity, { passive: true });
 
 async function bootApp(): Promise<void> {
   await loadCatalogMode();

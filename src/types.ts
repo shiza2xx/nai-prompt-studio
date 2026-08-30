@@ -51,7 +51,7 @@ export interface SavedLibraryCommon {
   /** V4 records are autonomous documents, never pointers into live workspaces. */
   version?: 4;
   id: string;
-  kind: 'prompt' | 'artist-mix';
+  kind: 'prompt' | 'artist-mix' | 'character';
   source?: 'manual' | 'prompt-builder' | 'artist-mix' | 'metadata' | 'legacy';
   name: string;
   description?: string;
@@ -102,7 +102,18 @@ export interface SavedArtistMixItem extends SavedLibraryCommon {
   snapshot: ArtistMixDraft;
 }
 
-export type SavedLibraryItem = SavedPromptItem | SavedArtistMixItem;
+/** Autonomous character document in Saved Library. It never points at the live builder. */
+export interface SavedCharacterData {
+  positive: string;
+  negative: string;
+}
+
+export interface SavedCharacterItem extends SavedLibraryCommon {
+  kind: 'character';
+  data: SavedCharacterData;
+}
+
+export type SavedLibraryItem = SavedPromptItem | SavedArtistMixItem | SavedCharacterItem;
 
 export interface BasePrompt {
   frame: string;
@@ -150,8 +161,9 @@ export interface GuideExample {
   group?: string;
 }
 
-export type CustomTagZone = 'frame' | 'scene' | 'render';
+export type CustomTagZone = 'frame' | 'scene' | 'render' | 'character';
 export type CustomTagKind = 'tag' | 'artist';
+export const CUSTOM_TAG_MAX_LENGTH = 4096;
 
 export interface CustomTagPreset {
   id: string;
@@ -176,6 +188,20 @@ export interface CustomTag {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface CustomTagLibrarySnapshot {
+  version: 1;
+  presets: CustomTagPreset[];
+  tags: CustomTag[];
+  warning?: string;
+}
+
+export type CustomTagPackResult =
+  | { status: 'imported'; snapshot: CustomTagLibrarySnapshot; presetId: string; name: string; imported: number; skipped: number }
+  | { status: 'no-new-cards'; snapshot: CustomTagLibrarySnapshot; presetId: null; name: null; imported: 0; skipped: number }
+  | { status: 'exported'; presetId: string; name: string; cardCount: number; path?: string }
+  | { status: 'cancelled' }
+  | { status: 'error'; message: string };
 
 export interface CatalogCard {
   id: string;

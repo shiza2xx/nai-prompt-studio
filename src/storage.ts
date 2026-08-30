@@ -1,6 +1,6 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { mixCompanionCapacity } from './artist-mix-layout.ts';
-import type { AnimationMode, AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, PreviewCachePreset, PromptDraft, PromptSet, SavedArtistMixData, SavedLibraryItem, SavedPromptData, SavedPromptItem, SavedPromptSnapshot, StudioTheme, WeightedTag } from './types';
+import { CUSTOM_TAG_MAX_LENGTH, type AnimationMode, type AppSettings, type ArtistMixDraft, type CustomTag, type CustomTagPackResult, type CustomTagPreset, type PreviewCachePreset, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedLibraryItem, type SavedPromptData, type SavedPromptItem, type SavedPromptSnapshot, type StudioTheme, type WeightedTag } from './types.ts';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -21,7 +21,7 @@ function normalizeArtistWeight(value: unknown): number {
   return Number(Math.max(0.1, Math.min(2, Math.round(source * 10) / 10)).toFixed(1));
 }
 
-type DesktopSnapshot = { exists?: boolean; data?: { version?: number; sets?: PromptSet[]; savedLibrary?: unknown; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[] } };
+type DesktopSnapshot = { exists?: boolean; data?: { version?: number; sets?: PromptSet[]; savedLibrary?: unknown; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[]; customTagLibrary?: { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } } };
 
 function bridge(): typeof window.naiStorage | undefined {
   try { return typeof window === 'undefined' ? undefined : window.naiStorage; } catch { return undefined; }
@@ -44,6 +44,8 @@ const desktopSnapshot: DesktopSnapshot = (() => {
   try { return bridge()?.load() as DesktopSnapshot ?? {}; } catch { return {}; }
 })();
 let cachedCustomTagPresets: CustomTagPreset[] | null = null;
+
+export function loadCustomTagLibraryWarning(): string { return desktopSnapshot.data?.customTagLibrary?.warning ?? ''; }
 
 /** True only when a profile existed before this renderer initialized. */
 export function hasExistingProfile(): boolean {
@@ -134,9 +136,45 @@ function normalizeSavedArtistMixData(value: unknown, prompt: string, fallback?: 
   return artists.length || serializedPrompt ? { artists, serializedPrompt } : undefined;
 }
 
+function normalizeSavedCharacterData(value: unknown): SavedCharacterData | undefined {
+  // Character records are a separate document kind. A malformed character
+  // must be rejected rather than silently becoming a prompt record.
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const source = value as Partial<SavedCharacterData>;
+  if (typeof source.positive !== 'string' || typeof source.negative !== 'string') return undefined;
+  return { positive: source.positive, negative: source.negative };
+}
+
 export function normalizeSavedLibraryItem(value: unknown, fallbackNow = new Date().toISOString()): SavedLibraryItem | null {
   if (!value || typeof value !== 'object') return null;
   const source = value as Partial<SavedLibraryItem> & { snapshot?: unknown; draft?: unknown; data?: unknown; source?: unknown; description?: unknown };
+  if (source.kind === 'character') {
+    const idValue = typeof source.id === 'string' ? source.id.trim() : '';
+    if (!idValue || !/^[a-zA-Z0-9_-]+$/.test(idValue)) return null;
+    const data = normalizeSavedCharacterData(source.data);
+    if (!data) return null;
+    const createdAt = normalizeSavedTimestamp(source.createdAt, fallbackNow);
+    const updatedAt = normalizeSavedTimestamp(source.updatedAt, createdAt);
+    const hasImageAsset = Object.prototype.hasOwnProperty.call(source, 'imageAsset');
+    const hasMime = Object.prototype.hasOwnProperty.call(source, 'mime');
+    const imageAsset = typeof source.imageAsset === 'string' && /^[a-zA-Z0-9._-]+$/.test(source.imageAsset) && !source.imageAsset.includes('..') ? source.imageAsset : undefined;
+    const mime = normalizeSavedMime(source.mime);
+    if ((hasImageAsset && !imageAsset) || (hasMime && !mime) || (hasImageAsset !== hasMime)) return null;
+    return cloneValue({
+      version: 4 as const,
+      id: idValue,
+      kind: 'character' as const,
+      source: source.source === 'manual' || source.source === 'prompt-builder' || source.source === 'artist-mix' || source.source === 'metadata' || source.source === 'legacy' ? source.source : 'manual',
+      name: normalizeSavedName(source.name, 'Saved character'),
+      ...(typeof source.description === 'string' && source.description.trim() ? { description: source.description.trim().slice(0, 2000) } : {}),
+      // Compatibility/search contract: prompt always mirrors positive.
+      prompt: data.positive,
+      ...(imageAsset && mime ? { imageAsset, mime, ...(typeof source.originalName === 'string' ? { originalName: source.originalName.slice(0, 255) } : {}) } : {}),
+      createdAt,
+      updatedAt,
+      data
+    });
+  }
   const kind = source.kind === 'artist-mix' ? 'artist-mix' : 'prompt';
   const idValue = typeof source.id === 'string' ? source.id.trim() : '';
   if (!idValue || !/^[a-zA-Z0-9_-]+$/.test(idValue)) return null;
@@ -411,11 +449,14 @@ export function saveDraft(draft: PromptDraft): void {
 export function normalizeCustomTag(value: unknown): CustomTag | null {
   if (!value || typeof value !== 'object') return null;
   const item = value as Partial<CustomTag>;
-  if (typeof item.id !== 'string' || !item.id || typeof item.tag !== 'string' || !item.tag.trim()) return null;
-  if (item.zone !== 'frame' && item.zone !== 'scene' && item.zone !== 'render') return null;
+  const tag = typeof item.tag === 'string' ? item.tag.trim() : '';
+  if (typeof item.id !== 'string' || !item.id || !tag || tag.length > CUSTOM_TAG_MAX_LENGTH) return null;
+  if (item.zone !== 'frame' && item.zone !== 'scene' && item.zone !== 'render' && item.zone !== 'character') return null;
   const kind = item.kind === 'artist' ? 'artist' : 'tag';
-  const hasAsset = typeof item.imageAsset === 'string' && !item.imageAsset.startsWith('memory-') && /^[a-zA-Z0-9._-]+$/.test(item.imageAsset);
+  const asset = typeof item.imageAsset === 'string' ? item.imageAsset.replace(/\\/g, '/') : '';
+  const hasAsset = /^(?:[a-zA-Z0-9._-]+|memory-[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+\/previews\/[a-f0-9]{64}\.(?:png|jpg|webp))$/.test(asset) && !asset.includes('..');
   const mime = item.mime === 'image/png' || item.mime === 'image/jpeg' || item.mime === 'image/webp' ? item.mime : null;
+  const description = typeof item.description === 'string' ? item.description.slice(0, 2000) : '';
   // Existing prompt-constructor cards remain strict. Artists may be text-only
   // and intentionally use the built-in plus-card placeholder.
   if (kind === 'tag' && (!hasAsset || !mime)) return null;
@@ -424,11 +465,11 @@ export function normalizeCustomTag(value: unknown): CustomTag | null {
   return {
     id: item.id,
     kind,
-    tag: item.tag.trim(),
+    tag,
     zone: item.zone,
     presetId: typeof item.presetId === 'string' && /^[a-zA-Z0-9_-]+$/.test(item.presetId.trim()) ? item.presetId.trim() : DEFAULT_CUSTOM_TAG_PRESET_ID,
-    description: typeof item.description === 'string' ? item.description : '',
-    ...(hasAsset && mime ? { imageAsset: item.imageAsset, mime } : {}),
+    description,
+    ...(hasAsset && mime ? { imageAsset: asset, mime } : {}),
     originalName: typeof item.originalName === 'string' ? item.originalName : '',
     createdAt: typeof item.createdAt === 'string' ? item.createdAt : now,
     updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : now
@@ -500,11 +541,10 @@ export function normalizeCustomTagPresetId(value: unknown, presets: readonly Cus
 export function loadCustomTagPresets(): CustomTagPreset[] {
   if (cachedCustomTagPresets) return cachedCustomTagPresets;
   if (!bridge()) { cachedCustomTagPresets = [defaultPreset()]; return cachedCustomTagPresets; }
-  const remote = desktopSnapshot.exists && Array.isArray(desktopSnapshot.data?.customTagPresets)
+  const remote = Array.isArray(desktopSnapshot.data?.customTagLibrary?.presets) ? desktopSnapshot.data!.customTagLibrary!.presets : desktopSnapshot.exists && Array.isArray(desktopSnapshot.data?.customTagPresets)
     ? desktopSnapshot.data!.customTagPresets
     : [];
   const normalized = normalizeCustomTagPresets(remote);
-  if (!desktopSnapshot.data?.customTagPresets || JSON.stringify(remote) !== JSON.stringify(normalized)) bridge()?.save('customTagPresets', normalized);
   cachedCustomTagPresets = normalized;
   return normalized;
 }
@@ -514,7 +554,6 @@ export function saveCustomTagPresets(presets: CustomTagPreset[]): void {
   // session. Electron persists only normalized metadata in workspace.json.
   cachedCustomTagPresets = normalizeCustomTagPresets(presets);
   if (!bridge()) return;
-  bridge()?.save('customTagPresets', cachedCustomTagPresets);
 }
 
 export function loadCustomTags(): CustomTag[] {
@@ -522,13 +561,13 @@ export function loadCustomTags(): CustomTag[] {
   // so loading metadata from localStorage would recreate broken asset URLs.
   if (!bridge()) return [];
   const presets = loadCustomTagPresets();
-  const remote = desktopSnapshot.exists && Array.isArray(desktopSnapshot.data?.customTags)
-    ? desktopSnapshot.data!.customTags!.map(normalizeCustomTag).filter((item): item is CustomTag => Boolean(item)).map(item => ({
+  const source = Array.isArray(desktopSnapshot.data?.customTagLibrary?.tags) ? desktopSnapshot.data!.customTagLibrary!.tags : desktopSnapshot.data?.customTags;
+  const remote = Array.isArray(source)
+    ? source.map(normalizeCustomTag).filter((item): item is CustomTag => Boolean(item)).map(item => ({
       ...item,
       presetId: normalizeCustomTagPresetId(item.presetId, presets)
     }))
     : null;
-  if (remote && desktopSnapshot.data?.customTags && JSON.stringify(remote) !== JSON.stringify(desktopSnapshot.data.customTags)) bridge()?.save('customTags', remote);
   return remote ?? [];
 }
 
@@ -536,5 +575,26 @@ export function saveCustomTags(tags: CustomTag[]): void {
   const normalized = tags.map(normalizeCustomTag).filter((item): item is CustomTag => Boolean(item));
   // Desktop/CMD persists metadata in workspace.json. Browser mode keeps the
   // caller's in-memory array only and never writes metadata without bytes.
-  bridge()?.save('customTags', normalized);
+  void normalized;
+}
+
+export async function transactCustomTags(operation: 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete', payload: object, bytes?: Uint8Array): Promise<{ version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } | null> {
+  const storage = bridge();
+  if (!storage?.transactCustomTags) return null;
+  return storage.transactCustomTags(operation, payload, bytes);
+}
+
+export async function importCustomTags(): Promise<CustomTagPackResult | null> {
+  const action = bridge()?.importCustomTags;
+  return action ? action() : null;
+}
+
+export async function importCustomTagsPath(filePath: string): Promise<CustomTagPackResult | null> {
+  const action = bridge()?.importCustomTagsPath;
+  return action ? action(filePath) : null;
+}
+
+export async function exportCustomTags(presetId: string): Promise<CustomTagPackResult | null> {
+  const action = bridge()?.exportCustomTags;
+  return action ? action(presetId) : null;
 }

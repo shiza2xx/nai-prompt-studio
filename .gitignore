@@ -8,6 +8,7 @@
 /.installer-smoke*/
 /.qa-artifacts/
 /.build-artifacts/
+/.test-tmp-*/
 *.log
 /build-check.log
 /icons.jpg
@@ -46,12 +47,21 @@
 /plus.png
 /card.png
 /error*.jpg
+/error*.jpeg
+/error*.png
+/error*.webp
+/customtag*.jpg
+/dropzoneerror*.jpg
+/foldererror*.jpg
+/foldersinselect*.jpg
+/savetag*.jpg
 /tags*.png
 /tags*.jpg
 /tags*.jpeg
 /tags*.webp
 /Start NAI Prompt Studio.cmd
 /DISCORD_POST.md
+/redditpost.md
 
 # Local update fixtures and previous installer experiments
 /update-test-manifest*.json

@@ -1,4 +1,4 @@
-import type { AppSettings, ArtistMixDraft, CustomTag, CustomTagPreset, OfflineCatalog, PromptDraft, PromptSet, SavedLibraryItem } from './types';
+import type { AppSettings, ArtistMixDraft, CustomTag, CustomTagPackResult, CustomTagPreset, OfflineCatalog, PromptDraft, PromptSet, SavedLibraryItem } from './types';
 
 interface DesktopStorageSnapshot {
   exists: boolean;
@@ -11,6 +11,7 @@ interface DesktopStorageSnapshot {
     draft: PromptDraft | null;
     customTags: CustomTag[];
     customTagPresets: CustomTagPreset[];
+    customTagLibrary?: CustomTagLibrarySnapshot;
     settings?: AppSettings;
     artistMix?: ArtistMixDraft;
   };
@@ -20,15 +21,46 @@ interface NAIStorageBridge {
   load(): DesktopStorageSnapshot;
   save(section: 'sets' | 'savedLibrary' | 'favorites' | 'characterFavorites' | 'draft' | 'customTags' | 'customTagPresets' | 'settings' | 'artistMix', value: PromptSet[] | SavedLibraryItem[] | string[] | PromptDraft | CustomTag[] | CustomTagPreset[] | AppSettings | ArtistMixDraft): void;
   saveSync(section: 'sets' | 'savedLibrary' | 'favorites' | 'characterFavorites' | 'draft' | 'customTags' | 'customTagPresets' | 'settings' | 'artistMix', value: PromptSet[] | SavedLibraryItem[] | string[] | PromptDraft | CustomTag[] | CustomTagPreset[] | AppSettings | ArtistMixDraft): boolean;
-  saveCustomTag?(metadata: Omit<CustomTag, 'imageAsset'|'createdAt'|'updatedAt'> & { createdAt?: string; updatedAt?: string }, bytes: Uint8Array): Promise<CustomTag>;
-  deleteCustomTag?(imageAsset: string): Promise<boolean>;
+  transactCustomTags?(operation: CustomTagLibraryOperation, payload: object, bytes?: Uint8Array): Promise<CustomTagLibrarySnapshot>;
+  importCustomTags?(): Promise<CustomTagPackResult>;
+  importCustomTagsPath?(filePath: string): Promise<CustomTagPackResult>;
+  exportCustomTags?(presetId: string): Promise<CustomTagPackResult>;
+  getPathForFile?(file: File): string;
   saveLibraryImage?(metadata: { id: string; mime?: SavedLibraryItem['mime']; originalName?: string }, bytes: Uint8Array): Promise<{ imageAsset: string; mime?: SavedLibraryItem['mime']; originalName?: string }>;
   deleteLibraryImage?(imageAsset: string): Promise<boolean>;
 }
 
+interface MetadataPostResult {
+  site: 'danbooru' | 'konachan' | 'safebooru';
+  siteName: string;
+  id: string;
+  page: string;
+  pageUrl: string;
+  source: string;
+  tags: string;
+  width: string;
+  height: string;
+  rating: string;
+  bytes: Uint8Array;
+  mime: 'image/png' | 'image/jpeg' | 'image/webp';
+  name: string;
+  originalName: string;
+  imageUrl?: string;
+}
+
+interface NAIMetadataBridge {
+  loadPost(url: string): Promise<MetadataPostResult>;
+  cancel(): Promise<boolean>;
+  cancelPost(): Promise<boolean>;
+}
+
+type CustomTagLibraryOperation = 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete';
+interface CustomTagLibrarySnapshot { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string; }
+
 declare global {
   interface Window {
-  naiStorage?: NAIStorageBridge;
+    naiStorage?: NAIStorageBridge;
+    naiMetadata?: NAIMetadataBridge;
     naiCatalog?: NAICatalogBridge;
     naiUpdater?: NAIUpdaterBridge;
   }

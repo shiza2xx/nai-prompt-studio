@@ -1,10 +1,13 @@
 const fs = require('node:fs');
+const fsp = fs.promises;
 const path = require('node:path');
 const crypto = require('node:crypto');
 
 const GALLERY = 'danbooru-artist-tags-2-v5';
 const GALLERY_URL = `https://nax.moe/?gallery=${GALLERY}`;
 const CDN_PREFIX = `https://cdn.zele.st/data/NAX/Images/${GALLERY}/`;
+const GALLERY_PAGE_CONCURRENCY = 4;
+const PROGRESS_INTERVAL_MS = 100;
 
 function decodeHtml(value) {
   return String(value ?? '')
@@ -141,10 +144,16 @@ function resolveActiveCatalogAsset(catalogDir, relative, { embeddedPath } = {}) 
 }
 function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } }
 function validWebpFile(file) {
+  let descriptor;
   try {
     const stat = fs.lstatSync(file);
-    return stat.isFile() && !stat.isSymbolicLink() && isWebp(fs.readFileSync(file));
+    if (!stat.isFile() || stat.isSymbolicLink()) return false;
+    descriptor = fs.openSync(file, 'r');
+    const header = Buffer.allocUnsafe(12);
+    const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+    return bytesRead === header.length && isWebp(header);
   } catch { return false; }
+  finally { if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch { /* best effort */ } } }
 }
 function resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative }) {
   const looseRelative = typeof relative === 'string' && relative.toLowerCase().endsWith('.webp') && !relative.includes('\\') && !relative.split('/').some(segment => segment === '.' || segment === '..');
@@ -223,6 +232,47 @@ function loadCatalog({ embeddedPath, catalogDir }) {
   }
   return mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory: active?.directory });
 }
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const run = async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  };
+  const workers = Math.min(Math.max(1, Math.floor(concurrency)), items.length);
+  await Promise.all(Array.from({ length: workers }, run));
+  return results;
+}
+function createProgressReporter(onProgress) {
+  let lastEmission = 0;
+  let pending = null;
+  let timer = null;
+  const emit = event => {
+    lastEmission = Date.now();
+    onProgress(event);
+  };
+  const report = event => {
+    const terminal = event.phase === 'complete' || event.phase === 'commit' || event.phase === 'discovered' || (event.phase === 'validation' && (event.completed === 0 || event.completed === event.total));
+    if (terminal) {
+      pending = null;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      emit(event);
+      return;
+    }
+    pending = event;
+    const wait = Math.max(0, PROGRESS_INTERVAL_MS - (Date.now() - lastEmission));
+    if (timer !== null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      if (pending) { const next = pending; pending = null; emit(next); }
+    }, wait);
+  };
+  report.stop = () => { if (timer !== null) clearTimeout(timer); timer = null; pending = null; };
+  return report;
+}
 async function discoverCards(fetchImpl = fetch, signal, progress = () => {}) {
   const get = async page => {
     const url = `${GALLERY_URL}&page=${page}`;
@@ -236,7 +286,7 @@ async function discoverCards(fetchImpl = fetch, signal, progress = () => {}) {
   const first = parseGalleryPage(await get(1));
   const pages = first.pages.length ? first.pages : [1];
   progress({ phase: 'discovering', completed: 1, total: pages.length });
-  const rest = await Promise.all(pages.filter(page => page !== 1).map(async page => parseGalleryPage(await get(page))));
+  const rest = await mapWithConcurrency(pages.filter(page => page !== 1), GALLERY_PAGE_CONCURRENCY, async page => parseGalleryPage(await get(page)));
   const cards = [first, ...rest].flatMap(result => result.cards);
   const seen = new Set();
   const unique = cards.filter(card => { const key = card.sourceUrl; if (seen.has(key)) return false; seen.add(key); return true; });
@@ -251,14 +301,22 @@ function validateCardResponse(response, expectedUrl) {
   if (!normalized || final !== expectedUrl) throw new Error('Card redirect or URL is outside the V5 CDN allowlist');
 }
 async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, onProgress = () => {} }) {
+  const progress = createProgressReporter(onProgress);
   const embedded = readJson(embeddedPath, { version: 2, artists: [], characters: [], tags: [] });
   const old = loadCatalog({ embeddedPath, catalogDir });
-  const discovered = await discoverCards(fetchImpl, signal, onProgress);
+  let discovered;
+  try { discovered = await discoverCards(fetchImpl, signal, progress); }
+  catch (error) { progress.stop(); throw error; }
   assertNotCancelled(signal);
   const existingBySource = new Map();
   for (const card of old.artists || []) {
     const source = cardSource(card);
     if (source && !existingBySource.has(source)) existingBySource.set(source, card);
+  }
+  const embeddedBySource = new Map();
+  for (const card of embedded.artists || []) {
+    const source = cardSource(card);
+    if (source && !embeddedBySource.has(source)) embeddedBySource.set(source, card);
   }
   const active = activeGeneration(catalogDir);
   const activeOverlay = active ? readJson(contained(active.directory, 'catalog.json'), null) : null;
@@ -268,7 +326,6 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
   const generation = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const stage = contained(catalogDir, path.join('.staging', generation));
   const stageCards = contained(stage, path.join('cards', 'artist', GALLERY));
-  fs.mkdirSync(stageCards, { recursive: true });
   let added = 0;
   let changed = 0;
   let renamed = false;
@@ -277,6 +334,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
   // only the previous runtime delta into the new generation so its cards stay
   // usable after a subsequent update.
   try {
+    await fsp.mkdir(stageCards, { recursive: true });
     for (const previous of (activeOverlay?.artists || [])) {
       if (!previous?.runtime) continue;
       const previousImage = String(previous.image || '');
@@ -286,8 +344,8 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       try { source = resolveActiveCatalogAsset(catalogDir, previousImage); } catch { continue; }
       const destination = contained(stage, previousImage);
       if (!validWebpFile(source)) continue;
-      fs.mkdirSync(path.dirname(destination), { recursive: true });
-      fs.copyFileSync(source, destination);
+      await fsp.mkdir(path.dirname(destination), { recursive: true });
+      await fsp.copyFile(source, destination);
       runtimeArtists.set(previous.catalogId || previous.id, { ...previous, runtime: true });
     }
 
@@ -297,7 +355,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       // Exact raw source URL is the only reuse identity. A changed URL is a
       // genuinely new card even when its display tag stayed the same.
       const exact = existingBySource.get(source.sourceUrl) || null;
-      const embeddedExact = (embedded.artists || []).find(card => cardSource(card) === source.sourceUrl) || null;
+      const embeddedExact = embeddedBySource.get(source.sourceUrl) || null;
       const embeddedId = cardId(embeddedExact);
       const runtimeId = exact?.runtime ? cardId(exact) : '';
       const embeddedBaseAvailable = embeddedExact
@@ -307,7 +365,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       if (embeddedExact && canPruneRuntime) {
         if (embeddedId) { runtimeArtists.delete(embeddedId); currentRuntimeIds.delete(embeddedId); }
         if (runtimeId) { runtimeArtists.delete(runtimeId); currentRuntimeIds.delete(runtimeId); }
-        onProgress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: `${source.tag} already embedded` });
+        progress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: `${source.tag} already embedded` });
         continue;
       }
       // If the embedded metadata is present but its bytes are unavailable, or
@@ -326,7 +384,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
         const seeded = runtimeArtists.get(catalogId);
         if (seeded && validCardAsset(String(seeded.image || ''))) {
           const seededPath = contained(stage, String(seeded.image));
-          if (fs.existsSync(seededPath) && isWebp(fs.readFileSync(seededPath))) {
+          if (fs.existsSync(seededPath) && validWebpFile(seededPath)) {
             // Keep the previous path when it is already valid.  This avoids a
             // needless fetch and preserves a stable overlay asset.
             runtimeArtists.set(catalogId, { ...seeded, id: existing.id || catalogId, catalogId: existing.catalogId || catalogId, tag: source.tag, score: source.score, sourceUrl: source.sourceUrl });
@@ -340,21 +398,23 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
         validateCardResponse(response, source.sourceUrl);
         const bytes = Buffer.from(await response.arrayBuffer());
         if (!isWebp(bytes)) throw new Error(`Invalid WebP payload for ${source.tag}`);
-        fs.writeFileSync(target, bytes);
+        await fsp.mkdir(path.dirname(target), { recursive: true });
+        await fsp.writeFile(target, bytes);
         if (existing) changed += 1; else added += 1;
       }
       runtimeArtists.set(catalogId, { id: existing?.id || catalogId, catalogId: existing?.catalogId || catalogId, tag: source.tag, gallery: GALLERY, image: relative, sourceUrl: source.sourceUrl, score: source.score, runtime: true });
       currentRuntimeIds.add(catalogId);
-      onProgress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: source.tag });
+      progress({ phase: 'downloading', completed: index + 1, total: discovered.length, added, changed, message: source.tag });
     }
     assertNotCancelled(signal);
     const artists = [...runtimeArtists.entries()].filter(([catalogId]) => currentRuntimeIds.has(catalogId)).map(([, card]) => card);
     const overlay = { version: 2, catalogId: 'nai-v5-runtime', generatedAt: new Date().toISOString(), artists, characters: [], tags: embedded.tags || [] };
-    onProgress({ phase: 'validation', completed: 0, total: artists.length, added, changed, message: 'Validating staged catalog' });
+    progress({ phase: 'validation', completed: 0, total: artists.length, added, changed, message: 'Validating staged catalog' });
     const ids = new Set();
     const sources = new Set();
     for (let index = 0; index < artists.length; index += 1) {
       assertNotCancelled(signal);
+      if (index > 0 && index % 32 === 0) await new Promise(resolve => setImmediate(resolve));
       const card = artists[index];
       const cardId = card.catalogId || card.id;
       if (!cardId || ids.has(cardId)) throw new Error(`Duplicate runtime catalog identity: ${cardId || 'missing id'}`);
@@ -364,35 +424,36 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       sources.add(source);
       if (!validCardAsset(card.image)) throw new Error(`Invalid runtime catalog asset for ${card.tag || cardId}`);
       const asset = containedCatalogAsset(stage, card.image);
-      if (!fs.existsSync(asset) || !isWebp(fs.readFileSync(asset))) throw new Error(`Invalid staged WebP for ${card.tag || cardId}`);
+      if (!fs.existsSync(asset) || !validWebpFile(asset)) throw new Error(`Invalid staged WebP for ${card.tag || cardId}`);
       if (!normalizeImageUrl(card.sourceUrl)) throw new Error(`Invalid runtime source URL for ${card.tag || cardId}`);
-      onProgress({ phase: 'validation', completed: index + 1, total: artists.length, added, changed, message: card.tag });
+      progress({ phase: 'validation', completed: index + 1, total: artists.length, added, changed, message: card.tag });
     }
     const stageCatalog = contained(stage, 'catalog.json');
-    fs.writeFileSync(stageCatalog, JSON.stringify(overlay));
-    JSON.parse(fs.readFileSync(stageCatalog, 'utf8'));
-    onProgress({ phase: 'validation', completed: artists.length, total: artists.length, added, changed, message: 'Staged catalog validated' });
+    await fsp.writeFile(stageCatalog, JSON.stringify(overlay));
+    JSON.parse(await fsp.readFile(stageCatalog, 'utf8'));
+    progress({ phase: 'validation', completed: artists.length, total: artists.length, added, changed, message: 'Staged catalog validated' });
     assertNotCancelled(signal);
     const generationDir = contained(catalogDir, path.join('generations', generation));
-    fs.mkdirSync(path.dirname(generationDir), { recursive: true });
+    await fsp.mkdir(path.dirname(generationDir), { recursive: true });
     assertNotCancelled(signal);
-    fs.renameSync(stage, generationDir);
+    await fsp.rename(stage, generationDir);
     renamed = true;
     // Commit is intentionally short and non-cancellable.  The old pointer
     // remains active until this atomic rename succeeds.
-    onProgress({ phase: 'commit', completed: 0, total: 1, added, changed, message: 'Activating catalog generation' });
+    progress({ phase: 'commit', completed: 0, total: 1, added, changed, message: 'Activating catalog generation' });
     const pointerTemp = contained(catalogDir, 'active.json.tmp');
-    fs.writeFileSync(pointerTemp, JSON.stringify({ generation }));
-    fs.renameSync(pointerTemp, contained(catalogDir, 'active.json'));
-    onProgress({ phase: 'commit', completed: 1, total: 1, added, changed, message: 'Catalog generation active' });
-    onProgress({ phase: 'complete', completed: discovered.length, total: discovered.length, added, changed, message: `+${added} artists` });
+    await fsp.writeFile(pointerTemp, JSON.stringify({ generation }));
+    await fsp.rename(pointerTemp, contained(catalogDir, 'active.json'));
+    progress({ phase: 'commit', completed: 1, total: 1, added, changed, message: 'Catalog generation active' });
+    progress({ phase: 'complete', completed: discovered.length, total: discovered.length, added, changed, message: `+${added} artists` });
     return { catalog: loadCatalog({ embeddedPath, catalogDir }), added, changed };
   } catch (error) {
     if (!renamed) {
-      try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* keep old generation active */ }
+      try { await fsp.rm(stage, { recursive: true, force: true }); } catch { /* keep old generation active */ }
     }
+    progress.stop();
     throw error;
   }
 }
 
-module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAsset, validCardAsset, validCharacterAsset, validGuideAsset, validCatalogAsset };
+module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, GALLERY_PAGE_CONCURRENCY, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAsset, validCardAsset, validCharacterAsset, validGuideAsset, validCatalogAsset };

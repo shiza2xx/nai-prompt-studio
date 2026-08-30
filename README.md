@@ -4,13 +4,14 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 
 ## Features
 
-- Prompt Builder with visual constructors for Frame, Scene, and Render/Quality tags organized into folders, plus separate undesired-content and character prompts
+- Prompt Builder with visual constructors for Frame, Scene, Render/Quality, and the active character prompt, plus separate undesired-content and character prompts
 - V5 artist browser with favorites, weighted tags, animated card previews, random artist counts, and per-card or global weight rerolls
 - Artist Mix workspace with one or more fixed primary artists and shuffled companion artists, favorites-only pools, focus mode, and one-click prompt copying
 - Searchable character card browser with separate positive and negative character prompts
-- Custom Tags presets with personal images, descriptions, and custom artist cards; a matching future NAX entry can replace a personal artist preview automatically
-- Saved Library for independent prompt and Artist Mix records with optional cover images, editable descriptions, positive/negative switching, character details, and per-field copy actions
-- Local NovelAI image metadata inspection for PNG and WebP files, including model, generation settings, base prompts, character prompts, artist highlighting, preview cards, and direct Saved Library actions
+- Custom Tags presets with personal images, descriptions, character-zone prompt cards, and custom artist cards; a matching future NAX entry can replace a personal artist preview automatically
+- Custom Tags folders can be shared with one `.naipack` file. Packs include the cards, descriptions, and original PNG/JPEG/WebP previews and can be moved between app profiles.
+- Saved Library for independent prompt, Artist Mix, and Character records with optional cover images, editable descriptions, positive/negative switching, character details, and per-field copy actions
+- NovelAI PNG/WebP metadata inspection plus Danbooru, Konachan, and Safebooru post loading, with selective tag saving, artist highlighting, preview cards, and direct Saved Library actions
 - Manual and optional startup checks for additions to the exact NAX V5 artist catalog, with live catalog refresh after downloading
 - App-local settings, caches, catalog data, logs, and verified GitHub update downloads
 - Eight interface themes: Arcane Gold, Midnight Blue, Raspberry Rose, Noir, Celestial Light, Ember Peach, Gothic, and Galaxy
@@ -22,13 +23,13 @@ v0.6.3 uses a lightweight installer. During installation, V5 artist and Prompt B
 
 ## Saved Library and updates
 
-Saved Library keeps independent prompt records, Artist Mix records, metadata-derived prompts, and optional cover images in the local application profile. Each prompt section can be inspected and copied separately. Nothing is uploaded automatically.
+Saved Library keeps independent prompt, Artist Mix, and Character records, including metadata-derived prompts and optional cover images, in the local application profile. Each prompt or character section can be inspected and copied separately. Nothing is uploaded automatically.
 
 The Settings workspace can check for a newer public release, show download progress, verify the installer size and SHA-512 digest, and launch the new installer for the same installation folder while preserving the existing `data` directory.
 
 ## Roadmap
 
-- **Constructor folders:** Prompt Builder folders are available now. Shareable Custom Tags folders (export/import of complete visual tag collections) remain planned and are not implemented yet.
+- **Constructor folders:** Prompt Builder folders and shareable Custom Tags `.naipack` export/import are available now.
 
 ## Source-only clones and catalog hydration
 

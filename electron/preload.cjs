@@ -1,13 +1,23 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('naiStorage', {
   load: () => ipcRenderer.sendSync('storage:load'),
   save: (section, value) => ipcRenderer.send('storage:save', section, value),
   saveSync: (section, value) => ipcRenderer.sendSync('storage:save-sync', section, value),
-  saveCustomTag: (metadata, bytes) => ipcRenderer.invoke('custom-tag:save', metadata, bytes),
-  deleteCustomTag: asset => ipcRenderer.invoke('custom-tag:delete', asset),
+  transactCustomTags: (operation, payload, bytes) => ipcRenderer.invoke('custom-tags:transact', operation, payload, bytes),
+  importCustomTags: () => ipcRenderer.invoke('custom-tags:import'),
+  importCustomTagsPath: filePath => ipcRenderer.invoke('custom-tags:import', filePath),
+  exportCustomTags: presetId => ipcRenderer.invoke('custom-tags:export', presetId),
+  getPathForFile: file => { try { return webUtils.getPathForFile(file); } catch { return ''; } },
   saveLibraryImage: (metadata, bytes) => ipcRenderer.invoke('library:image-save', metadata, bytes),
   deleteLibraryImage: asset => ipcRenderer.invoke('library:image-delete', asset)
+});
+
+contextBridge.exposeInMainWorld('naiMetadata', {
+  // The main process validates the exact page URL and owns all remote I/O.
+  loadPost: url => ipcRenderer.invoke('metadata:load-post', url),
+  cancel: () => ipcRenderer.invoke('metadata:cancel-post'),
+  cancelPost: () => ipcRenderer.invoke('metadata:cancel-post')
 });
 
 contextBridge.exposeInMainWorld('naiCatalog', {

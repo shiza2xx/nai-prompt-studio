@@ -5,9 +5,11 @@ const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const { resolveAppPaths, ensureWritable } = require('./app-paths.cjs');
 const { containedAsset, validateImagePayload, writeAsset } = require('./custom-tag-assets.cjs');
+const { createCustomTagLibrary, writeWorkspaceSection } = require('./custom-tag-library.cjs');
 const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
 const { normalizeDescriptors, ensureComponent, ensureSelectedComponents, loadState, statuses, readInstallerSelections } = require('./catalog-components.cjs');
 const { checkForUpdate, downloadInstaller, validateManifest, UpdateAbortError } = require('./app-updater.cjs');
+const { loadPost: loadBooruPost } = require('./booru-metadata.cjs');
 
 const APP_USER_MODEL_ID = 'com.novelai.promptstudio';
 const APP_ICON = path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'app-icon.png');
@@ -21,6 +23,7 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 let appPaths;
+let customTagLibrary;
 let profileError = '';
 try {
   appPaths = ensureWritable(resolveAppPaths({
@@ -29,6 +32,7 @@ try {
     executablePath: process.execPath
   }));
   app.setPath('userData', appPaths.dataDir);
+  customTagLibrary = createCustomTagLibrary({ customTagsDir: appPaths.customTagsDir, workspaceFile: appPaths.workspaceFile });
   app.setPath('sessionData', appPaths.dataDir);
   app.setPath('temp', appPaths.tempDir);
   app.commandLine.appendSwitch('disk-cache-dir', appPaths.cacheDir);
@@ -53,7 +57,10 @@ function storageFile() {
 
 function readStorage() {
   const file = storageFile();
-  if (!fs.existsSync(file)) return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
+  if (!fs.existsSync(file)) {
+    const library = customTagLibrary.load();
+    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: library.tags, customTagPresets: library.presets, customTagLibrary: library, settings: null, artistMix: null } };
+  }
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     const merged = { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null, ...data };
@@ -65,20 +72,109 @@ function readStorage() {
     if (!Array.isArray(merged.savedLibrary)) merged.savedLibrary = [];
     if (!Object.prototype.hasOwnProperty.call(data, 'savedLibrary')) merged.savedLibrary = undefined;
     merged.version = Math.max(3, Number(merged.version) || 3);
+    const library = customTagLibrary.load();
+    merged.customTags = library.tags;
+    merged.customTagPresets = library.presets;
+    merged.customTagLibrary = library;
     return { exists: true, data: merged };
   } catch {
-    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null } };
+    const library = customTagLibrary.load();
+    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: library.tags, customTagPresets: library.presets, customTagLibrary: library, settings: null, artistMix: null } };
   }
 }
 
 function saveStorageSection(section, value) {
   // Legacy section contract: ['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets']; new saves use savedLibrary.
-  if (!['sets', 'savedLibrary', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets', 'settings', 'artistMix'].includes(section)) return;
+  if (!['sets', 'savedLibrary', 'favorites', 'characterFavorites', 'draft', 'settings', 'artistMix'].includes(section)) return;
   const file = storageFile();
-  const current = readStorage().data;
-  current[section] = value;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(current, null, 2), 'utf8');
+  if (!fs.existsSync(file)) customTagLibrary.load();
+  writeWorkspaceSection(file, section, value);
+}
+
+function customTagResultError(error) {
+  return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+}
+
+function safeNaipackPath(value) {
+  if (typeof value !== 'string' || !value) throw new Error('A .naipack path is required.');
+  const resolved = path.resolve(value);
+  let stat;
+  try { stat = fs.lstatSync(resolved); } catch (error) { if (error?.code !== 'ENOENT') throw error; return resolved; }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('The selected .naipack target must be a regular file.');
+  return resolved;
+}
+
+function safeTaskTempDir() {
+  const resolved = path.resolve(appPaths.tempDir);
+  let stat;
+  try { stat = fs.lstatSync(resolved); } catch { throw new Error('The profile temporary directory is unavailable.'); }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('The profile temporary directory must be a real directory.');
+  const canonical = value => process.platform === 'win32' ? value.toLocaleLowerCase() : value;
+  const real = path.resolve(fs.realpathSync.native(resolved));
+  const dataRoot = path.resolve(appPaths.dataDir);
+  if (!canonical(real).startsWith(`${canonical(dataRoot)}${path.sep}`)) throw new Error('The profile temporary directory redirects outside the profile.');
+  return resolved;
+}
+
+function customTagNameForFile(value) {
+  const clean = String(value ?? 'Custom Tags').normalize('NFKC').replace(/[<>:"/\\|?*\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/g, '').slice(0, 100);
+  return `${clean || 'Custom Tags'}.naipack`;
+}
+
+function replaceNaipackRecoverably(staged, selected) {
+  const target = safeNaipackPath(selected);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const backup = `${target}.bak-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let displaced = false;
+  try {
+    if (fs.existsSync(target)) { fs.renameSync(target, backup); displaced = true; }
+    fs.renameSync(staged, target);
+    if (displaced) { try { fs.rmSync(backup, { force: true }); } catch {} }
+    return target;
+  } catch (error) {
+    try { if (!fs.existsSync(target) && displaced && fs.existsSync(backup)) fs.renameSync(backup, target); } catch {}
+    throw error;
+  }
+}
+
+async function importCustomTagPack(sourcePath) {
+  try {
+    if (!customTagLibrary) throw new Error('Custom Tags are unavailable because the profile could not be opened.');
+    const source = safeNaipackPath(sourcePath);
+    return customTagLibrary.importPack(source, { stagingDir: safeTaskTempDir() });
+  } catch (error) { return customTagResultError(error); }
+}
+
+async function showCustomTagPackImport() {
+  const result = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow() ?? undefined, {
+    title: 'Import Custom Tags',
+    properties: ['openFile'],
+    filters: [{ name: 'NAI Custom Tags pack', extensions: ['naipack'] }]
+  });
+  if (result.canceled || !result.filePaths[0]) return { status: 'cancelled' };
+  return importCustomTagPack(result.filePaths[0]);
+}
+
+async function exportCustomTagPack(presetId) {
+  try {
+    if (!customTagLibrary) throw new Error('Custom Tags are unavailable because the profile could not be opened.');
+    const preset = customTagLibrary.exportablePreset(presetId);
+    const tempDir = safeTaskTempDir();
+    const suggested = customTagNameForFile(preset.preset.name);
+    const result = await dialog.showSaveDialog(BrowserWindow.getFocusedWindow() ?? undefined, {
+      title: `Export ${preset.preset.name}`,
+      defaultPath: path.join(tempDir, suggested),
+      filters: [{ name: 'NAI Custom Tags pack', extensions: ['naipack'] }]
+    });
+    if (result.canceled || !result.filePath) return { status: 'cancelled' };
+    const selected = path.extname(result.filePath).toLocaleLowerCase() === '.naipack' ? result.filePath : `${result.filePath}.naipack`;
+    const staged = path.join(tempDir, `.naipack-export-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.naipack`);
+    try {
+      await customTagLibrary.exportPack(presetId, staged, tempDir);
+      replaceNaipackRecoverably(staged, selected);
+      return { status: 'exported', presetId: preset.preset.id, name: preset.preset.name, cardCount: preset.cards.length };
+    } finally { try { fs.rmSync(staged, { force: true }); } catch {} }
+  } catch (error) { return customTagResultError(error); }
 }
 
 ipcMain.on('storage:load', event => {
@@ -98,16 +194,38 @@ ipcMain.on('storage:save-sync', (event, section, value) => {
   }
 });
 
-ipcMain.handle('custom-tag:save', async (_event, metadata, payload) => {
-  if (!metadata || typeof metadata !== 'object') throw new Error('Custom tag metadata is required');
-  const mime = metadata.mime;
-  const bytes = validateImagePayload(payload, mime);
-  const asset = `${String(metadata.id || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '')}-${Date.now()}.${mime === 'image/jpeg' ? 'jpg' : mime.slice('image/'.length)}`;
-  writeAsset(appPaths.customTagsDir, asset, bytes, mime);
-  return { ...metadata, imageAsset: asset };
+ipcMain.handle('custom-tags:transact', async (_event, operation, payload, bytes) => customTagLibrary.transact(operation, payload, bytes));
+ipcMain.handle('custom-tags:import', async (_event, sourcePath) => {
+  try { return sourcePath ? importCustomTagPack(sourcePath) : await showCustomTagPackImport(); }
+  catch (error) { return customTagResultError(error); }
 });
-ipcMain.handle('custom-tag:delete', async (_event, asset) => {
-  try { fs.rmSync(containedAsset(appPaths.customTagsDir, asset), { force: true }); return true; } catch { return false; }
+ipcMain.handle('custom-tags:export', async (_event, presetId) => exportCustomTagPack(presetId));
+
+// Renderer code receives no general network primitive. Each webContents owns
+// at most one bounded booru request; a new load or tab disposal cancels the
+// previous one before the main-process adapter performs any network I/O.
+const booruRequests = new Map();
+ipcMain.handle('metadata:load-post', async (event, url) => {
+  const senderId = event.sender.id;
+  booruRequests.get(senderId)?.abort();
+  const controller = new AbortController();
+  booruRequests.set(senderId, controller);
+  const onDestroyed = () => controller.abort();
+  event.sender.once('destroyed', onDestroyed);
+  try {
+    const result = await loadBooruPost(url, { signal: controller.signal });
+    return { ...result, bytes: new Uint8Array(result.bytes) };
+  } finally {
+    event.sender.removeListener('destroyed', onDestroyed);
+    if (booruRequests.get(senderId) === controller) booruRequests.delete(senderId);
+  }
+});
+ipcMain.handle('metadata:cancel-post', async event => {
+  const controller = booruRequests.get(event.sender.id);
+  if (!controller) return false;
+  controller.abort();
+  booruRequests.delete(event.sender.id);
+  return true;
 });
 ipcMain.handle('library:image-save', async (_event, metadata, payload) => {
   if (!metadata || typeof metadata !== 'object') throw new Error('Saved Library cover metadata is required');
@@ -286,7 +404,10 @@ app.whenReady().then(() => {
   protocol.handle('nai-custom', request => {
     try {
       const asset = decodeURIComponent(new URL(request.url).pathname.replace(/^\//, ''));
-      const target = containedAsset(appPaths.customTagsDir, asset);
+      const parts = asset.replace(/\\/g, '/').split('/');
+      let target;
+      if (parts.length === 3 && parts[1] === 'previews') target = customTagLibrary.resolvePreview(parts[0], `previews/${parts[2]}`);
+      else target = containedAsset(appPaths.customTagsDir, asset);
       return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
     } catch { return new Response('Not found', { status: 404 }); }
   });

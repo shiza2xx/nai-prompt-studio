@@ -10,6 +10,29 @@ export interface WarmupPlanOptions {
   includeCatalogRemainder?: boolean;
 }
 
+export interface IdleWarmupOptions {
+  /** Delay the first idle slice so startup gets a quiet grace period. */
+  initialGraceMs?: number;
+  /** Re-check this predicate before each slice; true postpones background work. */
+  shouldBackoff?: () => boolean;
+  /** Keep each idle callback to one background job. */
+  onePerSlice?: boolean;
+  /** Delay used while backoff is active. */
+  backoffMs?: number;
+}
+
+/**
+ * Prefer the browser's idle queue and retain a conservative timer fallback for
+ * older Electron/WebViews and deterministic callers.
+ */
+export function scheduleIdleCallback(callback: () => void, fallbackDelayMs = 64, timeoutMs = 1500): unknown {
+  const host = globalThis as typeof globalThis & {
+    requestIdleCallback?: (idleCallback: () => void, options?: { timeout?: number }) => unknown;
+  };
+  if (typeof host.requestIdleCallback === 'function') return host.requestIdleCallback(callback, { timeout: timeoutMs });
+  return globalThis.setTimeout(callback, Math.max(0, fallbackDelayMs));
+}
+
 /**
  * Keep a warmup queue stable when several startup groups overlap. The first
  * occurrence owns the work, so callers can put higher-value groups first and
@@ -98,11 +121,14 @@ export function buildWarmupPlan(cards: readonly CatalogCard[], options: WarmupPl
   return order.slice(0, limit).concat(order.slice(limit));
 }
 
-export function scheduleIdleWarmup<T>(items: readonly T[], work: (item: T) => Promise<boolean>, initialLimit = 48, idle: (callback: () => void) => unknown = callback => globalThis.setTimeout(callback, 0), concurrency = 4): { initial: T[]; startIdle: () => void; cancel: () => void } {
+export function scheduleIdleWarmup<T>(items: readonly T[], work: (item: T) => Promise<boolean>, initialLimit = 48, idle: (callback: () => void) => unknown = callback => scheduleIdleCallback(callback), concurrency = 4, options: IdleWarmupOptions = {}): { initial: T[]; startIdle: () => void; cancel: () => void } {
   const initial = items.slice(0, Math.max(0, Math.floor(initialLimit)));
   const remainder = items.slice(initial.length);
   let stopped = false;
   let started = false;
+  const graceMs = Math.max(0, Math.floor(options.initialGraceMs ?? 0));
+  const backoffMs = Math.max(16, Math.floor(options.backoffMs ?? 250));
+  let firstSlice = true;
   return {
     initial,
     startIdle: () => {
@@ -110,16 +136,31 @@ export function scheduleIdleWarmup<T>(items: readonly T[], work: (item: T) => Pr
       started = true;
       let index = 0;
       let active = 0;
+      const schedule = (callback: () => void): void => {
+        if (stopped) return;
+        if (firstSlice && graceMs > 0) {
+          firstSlice = false;
+          globalThis.setTimeout(() => idle(callback), graceMs);
+          return;
+        }
+        firstSlice = false;
+        if (options.shouldBackoff?.()) {
+          globalThis.setTimeout(() => schedule(callback), backoffMs);
+          return;
+        }
+        idle(callback);
+      };
       const pump = () => {
         if (stopped) return;
-        while (active < Math.max(1, Math.floor(concurrency)) && index < remainder.length) {
+        const capacity = options.onePerSlice ? 1 : Math.max(1, Math.floor(concurrency));
+        while (active < capacity && index < remainder.length) {
           const item = remainder[index++];
           active += 1;
-          Promise.resolve(work(item)).catch(() => false).finally(() => { active -= 1; idle(pump); });
+          Promise.resolve(work(item)).catch(() => false).finally(() => { active -= 1; schedule(pump); });
         }
         if (index >= remainder.length && active === 0) stopped = true;
       };
-      idle(pump);
+      schedule(pump);
     },
     cancel: () => { stopped = true; }
   };

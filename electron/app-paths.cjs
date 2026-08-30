@@ -11,6 +11,7 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
   const logsDir = path.join(dataDir, 'logs');
   const crashDumpsDir = path.join(dataDir, 'crash-dumps');
   const customTagsDir = path.join(dataDir, 'custom-tags');
+  const customTagLibraryDir = path.join(customTagsDir, 'library-v1');
   const savedLibraryDir = path.join(dataDir, 'saved-library');
   const catalogDir = path.join(dataDir, 'catalog');
   const catalogComponentsDir = path.join(catalogDir, 'components');
@@ -25,7 +26,7 @@ function resolveAppPaths({ isPackaged, workspaceDir, executablePath }) {
     dataDir,
     logsDir,
     crashDumpsDir,
-    customTagsDir, savedLibraryDir,
+    customTagsDir, customTagLibraryDir, savedLibraryDir,
     catalogDir, catalogComponentsDir, catalogDownloadsDir, catalogLegacyDir, tempDir, cacheDir, updatesDir,
     workspaceFile: path.join(dataDir, 'workspace.json')
   };

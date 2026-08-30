@@ -24,7 +24,7 @@ const manifest = {
   url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
   size: stat.size,
   sha512: sha.digest('hex'),
-  releaseNotes: 'v0.6.5 speeds up reusable artist-card loading with a bounded two-tier preview cache, loads original artist images lazily on hover, and keeps custom and user cards untouched without recompressing their images.',
+  releaseNotes: 'v0.6.6 adds shareable Custom Tags packs, booru tag extraction, per-character visual constructors, Saved Characters, and smoother metadata and catalog performance.',
   // Additive field: schema-1 clients ignore catalogs while v0.6.4 reuses the
   // v0.6.3 descriptors to verify and hydrate selected ASAR components.
   catalogs

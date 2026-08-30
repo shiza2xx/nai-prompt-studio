@@ -1,6 +1,6 @@
 {
   "name": "nai-prompt-studio",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
@@ -24,6 +24,9 @@
     "release:manifest": "node tools/run-local.mjs node tools/generate-release-manifest.mjs",
     "release:catalog-packs": "node tools/run-local.mjs node tools/catalog-packs.mjs",
     "catalog:hydrate": "node tools/run-local.mjs node tools/hydrate-catalog.mjs"
+  },
+  "dependencies": {
+    "@electron/asar": "^3.4.1"
   },
   "build": {
     "appId": "com.novelai.promptstudio",
@@ -55,7 +58,6 @@
     }
   },
   "devDependencies": {
-    "@electron/asar": "^3.4.1",
     "electron": "^40.2.1",
     "electron-builder": "^26.0.12",
     "typescript": "^5.9.2",
