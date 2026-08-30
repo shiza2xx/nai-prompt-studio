@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('naiStorage', {
   load: () => ipcRenderer.sendSync('storage:load'),
+  retryLoad: () => ipcRenderer.sendSync('storage:retry-load'),
+  openProfileFolder: () => ipcRenderer.invoke('storage:open-profile-folder'),
   save: (section, value) => ipcRenderer.send('storage:save', section, value),
   saveSync: (section, value) => ipcRenderer.sendSync('storage:save-sync', section, value),
   transactCustomTags: (operation, payload, bytes) => ipcRenderer.invoke('custom-tags:transact', operation, payload, bytes),

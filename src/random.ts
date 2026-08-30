@@ -8,6 +8,12 @@ export interface RandomArtistSelection {
 export const MIN_ARTIST_WEIGHT = 0.1;
 export const MAX_ARTIST_WEIGHT = 2.0;
 export const ARTIST_WEIGHT_STEPS = 20;
+/** Prompt Builder never replaces more than this many artist cards at once. */
+export const MAX_PROMPT_RANDOM_ARTISTS = 15;
+
+export function promptArtistPoolSize(available: number): number {
+  return Math.min(MAX_PROMPT_RANDOM_ARTISTS, Math.max(0, Math.floor(Number(available) || 0)));
+}
 
 export interface RandomPoolRange {
   min: number;

@@ -312,8 +312,10 @@ async function alphaFromFile(file: File): Promise<Uint8Array> {
   } finally { bitmap?.close(); }
 }
 
-export async function extractImageMetadata(file: File): Promise<ImageMetadata> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
+export async function extractImageMetadata(file: File, alreadyReadBytes?: Uint8Array): Promise<ImageMetadata> {
+  // Callers that also need a display/save blob may supply their single local
+  // read. Direct callers retain the original File-only contract.
+  const bytes = alreadyReadBytes ?? new Uint8Array(await file.arrayBuffer());
   if (hasPrefix(bytes, PNG_SIGNATURE)) {
     const chunks = parsePngTextChunks(bytes);
     const stealth = decodeStealthPayload(await alphaFromFile(file));

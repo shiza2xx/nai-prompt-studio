@@ -7,13 +7,17 @@ import { mixCompanionCapacity, mixCompanionScale, mixOrbitLayout } from './artis
 import { paginateArtists, paginateCharacters } from './catalog-browser';
 import { buildWarmupPlan, scheduleIdleCallback, scheduleIdleWarmup, uniqueWarmupItems } from './catalog-warmup';
 import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } from './metadata-workspace';
+import { WorkspaceController, type WorkspaceId } from './workspace-controller';
+import { PromptWorkspaceModule } from './workspaces/prompt-workspace';
+import { SavedLibraryWorkspaceModule } from './workspaces/saved-library-workspace';
+import { CustomTagsWorkspaceModule } from './workspaces/custom-tags-workspace';
 import { PreviewCache, PREVIEW_IMAGE_SELECTOR, type PreviewImageLike, type PreviewLease, type PreviewPriority, type PreviewRootLike } from './preview-cache';
 import { createOfficialArtistThumbnail } from './artist-thumbnail';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
 import { classifyCustomTagDrop, type CustomTagDropFileDescriptor } from './custom-tag-dnd';
-import { normalizeArtistWeight, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
+import { MAX_PROMPT_RANDOM_ARTISTS, normalizeArtistWeight, promptArtistPoolSize, randomArtistSelection, randomCount, reconcileSelectedArtists, rerollArtistWeight, rerollArtistWeights, resolveRandomPoolRange } from './random';
 import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
-import { deleteLibraryImage, exportCustomTags, hasExistingProfile, importCustomTags, importCustomTagsPath, loadArtistMix, loadCustomTagLibraryWarning, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage, transactCustomTags } from './storage';
+import { deleteLibraryImage, exportCustomTags, hasExistingProfile, importCustomTags, importCustomTagsPath, loadArtistMix, loadCustomTagLibraryWarning, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage, transactCustomTags, workspaceRecoveryError } from './storage';
 import { CUSTOM_TAG_MAX_LENGTH, PREVIEW_CACHE_BUDGETS, type AnimationMode, type AppSettings, type ArtistMixDraft, type BasePrompt, type CatalogCard, type Character, type CustomTag, type CustomTagKind, type CustomTagPackResult, type CustomTagPreset, type CustomTagZone, type GuideExample, type OfflineCatalog, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedCharacterItem, type SavedLibraryItem, type SavedPromptData, type SavedPromptSnapshot, type WeightedTag } from './types';
 import type { CatalogComponentProgress, CatalogComponentStatus, UpdateManifest, UpdateProgress } from './global';
 
@@ -23,7 +27,8 @@ type ConstructorTarget = { kind: 'base'; zone: ConstructorZone } | { kind: 'char
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.6';
+const APP_VERSION = '0.6.7';
+const initialWorkspaceRecoveryError = workspaceRecoveryError();
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
 const restored = loadDraft();
@@ -39,6 +44,13 @@ let artistFavorites = loadFavorites('artists');
 let characterFavorites = loadFavorites('characters');
 let catalog: OfflineCatalog = emptyCatalog();
 let officialArtists: CatalogCard[] = [];
+let officialArtistIds = new Set<string>();
+let catalogLoadGeneration = 0;
+let guideLoadGeneration = 0;
+function replaceOfficialArtists(cards: CatalogCard[]): void {
+  officialArtists = cards;
+  officialArtistIds = new Set(cards.map(card => card.catalogId ?? card.id));
+}
 let artistCatalogAliases = new Map<string, string>();
 let shadowedCustomArtistIds = new Set<string>();
 let artistSearch = '';
@@ -194,6 +206,42 @@ let searchDebounceTimer: number | undefined;
 const workspaceScrollTop = new Map<string, number>();
 const viewScrollTop = new Map<string, number>();
 let renderedWorkspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings' = activeWorkspace;
+let workspaceController: WorkspaceController | null = null;
+const promptWorkspaceModule = new PromptWorkspaceModule();
+const savedLibraryWorkspaceModule = new SavedLibraryWorkspaceModule(() => ({
+  items: savedLibrary, search: savedLibrarySearch, filter: savedLibraryFilter, polarities: libraryPolarities,
+  panelClass: workspacePanelClass('saved-library'), imageUrl: libraryImageUrl, escape: escapeHtml
+}), {
+  search: value => { savedLibrarySearch = value; scheduleSearch(() => { if (workspaceController) { savedLibraryWorkspaceModule.refresh(workspaceController); bindPreviewFade(document.querySelector('#saved-library-grid') ?? document); } }); },
+  filter: value => { savedLibraryFilter = value; if (workspaceController) { savedLibraryWorkspaceModule.refresh(workspaceController); bindPreviewFade(document.querySelector('#saved-library-grid') ?? document); } },
+  create: kind => openLibrarySaveModal(kind, 'manual'), edit: openLibraryEditModal, delete: idValue => openLibraryConfirmation('delete', idValue),
+  copy: (value, selector) => { void copy(value, selector); }
+});
+const customTagsWorkspaceModule = new CustomTagsWorkspaceModule(() => ({
+  tags: customTags, presets: customTagPresets, selectedPresetId: selectedCustomPresetId, editingId: editingCustomTagId,
+  formKind: customTagFormKind, search: customTagSearch, filter: customTagFilter, creatingPreset: creatingCustomPreset,
+  renamingPresetId: renamingCustomPresetId, deletingPresetId: deletingCustomPresetId, deleteError: customPresetDeleteError,
+  warning: customTagLibraryWarning, packStatus: customTagPackStatus, packStatusKind: customTagPackStatusKind,
+  packAvailable: Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags),
+  draftImageUrl: customImageBytes && customImageMime ? customImageUrls.get('__draft__') ?? '' : '',
+  shadowedArtistIds: shadowedCustomArtistIds, defaultPresetId: DEFAULT_CUSTOM_TAG_PRESET_ID,
+  imageUrl: customTagImageUrl, escape: escapeHtml
+}), {
+  search: value => { customTagSearch = value; scheduleSearch(() => { if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); }); },
+  filter: value => { customTagFilter = value; if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); },
+  selectPreset: value => { selectedCustomPresetId = value === 'all' ? 'all' : value; deletingCustomPresetId = null; render(); },
+  beginCreatePreset: () => { creatingCustomPreset = true; render(); window.setTimeout(() => document.querySelector<HTMLInputElement>('#custom-preset-name')?.focus(), 0); },
+  cancelCreatePreset: () => { creatingCustomPreset = false; render(); }, createPreset: name => { void createCustomPreset(name); },
+  beginRenamePreset: presetId => { renamingCustomPresetId = presetId; deletingCustomPresetId = null; render(); window.setTimeout(() => document.getElementById(`preset-rename-${presetId}`)?.focus(), 0); },
+  cancelRenamePreset: () => { renamingCustomPresetId = null; render(); }, renamePreset: (presetId, name) => { void renameCustomPreset(presetId, name); },
+  beginDeletePreset: presetId => { deletingCustomPresetId = presetId; customPresetDeleteError = ''; renamingCustomPresetId = null; render(); },
+  cancelDeletePreset: () => { deletingCustomPresetId = null; customPresetDeleteError = ''; render(); }, confirmDeletePreset: (presetId, mode) => { void deleteCustomPreset(presetId, mode); },
+  editTag: tagId => { const item = customTags.find(tag => tag.id === tagId); if (!item) return; editingCustomTagId = item.id; customTagFormKind = item.kind === 'artist' ? 'artist' : 'tag'; selectedCustomPresetId = customTagPresetId(item); customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); },
+  deleteTag: tagId => { void deleteCustomTag(tagId); }, cancelEdit: () => { editingCustomTagId = null; customTagFormKind = 'tag'; customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); },
+  setKind: kind => { customTagFormKind = kind; render(); }, readImage: file => { void readCustomImage(file); }, saveTag: () => { void saveCustomTagFromForm(); },
+  importPack: () => { setCustomTagPackStatus('Opening .naipack…'); void importCustomTags().then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error))); },
+  exportPreset: presetId => { setCustomTagPackStatus('Preparing .naipack…'); void exportCustomTags(presetId).then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error))); }
+});
 const libraryPolarities = new Map<string, { base: 'positive' | 'negative'; characters: Array<'positive' | 'negative'> }>();
 // Legacy compatibility marker: new MetadataWorkspace(() => catalog.artists)
 const metadataWorkspace = new MetadataWorkspace(() => catalog.artists, card => catalogImage(card), saveMetadataToLibrary, () => customTagPresets, saveMetadataTagToCustomTags, savedMetadataId);
@@ -265,11 +313,11 @@ function normalizeRange(value?: { min: number; max: number }, available = 0): { 
   const requestedMax = Number(value?.max);
   const fallbackMin = Number.isFinite(requestedMin) ? Math.round(requestedMin) : DEFAULT_RANGE.min;
   const fallbackMax = Number.isFinite(requestedMax) ? Math.round(requestedMax) : DEFAULT_RANGE.max;
-  // Before the offline catalog is loaded, retain a restored range so that a
-  // valid user choice is not lost. Once loaded, the catalog length is the cap.
+  // Before the offline catalog is loaded, retain a restored range within the
+  // Prompt Builder cap. Once loaded, the smaller catalog/cap value wins.
   const upper = available > 0
-    ? Math.max(1, Math.floor(available))
-    : Math.max(DEFAULT_RANGE.max, fallbackMin, fallbackMax);
+    ? Math.max(1, promptArtistPoolSize(available))
+    : MAX_PROMPT_RANDOM_ARTISTS;
   const lower = Math.min(2, upper);
   const min = Math.max(lower, Math.min(upper, fallbackMin));
   const max = Math.max(min, Math.min(upper, fallbackMax));
@@ -280,7 +328,7 @@ function activeRandomPool(): CatalogCard[] {
 }
 function effectiveRandomRange() {
   const requested = artistRandomFavoritesOnly ? (favoriteRandomRange ?? randomRange) : randomRange;
-  return resolveRandomPoolRange(requested, activeRandomPool().length);
+  return resolveRandomPoolRange(requested, promptArtistPoolSize(activeRandomPool().length));
 }
 function escapeHtml(value: string): string { return value.replace(/[\u2014\u2013]/g, '-').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[c]!)); }
 function clean(value: string): string { return value.trim().replace(/^,|,$/g, '').trim(); }
@@ -298,7 +346,7 @@ function isCatalogPreviewSource(source: string): boolean {
   return /^(?:nai-catalog:\/\/|\.\/catalog\/)/i.test(source);
 }
 function isOfficialArtistCard(card: CatalogCard | undefined): boolean {
-  return Boolean(card && card.custom !== true && officialArtists.some(item => (item.catalogId ?? item.id) === (card.catalogId ?? card.id)));
+  return Boolean(card && card.custom !== true && officialArtistIds.has(card.catalogId ?? card.id));
 }
 function artistItemCard(item: WeightedTag): CatalogCard | undefined {
   return catalog.artists.find(candidate => (candidate.catalogId ?? candidate.id) === (item.catalogId ?? item.id));
@@ -571,10 +619,10 @@ function artistZone(): string {
   const activeRange = effectiveRandomRange();
   const rangeDisabled = !activeRange.feasible || catalogState !== 'ready';
   const controlMin = activeRange.feasible ? 2 : activeRange.min;
-  const controlMax = activeRange.feasible ? activeRange.available : activeRange.max;
+  const controlMax = activeRange.feasible ? Math.min(MAX_PROMPT_RANDOM_ARTISTS, activeRange.available) : activeRange.max;
   const stepper = (idValue: string, value: number, label: string): string => `<span class="number-stepper"><input id="${idValue}" type="number" min="${controlMin}" max="${controlMax}" value="${value}" aria-label="${label} numeric" ${rangeDisabled ? 'disabled' : ''}><span class="number-stepper-buttons"><button type="button" data-number-step="up" aria-label="Increase ${label.toLocaleLowerCase()}" title="Increase">▲</button><button type="button" data-number-step="down" aria-label="Decrease ${label.toLocaleLowerCase()}" title="Decrease">▼</button></span></span>`;
   const rangeMarkup = `<div class="range-pair" aria-label="Random artist count"><input id="random-min-range" type="range" min="${controlMin}" max="${controlMax}" step="1" value="${activeRange.min}" aria-label="Random minimum" ${rangeDisabled ? 'disabled' : ''}>${stepper('random-min', activeRange.min, 'Random minimum')}<span>to</span><input id="random-max-range" type="range" min="${controlMin}" max="${controlMax}" step="1" value="${activeRange.max}" aria-label="Random maximum" ${rangeDisabled ? 'disabled' : ''}>${stepper('random-max', activeRange.max, 'Random maximum')}</div>`;
-  const favoritePoolLabel = artistRandomFavoritesOnly ? `Favorites pool (${activeRange.available})` : 'Full V5 pool';
+  const favoritePoolLabel = artistRandomFavoritesOnly ? `Favorites pool (${activeRandomPool().length})` : 'Full V5 pool';
   const rangeNotice = !activeRange.feasible ? `<p class="random-notice" role="status" aria-live="polite">${artistRandomFavoritesOnly ? 'Favorites-only random needs at least 2 favorited V5 artists.' : 'Random replacement needs at least 2 V5 artist cards.'} Use the picker to add favorites or turn off Favorites-only.</p>` : '';
   return `<section class="zone zone-center" aria-label="V5 artist selection"><div class="zone-heading"><div><p class="eyebrow">V5 ARTISTS</p><h2>Artist cards</h2><p>Open the picker from the plus card, then adjust each selected artist.</p></div><div class="range-control"><label>Random replacement</label>${rangeMarkup}<div class="random-actions"><button class="secondary" id="random-artists">Replace cards</button><button class="chip ${artistRandomFavoritesOnly ? 'on' : ''}" id="random-favorites-only" type="button" aria-pressed="${artistRandomFavoritesOnly}">★ ${escapeHtml(favoritePoolLabel)}</button></div></div></div>${catalogStatusMarkup()}${rangeNotice}<p class="random-notice" id="random-notice" role="status" aria-live="polite" ${randomNotice ? '' : 'hidden'}>${escapeHtml(randomNotice)}</p><div class="live-prompt"><div><span>LIVE PROMPT</span><small>selected V5 artist weights</small></div><code id="artist-prompt-output">${escapeHtml(buildArtistsPrompt(base.artists))}</code></div><div class="selected-artists"><div class="subheading"><h3>Selected artists <span>${base.artists.length}</span></h3><div><button class="secondary" id="open-artist-picker">＋ Add artist</button><button class="secondary" id="copy-artists">Copy artists</button><button class="secondary reroll-action" id="reroll-all-weights" type="button">Reroll all weights</button></div></div><div class="selected-artist-grid">${base.artists.map(selectedArtistMarkup).join('')}<button class="empty-artist-card" id="open-artist-picker-empty" aria-label="Open artist picker"><img src="./plus.png" alt=""><b>Add V5 artist</b><small>Open searchable picker</small></button></div></div></section>`;
 }
@@ -819,48 +867,6 @@ function characterBlock(character: Character, index: number): string {
   return `<article class="character-block"><header><div class="character-title"><span class="number">${index + 1}</span><input class="character-name" value="${escapeHtml(character.label)}" data-character-name="${character.id}" aria-label="Character name"></div><div class="character-actions"><button class="small" type="button" data-save-character="${escapeHtml(character.id)}">Save character</button><button class="small" type="button" data-copy-character="${escapeHtml(character.id)}">Copy</button><button class="icon-button" type="button" data-remove-character="${escapeHtml(character.id)}" aria-label="Remove character">×</button></div></header>${characterPromptEditor(character)}${editor('undesired', character.id, character.undesired, 'Character undesired', 'hat, blurry')}</article>`;
 }
 
-function savedLibraryItems(): SavedLibraryItem[] {
-  const query = savedLibrarySearch.trim().toLocaleLowerCase();
-  return savedLibrary.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).filter(item => {
-    const typeMatch = savedLibraryFilter === 'all' || item.kind === savedLibraryFilter;
-    const detailText = item.kind === 'prompt'
-      ? `${item.data?.positive ?? ''} ${item.data?.negative ?? ''} ${item.data?.characters.map(character => `${character.label} ${character.positive} ${character.negative}`).join(' ') ?? ''}`
-      : item.kind === 'artist-mix'
-        ? `${item.data?.serializedPrompt ?? ''} ${item.data?.artists.map(artist => artist.tag).join(' ') ?? ''}`
-        : `${item.data?.positive ?? ''} ${item.data?.negative ?? ''}`;
-    const textMatch = !query || `${item.name} ${item.description ?? ''} ${item.prompt} ${item.originalName ?? ''} ${detailText}`.toLocaleLowerCase().includes(query);
-    return typeMatch && textMatch;
-  });
-}
-
-function savedLibraryCardMarkup(item: SavedLibraryItem): string {
-  const image = libraryImageUrl(item);
-  const label = item.kind === 'artist-mix' ? 'Artist Mix' : item.kind === 'character' ? 'Character' : 'Prompt';
-  const date = new Date(item.updatedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  const polarity = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: (item.kind === 'prompt' ? item.data?.characters ?? [] : []).map(() => 'positive' as const) };
-  libraryPolarities.set(item.id, polarity);
-  const promptBlock = (labelValue: string, value: { positive: string; negative: string }, index: number, active: 'positive' | 'negative'): string => {
-    const text = value[active] || '(No prompt recorded for this side.)';
-    return `<article class="saved-library-prompt" data-library-block="${escapeHtml(item.id)}:${index}"><header><b>${escapeHtml(labelValue)}</b><div class="metadata-toggle" role="group" aria-label="${escapeHtml(labelValue)} polarity"><button type="button" class="${active === 'positive' ? 'on' : ''}" data-library-polarity="${escapeHtml(item.id)}" data-library-index="${index}" data-polarity="positive" aria-pressed="${active === 'positive'}">Positive</button><button type="button" class="${active === 'negative' ? 'on' : ''}" data-library-polarity="${escapeHtml(item.id)}" data-library-index="${index}" data-polarity="negative" aria-pressed="${active === 'negative'}">Negative</button></div></header><pre>${escapeHtml(text)}</pre><button class="library-copy-icon" type="button" data-library-copy="${escapeHtml(item.id)}" data-library-index="${index}" aria-label="Copy ${escapeHtml(labelValue)} ${active} prompt" title="Copy ${escapeHtml(labelValue)} ${active} prompt" ${value[active] ? '' : 'disabled'}></button></article>`;
-  };
-  const generationValues = item.kind === 'prompt' ? [item.data?.model, item.data?.steps && `${item.data.steps} steps`, item.data?.sampler, item.data?.width && item.data?.height && `${item.data.width} x ${item.data.height}`, item.data?.cfg && `CFG ${item.data.cfg}`].filter(Boolean) : [];
-  const generationMarkup = generationValues.length ? `<div class="saved-library-generation"><span>Generation metadata</span><code>${escapeHtml(generationValues.join(' | '))}</code></div>` : '';
-  const details = item.kind === 'prompt'
-    ? `<details class="saved-library-details"><summary>Prompt details</summary>${promptBlock('Base prompt', { positive: item.data?.positive ?? item.prompt, negative: item.data?.negative ?? '' }, -1, polarity.base)}${(item.data?.characters ?? []).map((character, index) => promptBlock(character.label, character, index, polarity.characters[index] ?? 'positive')).join('')}${generationMarkup}</details>`
-    : item.kind === 'artist-mix'
-      ? `<details class="saved-library-details"><summary>Artist details</summary><code>${escapeHtml(item.data?.artists.map(artist => `${artist.tag} (${artist.weight})`).join(', ') || 'No structured artists')}</code></details>`
-      : `<details class="saved-library-details"><summary>Character details</summary>${promptBlock(item.name, item.data, -1, polarity.base)}</details>`;
-  const previewPrompt = item.kind === 'prompt' ? item.data?.positive ?? item.prompt : item.kind === 'artist-mix' ? item.data?.serializedPrompt ?? item.prompt : item.data.positive;
-  const previewAttrs = image ? ` tabindex="0" role="img" aria-label="Preview cover for ${escapeHtml(item.name)}" data-library-preview-image="${escapeHtml(image)}" data-library-preview-tag="${escapeHtml(item.name)}" data-library-preview-prompt="${escapeHtml(previewPrompt)}" data-library-preview-description="${escapeHtml(item.description ?? '')}"` : '';
-  return `<article class="saved-library-card" data-saved-library-card="${escapeHtml(item.id)}"><div class="saved-library-cover${image ? ' has-image' : ''}"${previewAttrs}>${image ? `<img data-preview-cache="content" data-preview-src="${escapeHtml(image)}" alt="" loading="lazy">` : '<span aria-hidden="true">✦</span>'}</div><div class="saved-library-card-body"><div class="saved-library-card-heading"><div><p class="eyebrow">${label}</p><h3>${escapeHtml(item.name)}</h3></div><time datetime="${escapeHtml(item.updatedAt)}">${escapeHtml(date)}</time></div><p class="saved-library-description">${escapeHtml(item.description || 'No description.')}</p>${details}<div class="saved-library-actions"><button class="secondary saved-library-rounded" type="button" data-edit-library="${escapeHtml(item.id)}">Edit</button><button class="secondary saved-library-rounded" type="button" data-delete-library="${escapeHtml(item.id)}">Delete</button></div></div></article>`;
-}
-
-function savedLibraryWorkspace(): string {
-  const items = savedLibraryItems();
-  const emptyCopy = savedLibrary.length ? 'Try a different name or type filter.' : 'Create an independent prompt, Artist Mix, or Character record.';
-  return `<section id="saved-library-panel" class="${workspacePanelClass('saved-library')} saved-library-workspace" role="tabpanel" aria-labelledby="saved-library-tab"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="saved-library-title">Saved Library</h2><p>Create independent prompt, Artist Mix, and Character records on this device.</p></div><div class="saved-library-header-actions"><button class="primary" id="save-library-prompt" type="button">＋ New Prompt</button><button class="secondary" id="save-library-mix" type="button">＋ New Artist Mix</button><button class="secondary" id="save-library-character" type="button">＋ New Character</button></div></header><div class="saved-library-tools"><input id="saved-library-search" value="${escapeHtml(savedLibrarySearch)}" placeholder="Search saved items..." aria-label="Search Saved Library"><div class="saved-library-filter" role="group" aria-label="Filter Saved Library"><button class="chip ${savedLibraryFilter === 'all' ? 'on' : ''}" type="button" data-library-filter="all">All</button><button class="chip ${savedLibraryFilter === 'prompt' ? 'on' : ''}" type="button" data-library-filter="prompt">Prompts</button><button class="chip ${savedLibraryFilter === 'artist-mix' ? 'on' : ''}" type="button" data-library-filter="artist-mix">Artist Mix</button><button class="chip ${savedLibraryFilter === 'character' ? 'on' : ''}" type="button" data-library-filter="character">Characters</button></div></div><div class="saved-library-grid" id="saved-library-grid">${items.length ? items.map(savedLibraryCardMarkup).join('') : `<div class="saved-library-empty"><span class="brand-mark">✦</span><h3>${savedLibrary.length ? 'No saved items match this search.' : 'Your Saved Library is ready.'}</h3><p>${emptyCopy}</p><button class="secondary" type="button" id="save-library-empty">New Prompt</button></div>`}</div></section>`;
-}
-
 function savedLibraryModalMarkup(): string {
   if (!libraryModalMode) return '';
   const item = libraryModalItemId ? savedLibrary.find(value => value.id === libraryModalItemId) : undefined;
@@ -1008,82 +1014,6 @@ function constructorModalMarkup(): string {
 
 
 
-function customPresetCount(presetId: string): number {
-  return customTags.filter(item => customTagPresetId(item) === presetId).length;
-}
-
-function customPresetMarkup(preset: CustomTagPreset): string {
-  const selected = selectedCustomPresetId === preset.id;
-  const renaming = renamingCustomPresetId === preset.id;
-  const isDefault = preset.id === DEFAULT_CUSTOM_TAG_PRESET_ID;
-  const selectedPresetControls = selected && !isDefault;
-  const packAvailable = Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags);
-  const exportAction = !isDefault && customPresetCount(preset.id) > 0 ? `<button class="icon-button preset-action-icon" type="button" data-export-preset="${escapeHtml(preset.id)}" aria-label="Export ${escapeHtml(preset.name)} as a .naipack" title="${packAvailable ? 'Export .naipack' : 'Export is available in the desktop app'}"${packAvailable ? '' : ' disabled'}>⇩</button>` : '';
-  const controls = selectedPresetControls ? `<div class="preset-actions" aria-label="Actions for ${escapeHtml(preset.name)}"><button class="icon-button preset-action-icon" type="button" data-rename-preset="${escapeHtml(preset.id)}" aria-label="Rename ${escapeHtml(preset.name)}" title="Rename preset">✎</button><button class="icon-button preset-action-icon danger-copy" type="button" data-delete-preset="${escapeHtml(preset.id)}" aria-label="Delete ${escapeHtml(preset.name)}" title="Delete preset">×</button></div>` : '<div class="preset-actions" aria-hidden="true"></div>';
-  const content = renaming
-    ? `<form class="preset-rename-form" data-preset-rename-form="${escapeHtml(preset.id)}"><input id="preset-rename-${escapeHtml(preset.id)}" value="${escapeHtml(preset.name)}" maxlength="80" aria-label="Rename ${escapeHtml(preset.name)}"><button class="tiny-copy" type="submit">Save</button><button class="tiny-copy" type="button" data-cancel-rename="${escapeHtml(preset.id)}">Cancel</button></form>`
-    : `<div class="preset-row-top"><button class="preset-select" type="button" data-select-preset="${escapeHtml(preset.id)}" aria-pressed="${selected}"><span><b>${escapeHtml(preset.name)}</b><small>${customPresetCount(preset.id)} ${customPresetCount(preset.id) === 1 ? 'card' : 'cards'}</small></span></button>${controls}<span class="preset-check" aria-hidden="true">${selected ? '●' : '○'}</span></div>`;
-  const exportFooter = exportAction ? `<button class="preset-export-footer" type="button" data-export-preset="${escapeHtml(preset.id)}" aria-label="Export ${escapeHtml(preset.name)} as a .naipack" title="${packAvailable ? 'Export .naipack' : 'Export is available in the desktop app'}"${packAvailable ? '' : ' disabled'}>Export .naipack</button>` : '';
-  return `<div class="preset-row ${selected ? 'selected' : ''} ${isDefault ? 'default' : ''}">${content}${exportFooter}</div>`;
-}
-
-function customZoneChoice(zone: CustomTagZone, current: CustomTagZone): string {
-  const label = zone === 'render' ? 'Render / Quality' : zone[0].toUpperCase() + zone.slice(1);
-  return `<label class="zone-choice ${current === zone ? 'selected' : ''}"><input type="radio" name="custom-tag-zone" value="${zone}" data-custom-zone="${zone}"${current === zone ? ' checked' : ''}><span>${label}</span></label>`;
-}
-
-function customTagKind(item?: CustomTag): CustomTagKind { return item ? (item.kind === 'artist' ? 'artist' : 'tag') : customTagFormKind; }
-function customTypeSelector(kind: CustomTagKind): string {
-  return `<label class="field custom-type-select"><span>Card type</span><select id="custom-card-kind" aria-label="Custom card type"><option value="tag"${kind === 'tag' ? ' selected' : ''}>Prompt tag</option><option value="artist"${kind === 'artist' ? ' selected' : ''}>Artist</option></select></label>`;
-}
-
-function customTagsWorkspaceContent(): string {
-  const editing = customTags.find(item => item.id === editingCustomTagId);
-  const kind = customTagKind(editing);
-  const destination = customPreset(selectedCustomPresetId);
-  const visibleCards = customTags.filter(item => {
-    const inPreset = selectedCustomPresetId === 'all' || customTagPresetId(item) === selectedCustomPresetId;
-    const query = customTagSearch.trim().toLocaleLowerCase();
-    const matchesSearch = !query || `${item.tag} ${item.description ?? ''}`.toLocaleLowerCase().includes(query);
-    return inPreset && matchesSearch && (customTagFilter === 'all' || (customTagFilter === 'artist' ? item.kind === 'artist' : item.kind !== 'artist' && item.zone === customTagFilter));
-  });
-  const imageUrl = customImageBytes && customImageMime
-    ? customImageUrls.get('__draft__') ?? ''
-    : editing?.imageAsset
-      ? customTagImageUrl(editing)
-      : '';
-  const hasImage = Boolean(imageUrl);
-  const imagePreview = hasImage
-    ? `<div class="custom-image-preview is-loaded" id="custom-image-preview"><img src="${escapeHtml(imageUrl)}" alt="${editing ? escapeHtml(editing.tag) : 'Selected custom tag image preview'}"></div>`
-    : '<div class="custom-image-preview is-empty" id="custom-image-preview"><span class="custom-image-empty">Choose an image to preview it here.</span></div>';
-  const deletePreset = deletingCustomPresetId ? customPreset(deletingCustomPresetId) : null;
-  const deletePrompt = deletePreset ? `<div class="preset-delete-confirm" role="alert"><b>Delete ${escapeHtml(deletePreset.name)}?</b><p>${customPresetCount(deletePreset.id)} ${customPresetCount(deletePreset.id) === 1 ? 'card is' : 'cards are'} in this folder. Choose whether to move them to My Tags or delete them with the folder.</p>${customPresetDeleteError ? `<p class="preset-delete-error">${escapeHtml(customPresetDeleteError)}</p>` : ''}<div><button class="danger-button" type="button" data-confirm-delete-preset="${escapeHtml(deletePreset.id)}" data-delete-mode="move">Delete folder only</button><button class="danger-button" type="button" data-confirm-delete-preset="${escapeHtml(deletePreset.id)}" data-delete-mode="delete">Delete folder and cards</button><button class="tiny-copy" type="button" id="cancel-delete-preset">Cancel</button></div></div>` : '';
-  const imageHelp = kind === 'artist' ? 'Optional PNG, JPEG, or WebP card, up to 20 MiB' : 'PNG, JPEG, or WebP, up to 20 MiB';
-  const imageStatus = kind === 'artist' ? 'Optional. Without an image, the artist uses the plus-card placeholder.' : 'Click or press Enter to choose an image.';
-  const nameLabel = kind === 'artist' ? 'Artist name' : 'Tag';
-  const namePlaceholder = kind === 'artist' ? 'artist name' : '1girl, upper body, looking at viewer';
-  const constructor = kind === 'artist' ? '<p class="custom-artist-note">Artist cards appear in Add Artist, random pools, Artist Mix, and metadata highlights.</p>' : `<fieldset class="field constructor-choices"><legend>Constructor</legend><div class="zone-choice-grid">${customZoneChoice('frame', editing?.zone ?? 'frame')}${customZoneChoice('scene', editing?.zone ?? 'frame')}${customZoneChoice('render', editing?.zone ?? 'frame')}${customZoneChoice('character', editing?.zone ?? 'frame')}</div><small class="custom-character-note">Character cards are saved for Custom Tags and are not used by Prompt Builder yet.</small></fieldset>`;
-  const packAvailable = Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags);
-  const packStatus = customTagPackStatus ? `<p id="custom-tag-pack-status" class="custom-tag-pack-status ${customTagPackStatusKind}" role="status" aria-live="polite">${escapeHtml(customTagPackStatus)}</p>` : '<p id="custom-tag-pack-status" class="custom-tag-pack-status" role="status" aria-live="polite"></p>';
-  const packControls = `<div class="custom-tag-pack-tools"><button class="secondary custom-tag-import" id="custom-tag-import" type="button" ${packAvailable ? '' : 'disabled'} aria-describedby="custom-tag-pack-help">⇧ Import .naipack</button><span id="custom-tag-pack-help">${packAvailable ? 'Import a shared Custom Tags preset.' : 'Import/export packs are available in the desktop app.'}</span></div>`;
-  return `<section class="custom-tags-workspace" aria-labelledby="custom-tags-title"><header class="workspace-intro"><div><p class="eyebrow">PERSONAL LIBRARY</p><h2 id="custom-tags-title">Custom Tag Builder</h2><p>Build prompt tags and artist cards for your studio.</p></div>${packControls}</header>${packStatus}<div class="custom-tags-layout"><aside class="custom-preset-sidebar" aria-label="Custom tag presets"><div class="preset-sidebar-heading"><div><p class="eyebrow">PRESET FOLDERS</p><h3>My presets</h3></div><span class="preset-total">${customTags.length}</span></div><button class="preset-all ${selectedCustomPresetId === 'all' ? 'selected' : ''}" type="button" data-select-preset="all" aria-pressed="${selectedCustomPresetId === 'all'}"><span><b>All Tags</b><small>${customTags.length} ${customTags.length === 1 ? 'card' : 'cards'}</small></span><span aria-hidden="true">${selectedCustomPresetId === 'all' ? '●' : '○'}</span></button><div class="custom-preset-list">${customTagPresets.map(customPresetMarkup).join('')}</div>${creatingCustomPreset ? `<form class="preset-create-form" id="custom-preset-form"><label class="field"><span>New preset folder</span><input id="custom-preset-name" maxlength="80" placeholder="A short folder name" required></label><div><button class="primary" type="submit">Create preset</button><button class="tiny-copy" type="button" id="cancel-create-preset">Cancel</button></div></form>` : '<button class="secondary preset-create-button" type="button" id="create-preset">＋ New preset</button>'}${deletePrompt}</aside><form class="custom-tag-form" id="custom-tag-form"><div class="form-heading"><div><p class="eyebrow">CREATE OR EDIT</p><h3>${editing ? `Edit custom ${kind}` : `New custom ${kind}`}</h3></div>${editing ? '<button class="tiny-copy" type="button" id="cancel-custom-edit">Cancel edit</button>' : ''}</div><p class="custom-destination" role="status">Destination: <b>${escapeHtml(destination.name)}</b>${selectedCustomPresetId === 'all' ? ' <small>All Tags is a view. New cards go to My Tags.</small>' : ''}</p>${customTypeSelector(kind)}<div class="field image-field"><span>Image <i>${imageHelp}</i></span><div class="custom-image-drop${hasImage ? ' has-image' : ''}" id="custom-image-drop" aria-describedby="custom-image-status"><input id="custom-tag-image" class="custom-file-input" type="file" accept="image/png,.png,image/jpeg,.jpg,.jpeg,image/webp,.webp" tabindex="-1"><button class="custom-image-empty-content" type="button" id="custom-tag-choose"${hasImage ? ' hidden' : ''}><span class="drop-icon" aria-hidden="true">＋</span><b>Drop an image here</b><span>or</span><span class="secondary choose-image-label">Choose image</span></button>${imagePreview}</div><p class="custom-image-status" id="custom-image-status">${imageStatus}</p></div><label class="field"><span>${nameLabel}</span><input id="custom-tag-name" value="${escapeHtml(editing?.tag ?? '')}" required maxlength="${CUSTOM_TAG_MAX_LENGTH}" placeholder="${namePlaceholder}"></label>${constructor}<label class="field"><span>Description / guide <i>(optional)</i></span><textarea id="custom-tag-description" maxlength="2000" placeholder="Explain what this card changes or when to use it.">${escapeHtml(editing?.description ?? '')}</textarea></label><p class="custom-tag-status" id="custom-tag-status" role="status" aria-live="polite"></p><button class="primary custom-save-button" type="submit">${editing ? 'Save changes' : `Save custom ${kind}`}</button></form><section class="custom-tag-library"><div class="subheading"><div><p class="eyebrow">SAVED CARDS</p><h3>${visibleCards.length} shown <span>·</span> ${customTags.length} total</h3></div><div class="custom-library-tools"><input id="custom-tag-search" value="${escapeHtml(customTagSearch)}" placeholder="Search your cards..." aria-label="Search custom cards"><div class="custom-zone-filter" role="group" aria-label="Filter saved cards"><button type="button" class="chip ${customTagFilter === 'all' ? 'on' : ''}" data-custom-filter="all" aria-pressed="${customTagFilter === 'all'}">All</button><button type="button" class="chip ${customTagFilter === 'artist' ? 'on' : ''}" data-custom-filter="artist" aria-pressed="${customTagFilter === 'artist'}">Artists</button><button type="button" class="chip ${customTagFilter === 'frame' ? 'on' : ''}" data-custom-filter="frame" aria-pressed="${customTagFilter === 'frame'}">Frame</button><button type="button" class="chip ${customTagFilter === 'scene' ? 'on' : ''}" data-custom-filter="scene" aria-pressed="${customTagFilter === 'scene'}">Scene</button><button type="button" class="chip ${customTagFilter === 'render' ? 'on' : ''}" data-custom-filter="render" aria-pressed="${customTagFilter === 'render'}">Render</button><button type="button" class="chip ${customTagFilter === 'character' ? 'on' : ''}" data-custom-filter="character" aria-pressed="${customTagFilter === 'character'}">Character</button></div></div></div><div class="custom-tag-grid" id="custom-tag-grid" tabindex="0">${visibleCards.length ? visibleCards.map(customLibraryCardMarkup).join('') : '<p class="empty-inline">No saved cards match this preset and filter yet.</p>'}</div></section></div><div id="custom-tag-pack-drop-overlay" class="custom-tag-pack-drop-toast" hidden aria-hidden="true" role="status" aria-live="polite"><b>Drop .naipack to import</b><span>One Custom Tags pack will be imported.</span></div></section>`;
-}
-
-function customTagsWorkspace(): string {
-  const content = customTagsWorkspaceContent();
-  if (!customTagLibraryWarning) return content;
-  const warning = `<p class="custom-tag-status" role="alert">${escapeHtml(customTagLibraryWarning)}</p>`;
-  return content.replace('<div class="custom-tags-layout">', `${warning}<div class="custom-tags-layout">`);
-}
-
-function customLibraryCardMarkup(item: CustomTag): string {
-  const description = item.description?.trim() ?? '';
-  const preset = customPreset(customTagPresetId(item));
-  const isArtist = item.kind === 'artist';
-  const status = isArtist && shadowedCustomArtistIds.has(item.id) ? 'NAX card active' : isArtist ? 'Artist' : item.zone === 'render' ? 'Render / Quality' : item.zone[0].toUpperCase() + item.zone.slice(1);
-  return `<article class="custom-library-card" data-constructor-preview-image="${escapeHtml(customTagImageUrl(item))}" data-constructor-preview-tag="${escapeHtml(item.tag)}" data-constructor-preview-description="${escapeHtml(description)}"><img data-preview-cache="content" data-preview-src="${escapeHtml(customTagImageUrl(item))}" alt="${escapeHtml(item.tag)}" loading="lazy"><div><b>${escapeHtml(item.tag)}</b><small>${escapeHtml(preset.name)} · ${status}</small>${description ? `<p>${escapeHtml(description)}</p>` : ''}</div><div class="custom-library-actions"><button class="tiny-copy" type="button" data-edit-custom-tag="${escapeHtml(item.id)}">Edit</button><button class="tiny-copy" type="button" data-delete-custom-tag="${escapeHtml(item.id)}">Delete</button></div></article>`;
-}
-
 function workspacePanelClass(workspace: 'prompt' | 'artist-mix' | 'saved-library' | 'custom-tags' | 'metadata' | 'settings'): string {
   return pendingWorkspaceTransition === workspace
     ? `workspace-panel workspace-panel-incoming workspace-panel-incoming-${workspace}`
@@ -1123,13 +1053,16 @@ function render(): void {
   const activeMarkup = activeWorkspace === 'prompt'
     ? `<section id="prompt-panel" class="${workspacePanelClass('prompt')}" role="tabpanel" aria-labelledby="prompt-tab"><section class="workspace-intro"><div><p class="eyebrow">FOUR-ZONE WORKSPACE</p><h2>Build the prompt in order.</h2><p>Frame → artists → scene → render. Undesired content and character blocks stay separate.</p></div></section><section class="four-zone-grid">${zoneDetails()}${artistZone()}${charactersZone()}</section><footer class="app-footer"><div class="footer-brand"><span>NAI Prompt Studio</span><span class="footer-links"><a href="https://nax.moe/?gallery=danbooru-artist-tags-2-v5" target="_blank" rel="noopener noreferrer">NAX · CC BY 4.0</a><a href="https://hothottuk.neocities.org/en" target="_blank" rel="noopener noreferrer">hothottuk's guide</a></span></div></footer></section>`
     : activeWorkspace === 'artist-mix' ? artistMixWorkspace()
-    : activeWorkspace === 'saved-library' ? savedLibraryWorkspace()
-    : activeWorkspace === 'custom-tags' ? `<section id="custom-tags-panel" class="${workspacePanelClass('custom-tags')}" role="tabpanel" aria-labelledby="custom-tags-tab">${customTagsWorkspace()}</section>`
+    : activeWorkspace === 'saved-library' ? savedLibraryWorkspaceModule.markup()
+    : activeWorkspace === 'custom-tags' ? customTagsWorkspaceModule.markup(workspacePanelClass('custom-tags'))
     : activeWorkspace === 'metadata' ? `<section id="metadata-panel" class="${workspacePanelClass('metadata')}" role="tabpanel" aria-labelledby="metadata-tab">${metadataWorkspace.markup()}</section>`
     : settingsWorkspace();
   const shellClass = `${focusMode ? 'app-shell focus-shell' : 'app-shell'}${startupEntryPending ? ' startup-entry' : ''}`;
   const chrome = focusMode ? '' : `<div class="app-chrome"><header class="topbar"><div class="brand"><img class="brand-mark brand-icon" src="./app-icon.png" alt=""><div><h1>Prompt Studio</h1><p>NovelAI Diffusion · V5 artist workflow</p></div></div><div class="top-actions">${activeWorkspace === 'prompt' ? '<button class="reset-prompt" id="reset" type="button">Reset prompt</button>' : ''}</div></header>${tabs}</div>`;
-  app.innerHTML = `<main class="${shellClass}">${chrome}${activeMarkup}</main>${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${activeWorkspace === 'metadata' ? metadataWorkspace.overlayMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`;
+  if (!workspaceController) workspaceController = new WorkspaceController(app, routeDelegatedShellAction);
+  workspaceController.updateChrome(shellClass, chrome);
+  workspaceController.mount(activeWorkspace as WorkspaceId, activeMarkup);
+  workspaceController.updateOverlays(`${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${activeWorkspace === 'metadata' ? metadataWorkspace.overlayMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`);
   pendingWorkspaceTransition = null;
   bindEvents();
   bindPreviewFade(app.querySelector<HTMLElement>('.app-shell') ?? app);
@@ -1150,11 +1083,17 @@ function render(): void {
   renderedWorkspace = activeWorkspace;
 }
 
+function routeDelegatedShellAction(event: Event): void {
+  const element = event.target instanceof Element ? event.target : null;
+  if (savedLibraryWorkspaceModule.route(event) || customTagsWorkspaceModule.route(event)) return;
+  if (event.type !== 'click') return;
+  const target = element?.closest<HTMLElement>('[role="tab"]');
+  const workspace = target?.id.replace(/-tab$/, '') as WorkspaceId | undefined;
+  if (workspace && ['prompt', 'artist-mix', 'saved-library', 'custom-tags', 'metadata', 'settings'].includes(workspace)) { switchWorkspace(workspace); return; }
+}
+
 function updatePrompt(): void {
-  const fullOutput = document.querySelector<HTMLElement>('#full-prompt-output');
-  const artistOutput = document.querySelector<HTMLElement>('#artist-prompt-output');
-  if (fullOutput) fullOutput.textContent = prompt();
-  if (artistOutput) artistOutput.textContent = buildArtistsPrompt(base.artists);
+  promptWorkspaceModule.updateOutputs(workspaceController, prompt(), buildArtistsPrompt(base.artists));
 }
 function hydratePreviewScope(scope: ParentNode): void {
   const images = Array.from(scope.querySelectorAll(PREVIEW_IMAGE_SELECTOR)) as unknown as PreviewImageLike[];
@@ -1437,41 +1376,6 @@ async function saveMetadataTagToCustomTags(payload: { tag: string; category: 'fr
   return true;
 }
 
-function libraryPromptSide(item: SavedLibraryItem, index: number, polarity: 'positive' | 'negative'): string {
-  if (item.kind === 'character') return item.data[polarity];
-  if (item.kind !== 'prompt') return '';
-  if (index < 0) return polarity === 'positive' ? item.data?.positive ?? item.prompt : item.data?.negative ?? '';
-  return item.data?.characters[index]?.[polarity] ?? '';
-}
-
-function patchLibraryPromptBlock(button: HTMLButtonElement): void {
-  const item = savedLibrary.find(value => value.id === button.dataset.libraryPolarity);
-  if (!item || (item.kind !== 'prompt' && item.kind !== 'character')) return;
-  const index = Number(button.dataset.libraryIndex);
-  const polarity = button.dataset.polarity === 'negative' ? 'negative' : 'positive';
-  const state = libraryPolarities.get(item.id) ?? { base: 'positive' as const, characters: item.kind === 'prompt' ? item.data?.characters.map(() => 'positive' as const) ?? [] : [] };
-  if (index < 0) state.base = polarity; else state.characters[index] = polarity;
-  libraryPolarities.set(item.id, state);
-  const block = button.closest<HTMLElement>('[data-library-block]');
-  if (!block) return;
-  block.querySelectorAll<HTMLButtonElement>('[data-library-polarity]').forEach(toggle => {
-    const on = toggle.dataset.polarity === polarity;
-    toggle.classList.toggle('on', on);
-    toggle.setAttribute('aria-pressed', String(on));
-  });
-  const value = libraryPromptSide(item, index, polarity);
-  const pre = block.querySelector<HTMLElement>('pre');
-  if (pre) pre.textContent = value || '(No prompt recorded for this side.)';
-  const copyButton = block.querySelector<HTMLButtonElement>('[data-library-copy]');
-  if (copyButton) {
-    const label = index < 0 ? item.kind === 'character' ? item.name : 'Base prompt' : item.kind === 'prompt' ? item.data?.characters[index]?.label ?? `Character ${index + 1}` : `Character ${index + 1}`;
-    const copyLabel = `Copy ${label} ${polarity} prompt`;
-    copyButton.disabled = !value;
-    copyButton.setAttribute('aria-label', copyLabel);
-    copyButton.title = copyLabel;
-  }
-}
-
 function removeLibraryCharacter(characterId: string): void {
   captureLibraryFormDraft();
   const index = libraryFormPrompt.characters.findIndex(character => character.id === characterId);
@@ -1490,25 +1394,6 @@ function removeLibraryCharacter(characterId: string): void {
 }
 
 function bindSavedLibraryEvents(): void {
-  document.querySelector('#saved-library-tab')?.addEventListener('click', () => switchWorkspace('saved-library'));
-  document.querySelector('#save-library-prompt')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
-  document.querySelector('#save-library-mix')?.addEventListener('click', () => openLibrarySaveModal('artist-mix', 'manual'));
-  document.querySelector('#save-library-character')?.addEventListener('click', () => openLibrarySaveModal('character', 'manual'));
-  document.querySelector('#save-library-empty')?.addEventListener('click', () => openLibrarySaveModal('prompt', 'manual'));
-  document.querySelector('#saved-library-search')?.addEventListener('input', event => { savedLibrarySearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
-  document.querySelectorAll<HTMLButtonElement>('[data-library-filter]').forEach(button => button.addEventListener('click', () => { savedLibraryFilter = button.dataset.libraryFilter as typeof savedLibraryFilter; render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-library-copy]').forEach(button => button.addEventListener('click', () => {
-    const item = savedLibrary.find(value => value.id === button.dataset.libraryCopy);
-    if (!item) return;
-    const index = Number(button.dataset.libraryIndex);
-    const polarity = index < 0 ? libraryPolarities.get(item.id)?.base ?? 'positive' : libraryPolarities.get(item.id)?.characters[index] ?? 'positive';
-    if (item.kind !== 'prompt' && item.kind !== 'character') return;
-    const value = libraryPromptSide(item, index, polarity);
-    if (value) void copy(value, `[data-library-copy="${item.id}"][data-library-index="${index}"]`);
-  }));
-  document.querySelectorAll<HTMLButtonElement>('[data-library-polarity]').forEach(button => button.addEventListener('click', () => patchLibraryPromptBlock(button)));
-  document.querySelectorAll<HTMLButtonElement>('[data-edit-library]').forEach(button => button.addEventListener('click', () => openLibraryEditModal(button.dataset.editLibrary!)));
-  document.querySelectorAll<HTMLButtonElement>('[data-delete-library]').forEach(button => button.addEventListener('click', () => openLibraryConfirmation('delete', button.dataset.deleteLibrary!)));
   if (!libraryModalMode) return;
   document.querySelector('#close-library-modal')?.addEventListener('click', closeLibraryModal);
   document.querySelector('#cancel-library-action')?.addEventListener('click', closeLibraryModal);
@@ -1554,11 +1439,6 @@ function bindEvents(): void {
     saveSettings(settings);
     saveDraft(currentDraft());
   });
-  document.querySelector('#prompt-tab')?.addEventListener('click', () => switchWorkspace('prompt'));
-  document.querySelector('#artist-mix-tab')?.addEventListener('click', () => switchWorkspace('artist-mix'));
-  document.querySelector('#custom-tags-tab')?.addEventListener('click', () => switchWorkspace('custom-tags'));
-  document.querySelector('#metadata-tab')?.addEventListener('click', () => switchWorkspace('metadata'));
-  document.querySelector('#settings-tab')?.addEventListener('click', () => switchWorkspace('settings'));
   document.querySelector('#add-character')?.addEventListener('click', () => { characters.push(newCharacter()); saveSoon(); render(); });
   bindArtistEvents();
   bindCharacterEvents();
@@ -1793,9 +1673,9 @@ function applyCustomTagSnapshot(snapshot: { presets: CustomTagPreset[]; tags: Cu
   if (snapshot.warning) console.warn(`[custom-tags] ${snapshot.warning}`);
 }
 
-async function createCustomPreset(): Promise<void> {
+async function createCustomPreset(nameValue?: string): Promise<void> {
   const input = document.querySelector<HTMLInputElement>('#custom-preset-name');
-  const name = input?.value.trim().replace(/\s+/g, ' ').slice(0, 80) ?? '';
+  const name = (nameValue ?? input?.value ?? '').trim().replace(/\s+/g, ' ').slice(0, 80);
   if (!name) { input?.focus(); return; }
   if (customTagPresets.some(preset => presetNameKey(preset.name) === presetNameKey(name))) {
     input?.setCustomValidity('Preset names must be unique.');
@@ -1813,10 +1693,10 @@ async function createCustomPreset(): Promise<void> {
   render();
 }
 
-async function renameCustomPreset(presetId: string): Promise<void> {
+async function renameCustomPreset(presetId: string, nameValue?: string): Promise<void> {
   if (presetId === DEFAULT_CUSTOM_TAG_PRESET_ID) { renamingCustomPresetId = null; render(); return; }
   const input = document.querySelector<HTMLInputElement>(`#preset-rename-${presetId}`);
-  const name = input?.value.trim().replace(/\s+/g, ' ').slice(0, 80) ?? '';
+  const name = (nameValue ?? input?.value ?? '').trim().replace(/\s+/g, ' ').slice(0, 80);
   if (!name) { input?.focus(); return; }
   if (customTagPresets.some(preset => preset.id !== presetId && presetNameKey(preset.name) === presetNameKey(name))) {
     input?.setCustomValidity('Preset names must be unique.');
@@ -1891,41 +1771,11 @@ async function deleteCustomPreset(presetId: string, mode: 'move' | 'delete' = 'm
 function bindCustomTagEvents(): void {
   if (activeWorkspace !== 'custom-tags') return;
   bindCustomTagPackEvents();
-  document.querySelector('#custom-tag-search')?.addEventListener('input', event => { customTagSearch = (event.target as HTMLInputElement).value; scheduleSearch(render); });
-  document.querySelectorAll<HTMLButtonElement>('[data-custom-filter]').forEach(button => button.addEventListener('click', () => { customTagFilter = button.dataset.customFilter as CustomTagZone | 'artist' | 'all'; render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-select-preset]').forEach(button => button.addEventListener('click', () => {
-    selectedCustomPresetId = button.dataset.selectPreset === 'all' ? 'all' : (button.dataset.selectPreset ?? DEFAULT_CUSTOM_TAG_PRESET_ID);
-    deletingCustomPresetId = null;
-    render();
-  }));
-  document.querySelector('#create-preset')?.addEventListener('click', () => { creatingCustomPreset = true; render(); window.setTimeout(() => document.querySelector<HTMLInputElement>('#custom-preset-name')?.focus(), 0); });
-  document.querySelector('#cancel-create-preset')?.addEventListener('click', () => { creatingCustomPreset = false; render(); });
-  document.querySelector<HTMLFormElement>('#custom-preset-form')?.addEventListener('submit', event => { event.preventDefault(); void createCustomPreset(); });
-  document.querySelectorAll<HTMLButtonElement>('[data-rename-preset]').forEach(button => button.addEventListener('click', () => { renamingCustomPresetId = button.dataset.renamePreset!; deletingCustomPresetId = null; render(); window.setTimeout(() => document.getElementById(`preset-rename-${renamingCustomPresetId!}`)?.focus(), 0); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-cancel-rename]').forEach(button => button.addEventListener('click', () => { renamingCustomPresetId = null; render(); }));
-  document.querySelectorAll<HTMLFormElement>('[data-preset-rename-form]').forEach(form => form.addEventListener('submit', event => { event.preventDefault(); void renameCustomPreset(form.dataset.presetRenameForm!); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-delete-preset]').forEach(button => button.addEventListener('click', () => { deletingCustomPresetId = button.dataset.deletePreset!; customPresetDeleteError = ''; renamingCustomPresetId = null; render(); }));
-  document.querySelector('#cancel-delete-preset')?.addEventListener('click', () => { deletingCustomPresetId = null; customPresetDeleteError = ''; render(); });
-  document.querySelectorAll<HTMLButtonElement>('[data-confirm-delete-preset]').forEach(button => button.addEventListener('click', () => { void deleteCustomPreset(button.dataset.confirmDeletePreset!, button.dataset.deleteMode === 'delete' ? 'delete' : 'move'); }));
-  document.querySelector('#cancel-custom-edit')?.addEventListener('click', () => { editingCustomTagId = null; customTagFormKind = 'tag'; customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); });
-  document.querySelectorAll<HTMLButtonElement>('[data-edit-custom-tag]').forEach(button => button.addEventListener('click', () => { const item = customTags.find(tag => tag.id === button.dataset.editCustomTag); if (!item) return; editingCustomTagId = item.id; customTagFormKind = item.kind === 'artist' ? 'artist' : 'tag'; selectedCustomPresetId = customTagPresetId(item); customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); }));
-  document.querySelectorAll<HTMLButtonElement>('[data-delete-custom-tag]').forEach(button => button.addEventListener('click', () => void deleteCustomTag(button.dataset.deleteCustomTag!)));
-  const fileInput = document.querySelector<HTMLInputElement>('#custom-tag-image');
   const dropZone = document.querySelector<HTMLElement>('#custom-image-drop');
-  fileInput?.addEventListener('change', event => void readCustomImage((event.target as HTMLInputElement).files?.[0]));
-  document.querySelector('#custom-tag-choose')?.addEventListener('click', event => { event.stopPropagation(); fileInput?.click(); });
-  dropZone?.addEventListener('click', event => { if (event.target !== fileInput) fileInput?.click(); });
-  dropZone?.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput?.click(); } });
   dropZone?.addEventListener('dragenter', event => { event.preventDefault(); dropZone.classList.add('is-dragging'); });
   dropZone?.addEventListener('dragover', event => { event.preventDefault(); dropZone.classList.add('is-dragging'); });
   dropZone?.addEventListener('dragleave', event => { event.preventDefault(); if (!dropZone.contains(event.relatedTarget as Node | null)) dropZone.classList.remove('is-dragging'); });
   dropZone?.addEventListener('drop', event => { event.preventDefault(); dropZone.classList.remove('is-dragging'); void readCustomImage(event.dataTransfer?.files?.[0]); });
-  document.querySelector<HTMLSelectElement>('#custom-card-kind')?.addEventListener('change', event => {
-    customTagFormKind = (event.target as HTMLSelectElement).value === 'artist' ? 'artist' : 'tag';
-    render();
-  });
-  document.querySelectorAll<HTMLInputElement>('[data-custom-zone]').forEach(input => input.addEventListener('change', () => { document.querySelectorAll('.zone-choice').forEach(label => label.classList.toggle('selected', (label.querySelector('input') as HTMLInputElement | null)?.checked ?? false)); }));
-  document.querySelector<HTMLFormElement>('#custom-tag-form')?.addEventListener('submit', event => { event.preventDefault(); void saveCustomTagFromForm(); });
 }
 
 async function readCustomImage(file?: File): Promise<void> {
@@ -2047,15 +1897,6 @@ async function importDroppedCustomTagPack(file?: File): Promise<void> {
 function bindCustomTagPackEvents(): void {
   const workspace = document.querySelector<HTMLElement>('.custom-tags-workspace');
   if (!workspace) return;
-  document.querySelector<HTMLButtonElement>('#custom-tag-import')?.addEventListener('click', () => {
-    setCustomTagPackStatus('Opening .naipack…');
-    void importCustomTags().then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error)));
-  });
-  document.querySelectorAll<HTMLButtonElement>('[data-export-preset]').forEach(button => button.addEventListener('click', event => {
-    event.stopPropagation();
-    setCustomTagPackStatus('Preparing .naipack…');
-    void exportCustomTags(button.dataset.exportPreset!).then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error)));
-  }));
   const overlay = workspace.querySelector<HTMLElement>('#custom-tag-pack-drop-overlay');
   let packDragDepth = 0;
   const showPackDropToast = () => {
@@ -2814,9 +2655,11 @@ async function startCatalogUpdate(): Promise<void> {
   if (catalogStatusVisible()) render();
   try {
     const result = await window.naiCatalog.update();
+    // A successful direct update is newer than any in-flight catalog load.
+    ++catalogLoadGeneration;
     const previousArtists = officialArtists;
     const previousById = new Map(previousArtists.map(card => [card.catalogId ?? card.id, card]));
-    officialArtists = result.catalog.artists;
+    replaceOfficialArtists(result.catalog.artists);
     catalog = { ...result.catalog, artists: [] };
     invalidateOfficialPreviewCatalog(catalogRevision(result.catalog));
     rebuildEffectiveArtistCatalog();
@@ -2855,7 +2698,7 @@ async function startCatalogUpdate(): Promise<void> {
 function randomizeArtists(): void {
   const pool = activeRandomPool();
   const requested = artistRandomFavoritesOnly ? (favoriteRandomRange ?? randomRange) : randomRange;
-  const range = resolveRandomPoolRange(requested, pool.length);
+  const range = resolveRandomPoolRange(requested, promptArtistPoolSize(pool.length));
   if (!range.feasible) {
     randomNotice = artistRandomFavoritesOnly
       ? 'Favorites-only random needs at least 2 favorited V5 artists. Add favorites or turn off Favorites-only. Your selected artists were kept.'
@@ -2880,7 +2723,7 @@ function updateRandomRange(sourceId = ''): void {
   const source = sourceId ? document.querySelector<HTMLInputElement>(`#${sourceId}`) : null;
   const min = Number(sourceId.includes('min') ? source?.value : document.querySelector<HTMLInputElement>('#random-min')?.value);
   const max = Number(sourceId.includes('max') ? source?.value : document.querySelector<HTMLInputElement>('#random-max')?.value);
-  const resolved = resolveRandomPoolRange({ min, max }, activeRandomPool().length);
+  const resolved = resolveRandomPoolRange({ min, max }, promptArtistPoolSize(activeRandomPool().length));
   if (artistRandomFavoritesOnly) {
     if (resolved.feasible) favoriteRandomRange = { min: resolved.min, max: resolved.max };
   } else {
@@ -2987,19 +2830,22 @@ function closeDetails(): void {
 }
 
 async function loadCatalog(): Promise<void> {
+  const request = ++catalogLoadGeneration;
   try {
     const loaded = window.naiCatalog
       ? await window.naiCatalog.load() as Partial<OfflineCatalog>
       : await (async () => { const response = await fetch('./catalog/catalog.json'); if (!response.ok) throw new Error(`Catalog request failed (${response.status})`); return await response.json() as Partial<OfflineCatalog>; })();
     if (!Array.isArray(loaded.artists) || !Array.isArray(loaded.characters)) throw new Error('Catalog snapshot is missing artist or character arrays');
-    officialArtists = loaded.artists;
+    if (request !== catalogLoadGeneration) return;
+    replaceOfficialArtists(loaded.artists);
     catalog = { ...emptyCatalog(), ...loaded, artists: [], characters: loaded.characters, tags: loaded.tags ?? FALLBACK_TAGS } as OfflineCatalog;
     invalidateOfficialPreviewCatalog(catalogRevision(catalog));
     rebuildEffectiveArtistCatalog();
     catalogState = 'ready';
     catalogError = '';
   } catch (error) {
-    officialArtists = [];
+    if (request !== catalogLoadGeneration) return;
+    replaceOfficialArtists([]);
     catalog = emptyCatalog();
     catalogState = 'error';
     catalogError = error instanceof Error ? error.message : 'The offline V5 catalog could not be loaded.';
@@ -3010,14 +2856,17 @@ async function loadCatalog(): Promise<void> {
 }
 
 async function loadGuide(): Promise<void> {
+  const request = ++guideLoadGeneration;
   try {
     const response = await fetch('./catalog/guide/manifest.json');
     if (!response.ok) throw new Error(`Guide request failed (${response.status})`);
     const value = await response.json() as GuideExample[] | { entries?: GuideExample[] };
     const entries = Array.isArray(value) ? value : (value.entries ?? []);
+    if (request !== guideLoadGeneration) return;
     guideCards = classifyGuideEntries(entries);
     guideState = 'ready';
   } catch (error) {
+    if (request !== guideLoadGeneration) return;
     guideCards = [];
     guideState = 'error';
     console.warn(error instanceof Error ? error.message : 'The offline guide could not be loaded.');
@@ -3170,7 +3019,7 @@ function startupBlockingCards(warmup: readonly CatalogCard[]): CatalogCard[] {
 
 function startupUserPreviewSources(): string[] {
   const sources = new Set<string>();
-  for (const item of savedLibraryItems().slice(0, STARTUP_IDLE_SOURCE_LIMIT)) {
+  for (const item of savedLibrary.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, STARTUP_IDLE_SOURCE_LIMIT)) {
     const image = libraryImageUrl(item);
     if (image) sources.add(image);
   }
@@ -3294,11 +3143,32 @@ async function bootApp(): Promise<void> {
 
 applyAnimationMode(animationMode);
 applyTheme();
-bindAppUpdateProgress();
-bindComponentProgress();
-renderStartup();
-void bootApp();
+function renderWorkspaceRecovery(error: string): void {
+  const app = document.querySelector<HTMLDivElement>('#app');
+  if (!app) return;
+  app.innerHTML = `<main class="workspace-recovery"><section role="alert" aria-labelledby="workspace-recovery-title"><p class="eyebrow">WORKSPACE RECOVERY</p><h1 id="workspace-recovery-title">Your workspace needs attention</h1><p>NAI Prompt Studio could not safely read its local workspace. Nothing has been changed or reset.</p><p class="workspace-recovery-detail">${escapeHtml(error)}</p><div class="settings-actions"><button class="primary" id="retry-workspace-recovery" type="button">Retry</button><button class="secondary" id="open-profile-folder" type="button">Open profile folder</button></div><p id="workspace-recovery-action" role="status"></p></section></main>`;
+  document.querySelector('#retry-workspace-recovery')?.addEventListener('click', () => {
+    const snapshot = window.naiStorage?.retryLoad?.();
+    if (snapshot?.state === 'ready' || snapshot?.state === 'missing') window.location.reload();
+    else {
+      const status = document.querySelector<HTMLElement>('#workspace-recovery-action');
+      if (status) status.textContent = snapshot?.error || 'The workspace is still unavailable.';
+    }
+  });
+  document.querySelector('#open-profile-folder')?.addEventListener('click', () => {
+    const status = document.querySelector<HTMLElement>('#workspace-recovery-action');
+    void window.naiStorage?.openProfileFolder?.().then(() => { if (status) status.textContent = 'The profile folder was opened.'; }).catch(reason => { if (status) status.textContent = reason instanceof Error ? reason.message : 'The profile folder could not be opened.'; });
+  });
+}
+
+if (initialWorkspaceRecoveryError) renderWorkspaceRecovery(initialWorkspaceRecoveryError);
+else {
+  bindAppUpdateProgress();
+  bindComponentProgress();
+  renderStartup();
+  void bootApp();
+}
 window.addEventListener('resize', scheduleMixOrbitThreads);
-window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); previewIdleCancel?.(); gridPreviewCache.dispose(); contentPreviewCache.dispose(); hoverPreviewCache.dispose(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); });
+window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); previewIdleCancel?.(); gridPreviewCache.dispose(); contentPreviewCache.dispose(); hoverPreviewCache.dispose(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); workspaceController?.dispose(); workspaceController = null; });
 
 export { normalizeRange, randomizeArtists, prompt };

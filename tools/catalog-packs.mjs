@@ -4,15 +4,16 @@ import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmS
 import { join, relative, resolve } from 'node:path';
 import { createPackageFromFiles, listPackage } from '@electron/asar';
 import { projectRoot } from './local-env.mjs';
+import { COMPONENT_VERSION, resolveCatalogComponentVersion } from './catalog-packs-version.mjs';
+
+export { COMPONENT_VERSION } from './catalog-packs-version.mjs';
 
 // Build independently verifiable ASAR components directly from public/catalog.
 // No image staging tree is created, and public catalog inputs are never moved,
 // optimized, or deleted.
 const catalog = join(projectRoot, 'public', 'catalog');
 const output = resolve(process.argv.find(arg => arg.startsWith('--output='))?.slice('--output='.length) || join(projectRoot, 'release-v5', 'catalog-packs'));
-const packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
-const version = String(packageJson.version);
-if (version !== '0.6.3') throw new Error(`Catalog packs require app version 0.6.3 (found ${version}).`);
+const version = resolveCatalogComponentVersion();
 mkdirSync(output, { recursive: true });
 
 function walkFiles(root) {

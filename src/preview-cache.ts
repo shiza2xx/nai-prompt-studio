@@ -108,6 +108,13 @@ interface InternalEntry extends PreviewEntry {
   slotReleased?: boolean;
   pendingUrl?: string;
   revokedUrls: Set<string>;
+  readyPrevious?: InternalEntry;
+  readyNext?: InternalEntry;
+}
+
+interface PreviewQueue {
+  items: InternalEntry[];
+  cursor: number;
 }
 
 const PREVIEW_SELECTOR = 'img[data-preview-src], img[data-constructor-image-src]';
@@ -137,7 +144,11 @@ function finiteDimension(value: unknown): number {
 /** A stable, priority-aware queue with explicit retention leases. */
 export class PreviewCache {
   private readonly entries = new Map<string, InternalEntry>();
-  private readonly queue: InternalEntry[] = [];
+  // Entries may appear in an older bucket after promotion. Consumers take only
+  // the entry whose current priority still matches, making promotion O(1).
+  private readonly queues: Record<PreviewPriority, PreviewQueue> = {
+    visible: { items: [], cursor: 0 }, 'current-page': { items: [], cursor: 0 }, background: { items: [], cursor: 0 }, idle: { items: [], cursor: 0 }
+  };
   private readonly fetchSource: (input: string, signal?: AbortSignal) => Promise<{ ok?: boolean; status?: number; blob(): Promise<unknown> }>;
   private readonly makeObjectURL: (blob: unknown) => string;
   private readonly revokeURL: (url: string) => void;
@@ -152,6 +163,10 @@ export class PreviewCache {
   private readonly clearTimeoutWork: (handle: unknown) => void;
   private readonly scheduleWork: (callback: () => void, priority: PreviewPriority) => unknown;
   private readonly leases = new Map<string, Set<string>>();
+  private readonly leaseRefs = new Map<string, number>();
+  private readonly imageEntries = new WeakMap<PreviewImageLike, InternalEntry>();
+  private readyHead?: InternalEntry;
+  private readyTail?: InternalEntry;
   private foregroundActive = 0;
   private backgroundActive = 0;
   private bytesUsed = 0;
@@ -232,7 +247,7 @@ export class PreviewCache {
       this.cancelEntry(entry, new Error('Preview invalidated.'));
       this.revokeEntry(entry);
     }
-    for (const leased of this.leases.values()) for (const key of [...leased]) if (keys.has(key)) leased.delete(key);
+    this.dropLeaseKeys(keys);
     this.pump();
   }
 
@@ -248,14 +263,17 @@ export class PreviewCache {
   acquireLease(scope: string, sources: Iterable<string>): PreviewLease {
     const scopeKey = String(scope || '').trim();
     if (!scopeKey) throw new Error('Preview lease scope is required.');
+    const previous = this.leases.get(scopeKey);
+    if (previous) for (const key of previous) this.releaseLeaseKey(key);
     const retained = new Set([...sources].map(source => this.key(String(source))).filter(Boolean));
+    for (const key of retained) this.retainLeaseKey(key);
     this.leases.set(scopeKey, retained);
     const cache = this;
     const lease: PreviewLease = {
       scope: scopeKey,
       get sources() { return [...retained].map(key => key.slice(key.indexOf('\u0000') + 1)); },
-      release: () => { if (cache.leases.get(scopeKey) === retained) cache.leases.delete(scopeKey); cache.evict(); },
-      update: next => { retained.clear(); for (const source of next) { const key = cache.key(String(source)); if (key) retained.add(key); } cache.evict(); }
+      release: () => { if (cache.leases.get(scopeKey) === retained) { cache.leases.delete(scopeKey); for (const key of retained) cache.releaseLeaseKey(key); } cache.evict(); },
+      update: next => { if (cache.leases.get(scopeKey) !== retained) return; const replacement = new Set([...next].map(source => cache.key(String(source))).filter(Boolean)); for (const key of retained) if (!replacement.has(key)) cache.releaseLeaseKey(key); for (const key of replacement) if (!retained.has(key)) cache.retainLeaseKey(key); retained.clear(); for (const key of replacement) retained.add(key); cache.evict(); }
     };
     this.evict();
     return lease;
@@ -268,8 +286,8 @@ export class PreviewCache {
     return this.acquireLease(scope, sources);
   }
 
-  releaseLease(scope: string): void { this.leases.delete(String(scope || '').trim()); this.evict(); }
-  clearLeases(): void { this.leases.clear(); this.evict(); }
+  releaseLease(scope: string): void { const keys = this.leases.get(String(scope || '').trim()); if (keys) for (const key of keys) this.releaseLeaseKey(key); this.leases.delete(String(scope || '').trim()); this.evict(); }
+  clearLeases(): void { this.leases.clear(); this.leaseRefs.clear(); this.evict(); }
 
   /** Request one source; duplicate queued/loading requests share one promise. */
   load(source: string, priority: PreviewPriority = 'background'): Promise<PreviewEntry> {
@@ -279,7 +297,7 @@ export class PreviewCache {
     const existing = this.entries.get(key);
     if (existing) {
       if (existing.state === 'queued' && this.priorityRank(priority) > this.priorityRank(existing.priority)) {
-        existing.priority = priority;
+        this.enqueue(existing, priority);
         this.pump();
       }
       this.touch(existing);
@@ -311,7 +329,7 @@ export class PreviewCache {
     }
     const promise = this.load(source, priority);
     const entry = this.entries.get(this.key(source));
-    if (entry) entry.consumers.add(image);
+    if (entry) { this.releaseImage(image); entry.consumers.add(image); this.imageEntries.set(image, entry); }
     void promise.then(value => {
       if (!current()) { this.releaseImage(image); return value; }
       if (value.state === 'ready') this.mount(image, value as InternalEntry);
@@ -331,13 +349,13 @@ export class PreviewCache {
     return results;
   }
 
-  releaseImage(image: PreviewImageLike): void { for (const entry of this.entries.values()) entry.consumers.delete(image); }
+  releaseImage(image: PreviewImageLike): void { const entry = this.imageEntries.get(image); if (entry) entry.consumers.delete(image); this.imageEntries.delete(image); }
 
   /** Abort queued/in-flight work, settle all promises, and revoke URLs. */
   clear(): void {
     this.generation += 1;
     for (const entry of this.entries.values()) { this.cancelEntry(entry, new Error('Preview cache cleared.')); this.revokeEntry(entry); }
-    this.entries.clear(); this.queue.length = 0; this.bytesUsed = 0; this.pump();
+    this.entries.clear(); for (const queue of Object.values(this.queues)) { queue.items.length = 0; queue.cursor = 0; } this.bytesUsed = 0; this.readyHead = undefined; this.readyTail = undefined; this.pump();
   }
 
   dispose(): void { if (this.disposed) return; this.disposed = true; this.clear(); this.leases.clear(); }
@@ -346,18 +364,30 @@ export class PreviewCache {
     const value = String(source || '').trim();
     return value ? `${this.variant}\u0000${value}` : '';
   }
-  private enqueue(entry: InternalEntry, priority: PreviewPriority): void { entry.priority = priority; this.queue.push(entry); this.scheduleWork(() => this.pump(), priority); this.pump(); }
+  private enqueue(entry: InternalEntry, priority: PreviewPriority): void { entry.priority = priority; this.queues[priority].items.push(entry); this.scheduleWork(() => this.pump(), priority); this.pump(); }
 
   private pump(): void {
     if (this.disposed) return;
-    const foreground = this.queue.filter(entry => entry.priority !== 'background' && entry.priority !== 'idle').sort((a, b) => this.priorityRank(b.priority) - this.priorityRank(a.priority) || a.sequence - b.sequence);
-    const background = this.queue.filter(entry => entry.priority === 'background' || entry.priority === 'idle').sort((a, b) => this.priorityRank(b.priority) - this.priorityRank(a.priority) || a.sequence - b.sequence);
-    while (this.foregroundActive < this.foregroundConcurrency && foreground.length) { const entry = foreground.shift()!; this.removeQueued(entry); this.start(entry, true); }
-    while (this.backgroundActive < this.backgroundConcurrency && background.length) { const entry = background.shift()!; this.removeQueued(entry); this.start(entry, false); }
+    while (this.foregroundActive < this.foregroundConcurrency) { const entry = this.dequeue('visible') ?? this.dequeue('current-page'); if (!entry) break; this.start(entry, true); }
+    while (this.backgroundActive < this.backgroundConcurrency) { const entry = this.dequeue('background') ?? this.dequeue('idle'); if (!entry) break; this.start(entry, false); }
   }
 
   private priorityRank(priority: PreviewPriority | undefined): number { return priority === 'visible' ? 4 : priority === 'current-page' ? 3 : priority === 'background' ? 2 : 1; }
-  private removeQueued(entry: InternalEntry): void { const index = this.queue.indexOf(entry); if (index >= 0) this.queue.splice(index, 1); }
+  private dequeue(priority: PreviewPriority): InternalEntry | undefined {
+    const queue = this.queues[priority];
+    while (queue.cursor < queue.items.length) {
+      const entry = queue.items[queue.cursor++]!;
+      this.compactQueue(queue);
+      if (entry.state === 'queued' && entry.priority === priority && this.entries.get(entry.key) === entry) return entry;
+    }
+    this.compactQueue(queue);
+    return undefined;
+  }
+  private compactQueue(queue: PreviewQueue): void {
+    if (queue.cursor === queue.items.length) { queue.items.length = 0; queue.cursor = 0; }
+    else if (queue.cursor >= 64 && queue.cursor * 2 >= queue.items.length) { queue.items.splice(0, queue.cursor); queue.cursor = 0; }
+  }
+  private removeQueued(entry: InternalEntry): void { if (entry.state === 'queued') entry.priority = undefined; }
 
   private start(entry: InternalEntry, foreground: boolean): void {
     if (this.disposed || entry.controller.signal.aborted) return;
@@ -366,7 +396,7 @@ export class PreviewCache {
     void this.decode(entry).then(value => {
       this.clearEntryTimeout(entry);
       if (entry.controller.signal.aborted || entry.timedOut || this.disposed || this.entries.get(entry.key) !== entry) { this.revokeDecodedURL(entry, value.url); return; }
-      entry.state = 'ready'; entry.url = value.url; entry.width = value.width; entry.height = value.height; entry.bytes = value.bytes;
+      entry.state = 'ready'; entry.url = value.url; entry.width = value.width; entry.height = value.height; entry.bytes = value.bytes; this.linkReadyMostRecent(entry);
       this.bytesUsed += entry.bytes; this.touch(entry); this.evict(entry);
       // If this item alone cannot fit the active ceiling, evict() revokes it
       // and removes the entry. Surface a terminal failure rather than handing
@@ -403,17 +433,17 @@ export class PreviewCache {
     finally { if (entry.pendingUrl === url) entry.pendingUrl = undefined; }
   }
 
-  private touch(entry: InternalEntry): void { entry.lastUsed = ++this.clock; }
+  private touch(entry: InternalEntry): void { entry.lastUsed = ++this.clock; if (entry.state === 'ready') this.linkReadyMostRecent(entry); }
   private mount(image: PreviewImageLike, entry: InternalEntry): void {
     if (entry.state !== 'ready' || !entry.url) return;
-    image.src = entry.url; image.dataset.previewState = 'ready'; delete image.dataset.previewError; image.classList.remove?.('is-preview-error'); image.classList.add('is-decoded', 'is-loaded', 'is-preview-ready'); image.parentElement?.classList.add('is-preview-ready'); entry.consumers.add(image); this.touch(entry);
+    this.releaseImage(image); image.src = entry.url; image.dataset.previewState = 'ready'; delete image.dataset.previewError; image.classList.remove?.('is-preview-error'); image.classList.add('is-decoded', 'is-loaded', 'is-preview-ready'); image.parentElement?.classList.add('is-preview-ready'); entry.consumers.add(image); this.imageEntries.set(image, entry); this.touch(entry);
   }
   private markFailure(image: PreviewImageLike, error: unknown): void { image.dataset.previewState = 'error'; image.dataset.previewError = 'true'; image.classList.add('is-preview-error', 'is-preview-ready'); image.parentElement?.classList.add('is-preview-ready'); if (!image.alt) image.alt = 'Preview unavailable'; if (!image.src) image.src = './plus.png'; void error; }
-  private isLeased(entry: InternalEntry): boolean { for (const keys of this.leases.values()) if (keys.has(entry.key)) return true; return false; }
+  private isLeased(entry: InternalEntry): boolean { return (this.leaseRefs.get(entry.key) ?? 0) > 0; }
   private evict(protectedEntry?: InternalEntry): void {
     if (this.bytesUsed <= this.maxBytesValue) return;
-    const candidates = [...this.entries.values()].filter(entry => entry !== protectedEntry && entry.state === 'ready' && entry.url && !this.isLeased(entry)).sort((a, b) => a.lastUsed - b.lastUsed);
-    for (const entry of candidates) { if (this.bytesUsed <= this.maxBytesValue) break; this.entries.delete(entry.key); this.revokeEntry(entry); }
+    let entry = this.readyHead;
+    while (this.bytesUsed > this.maxBytesValue && entry) { const next = entry.readyNext; if (entry !== protectedEntry && !this.isLeased(entry)) { this.entries.delete(entry.key); this.revokeEntry(entry); } entry = next; }
     // A single decoded item may itself exceed a newly reduced budget. Do not
     // violate the ceiling indefinitely merely because it was just completed;
     // a lease is the only explicit reason to retain such an item.
@@ -422,7 +452,7 @@ export class PreviewCache {
       this.revokeEntry(protectedEntry);
     }
   }
-  private revokeEntry(entry: InternalEntry): void { if (entry.url) this.revokeDecodedURL(entry, entry.url); this.revokePendingURL(entry); this.bytesUsed = Math.max(0, this.bytesUsed - entry.bytes); entry.url = undefined; entry.consumers.clear(); }
+  private revokeEntry(entry: InternalEntry): void { if (entry.url) this.revokeDecodedURL(entry, entry.url); this.revokePendingURL(entry); this.unlinkReady(entry); this.bytesUsed = Math.max(0, this.bytesUsed - entry.bytes); entry.url = undefined; for (const image of entry.consumers) this.imageEntries.delete(image); entry.consumers.clear(); }
   private resolveEntry(entry: InternalEntry, value: PreviewEntry): void { if (!entry.settled) { entry.settled = true; entry.resolve?.(value); } }
   private cancelEntry(entry: InternalEntry, error: Error): void { this.clearEntryTimeout(entry); entry.controller.abort(); this.removeQueued(entry); this.revokePendingURL(entry); if (entry.state === 'queued' || entry.state === 'loading') { entry.state = 'failed'; entry.error = error; this.resolveEntry(entry, entry); } }
   private timeoutEntry(entry: InternalEntry, foreground: boolean): void {
@@ -452,7 +482,12 @@ export class PreviewCache {
     this.revokeURL(url);
   }
   private revokeDecodedURL(entry: InternalEntry, url: string): void { if (entry.revokedUrls.has(url)) { entry.revokedUrls.delete(url); return; } this.revokeURL(url); }
-  private dropLeaseSources(predicate: (source: string) => boolean): void { for (const [scope, keys] of this.leases) { for (const key of [...keys]) { const source = key.slice(key.indexOf('\u0000') + 1); if (predicate(source)) keys.delete(key); } if (!keys.size) this.leases.delete(scope); } }
+  private retainLeaseKey(key: string): void { this.leaseRefs.set(key, (this.leaseRefs.get(key) ?? 0) + 1); }
+  private releaseLeaseKey(key: string): void { const count = this.leaseRefs.get(key) ?? 0; if (count <= 1) this.leaseRefs.delete(key); else this.leaseRefs.set(key, count - 1); }
+  private linkReadyMostRecent(entry: InternalEntry): void { this.unlinkReady(entry); entry.readyPrevious = this.readyTail; entry.readyNext = undefined; if (this.readyTail) this.readyTail.readyNext = entry; else this.readyHead = entry; this.readyTail = entry; }
+  private unlinkReady(entry: InternalEntry): void { const previous = entry.readyPrevious; const next = entry.readyNext; if (previous) previous.readyNext = next; else if (this.readyHead === entry) this.readyHead = next; if (next) next.readyPrevious = previous; else if (this.readyTail === entry) this.readyTail = previous; entry.readyPrevious = undefined; entry.readyNext = undefined; }
+  private dropLeaseKeys(removed: ReadonlySet<string>): void { for (const [scope, keys] of this.leases) { for (const key of [...keys]) if (removed.has(key)) { keys.delete(key); this.releaseLeaseKey(key); } if (!keys.size) this.leases.delete(scope); } }
+  private dropLeaseSources(predicate: (source: string) => boolean): void { const removed = new Set<string>(); for (const keys of this.leases.values()) for (const key of keys) if (predicate(key.slice(key.indexOf('\u0000') + 1))) removed.add(key); this.dropLeaseKeys(removed); }
 }
 
 export const PREVIEW_IMAGE_SELECTOR = PREVIEW_SELECTOR;

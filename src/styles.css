@@ -1264,3 +1264,7 @@ html[data-workspace="artist-mix"] .app-shell { padding-bottom: 0; }
 @media (max-width: 900px) {
   .mix-random-settings > .mix-behavior-toggles { grid-column: 1 / -1; justify-content: flex-start; }
 }
+
+.workspace-recovery { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--bg-deep); }
+.workspace-recovery > section { width: min(620px, 100%); padding: 30px; border: 1px solid var(--border); border-radius: 18px; background: var(--panel-raised); box-shadow: var(--shadow); }
+.workspace-recovery-detail { padding: 12px; border-radius: 10px; background: rgb(var(--danger-rgb) / 10%); color: var(--text-muted); overflow-wrap: anywhere; }

@@ -172,14 +172,26 @@ function resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative }) {
   } catch { /* missing or damaged component is not a usable base */ }
   return null;
 }
+function createBaseAssetResolver({ embeddedPath, catalogDir, cache = new Map() }) {
+  return relative => {
+    const key = String(relative || '');
+    if (cache.has(key)) return cache.get(key);
+    const value = resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative });
+    cache.set(key, value);
+    return value;
+  };
+}
 function cardId(card) { return String(card?.catalogId ?? card?.id ?? ''); }
 function cardSource(card) { return String(card?.sourceUrl ?? ''); }
 function overlayHasAsset(card, activeDirectory) {
   if (!activeDirectory || !validCardAsset(card?.image)) return false;
   try { return validWebpFile(contained(activeDirectory, card.image)); } catch { return false; }
 }
-function mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory } = {}) {
+function mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory, baseAssets } = {}) {
   if (!overlay || !Array.isArray(overlay.artists)) return embedded;
+  // Asset validation can hit disk. Cache only within this one synchronous merge
+  // pass so a later update never trusts an earlier filesystem observation.
+  const resolveBase = createBaseAssetResolver({ embeddedPath, catalogDir, cache: baseAssets });
   const cards = [];
   const byId = new Map();
   const bySource = new Map();
@@ -207,21 +219,21 @@ function mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDire
     const idMatch = id ? byId.get(id) : null;
     const sourceMatch = source ? bySource.get(source) : null;
     const sameBaseIdentity = Boolean(idMatch && sourceMatch && idMatch === sourceMatch && cardId(idMatch) === id && cardSource(idMatch) === source);
-    const baseAvailable = sameBaseIdentity && Boolean(resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: idMatch.image }));
+    const baseAvailable = sameBaseIdentity && Boolean(resolveBase(idMatch.image));
     const ownsAsset = overlayHasAsset(card, activeDirectory);
     // An embedded card may replace a runtime card only after its bytes have
     // been resolved and validated. Metadata alone is never proof of a base.
     if (sameBaseIdentity && baseAvailable) continue;
     // If the overlay has no usable bytes but the same-source base does, keep
     // the working base card. A valid overlay wins when it owns the asset.
-    if (idMatch && !ownsAsset && resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: idMatch.image })) continue;
-    if (sourceMatch && !ownsAsset && resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: sourceMatch.image })) continue;
+    if (idMatch && !ownsAsset && resolveBase(idMatch.image)) continue;
+    if (sourceMatch && !ownsAsset && resolveBase(sourceMatch.image)) continue;
     add(card);
   }
   return { ...embedded, ...overlay, artists: cards, characters: embedded.characters || [], tags: overlay.tags || embedded.tags || [] };
 }
-function loadCatalog({ embeddedPath, catalogDir }) {
-  const embedded = readJson(embeddedPath, { version: 2, artists: [], characters: [], tags: [] });
+function loadCatalog({ embeddedPath, catalogDir, embedded: suppliedEmbedded, baseAssets }) {
+  const embedded = suppliedEmbedded ?? readJson(embeddedPath, { version: 2, artists: [], characters: [], tags: [] });
   const active = activeGeneration(catalogDir);
   let overlay = null;
   if (active) {
@@ -230,7 +242,7 @@ function loadCatalog({ embeddedPath, catalogDir }) {
     catch { throw new Error('Invalid active catalog generation catalog'); }
     if (!overlay || typeof overlay !== 'object' || !Array.isArray(overlay.artists)) throw new Error('Invalid active catalog generation catalog');
   }
-  return mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory: active?.directory });
+  return mergedCatalog(embedded, overlay, { catalogDir, embeddedPath, activeDirectory: active?.directory, baseAssets: baseAssets ?? new Map() });
 }
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -303,7 +315,11 @@ function validateCardResponse(response, expectedUrl) {
 async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, onProgress = () => {} }) {
   const progress = createProgressReporter(onProgress);
   const embedded = readJson(embeddedPath, { version: 2, artists: [], characters: [], tags: [] });
-  const old = loadCatalog({ embeddedPath, catalogDir });
+  // The map belongs to this update only: it avoids repeated probes of the
+  // same immutable base asset while never carrying trust across operations.
+  const baseAssets = new Map();
+  const resolveBase = createBaseAssetResolver({ embeddedPath, catalogDir, cache: baseAssets });
+  const old = loadCatalog({ embeddedPath, catalogDir, embedded, baseAssets });
   let discovered;
   try { discovered = await discoverCards(fetchImpl, signal, progress); }
   catch (error) { progress.stop(); throw error; }
@@ -359,7 +375,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       const embeddedId = cardId(embeddedExact);
       const runtimeId = exact?.runtime ? cardId(exact) : '';
       const embeddedBaseAvailable = embeddedExact
-        ? Boolean(resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative: embeddedExact.image }))
+        ? Boolean(resolveBase(embeddedExact.image))
         : false;
       const canPruneRuntime = Boolean(embeddedExact && embeddedBaseAvailable && (!runtimeId || runtimeId === embeddedId));
       if (embeddedExact && canPruneRuntime) {
@@ -446,7 +462,7 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
     await fsp.rename(pointerTemp, contained(catalogDir, 'active.json'));
     progress({ phase: 'commit', completed: 1, total: 1, added, changed, message: 'Catalog generation active' });
     progress({ phase: 'complete', completed: discovered.length, total: discovered.length, added, changed, message: `+${added} artists` });
-    return { catalog: loadCatalog({ embeddedPath, catalogDir }), added, changed };
+    return { catalog: loadCatalog({ embeddedPath, catalogDir, embedded, baseAssets }), added, changed };
   } catch (error) {
     if (!renamed) {
       try { await fsp.rm(stage, { recursive: true, force: true }); } catch { /* keep old generation active */ }

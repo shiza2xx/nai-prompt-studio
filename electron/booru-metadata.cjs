@@ -13,21 +13,24 @@ const SITE_CONFIG = {
     api: id => `https://danbooru.donmai.us/posts/${id}.json`, apiPath: /^\/posts\/\d+\.json$/,
     apiQuery: url => url.search === '',
     imageHosts: new Set(['cdn.donmai.us', 'danbooru.donmai.us', 'static.donmai.us', 'images.donmai.us']),
-    imageFields: ['large_file_url', 'file_url', 'preview_file_url']
+    // Preserve the original post bytes whenever the API exposes them.
+    // Large/sample/preview variants are display-oriented fallbacks and may
+    // be lower-resolution recompressed JPEGs.
+    imageFields: ['file_url', 'large_file_url', 'preview_file_url']
   },
   konachan: {
     label: 'Konachan', host: 'konachan.com', pagePath: /^\/post\/show\/(\d+)\/?$/,
     api: id => `https://konachan.com/post.json?tags=id:${id}`, apiPath: /^\/post\.json$/,
     apiQuery: url => url.searchParams.getAll('tags').length === 1 && /^id:\d+$/.test(url.searchParams.get('tags') || '') && [...url.searchParams.keys()].length === 1,
     imageHosts: new Set(['konachan.com', 'img.konachan.com', 'images.konachan.com']),
-    imageFields: ['sample_url', 'jpeg_url', 'file_url', 'preview_url']
+    imageFields: ['file_url', 'jpeg_url', 'sample_url', 'preview_url']
   },
   safebooru: {
     label: 'Safebooru', host: 'safebooru.org', pagePath: /^\/index\.php$/,
     api: id => `https://safebooru.org/index.php?page=dapi&s=post&q=index&id=${id}&json=1`, apiPath: /^\/index\.php$/,
     apiQuery: url => { const keys = [...url.searchParams.keys()]; return keys.length === 5 && new Set(keys).size === 5 && url.searchParams.get('page') === 'dapi' && url.searchParams.get('s') === 'post' && url.searchParams.get('q') === 'index' && /^\d+$/.test(url.searchParams.get('id') || '') && url.searchParams.get('json') === '1'; },
     imageHosts: new Set(['safebooru.org', 'img.safebooru.org', 'images.safebooru.org']),
-    imageFields: ['sample_url', 'image', 'file_url', 'preview_url']
+    imageFields: ['file_url', 'image', 'sample_url', 'preview_url']
   }
 };
 

@@ -1,15 +1,20 @@
 {
   "name": "nai-prompt-studio",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
   "description": "Local Windows prompt studio for NovelAI artist workflows and image metadata.",
   "author": "shiza2xx",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/shiza2xx/nai-prompt-studio.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shiza2xx/nai-prompt-studio.git"
+  },
   "homepage": "https://github.com/shiza2xx/nai-prompt-studio",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "node tools/start-desktop-dev.mjs",
     "web:dev": "node tools/run-local.mjs node node_modules/vite/bin/vite.js",
@@ -18,12 +23,13 @@
     "desktop:build": "node tools/run-local.mjs node tools/build-desktop.mjs",
     "preview": "node tools/run-local.mjs node node_modules/vite/bin/vite.js preview",
     "catalog:update:v5": "node tools/run-local.mjs node tools/update-v5-catalog.mjs",
-    "test": "node tools/run-local.mjs node --experimental-strip-types tools/tests.mjs",
+    "test": "node tools/run-local.mjs node tools/test-runner.mjs",
     "installer:proof": "node tools/run-local.mjs node tools/installer-proof/build-and-run-proof.mjs",
     "import:guide-examples": "node tools/run-local.mjs node tools/import-hothottuk-guide.mjs",
     "release:manifest": "node tools/run-local.mjs node tools/generate-release-manifest.mjs",
     "release:catalog-packs": "node tools/run-local.mjs node tools/catalog-packs.mjs",
-    "catalog:hydrate": "node tools/run-local.mjs node tools/hydrate-catalog.mjs"
+    "catalog:hydrate": "node tools/run-local.mjs node tools/hydrate-catalog.mjs",
+    "release:preflight": "node tools/run-local.mjs node tools/release-preflight.mjs"
   },
   "dependencies": {
     "@electron/asar": "^3.4.1"
@@ -60,6 +66,7 @@
   "devDependencies": {
     "electron": "^40.2.1",
     "electron-builder": "^26.0.12",
+    "happy-dom": "^18.0.1",
     "typescript": "^5.9.2",
     "vite": "^7.1.7"
   },

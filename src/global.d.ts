@@ -1,8 +1,6 @@
 import type { AppSettings, ArtistMixDraft, CustomTag, CustomTagPackResult, CustomTagPreset, OfflineCatalog, PromptDraft, PromptSet, SavedLibraryItem } from './types';
 
-interface DesktopStorageSnapshot {
-  exists: boolean;
-  data: {
+interface DesktopStorageData {
     version: number;
     sets: PromptSet[];
     savedLibrary?: SavedLibraryItem[];
@@ -14,13 +12,18 @@ interface DesktopStorageSnapshot {
     customTagLibrary?: CustomTagLibrarySnapshot;
     settings?: AppSettings;
     artistMix?: ArtistMixDraft;
-  };
 }
+type DesktopStorageSnapshot =
+  | { state: 'missing'; exists: false; data: DesktopStorageData }
+  | { state: 'ready'; exists: true; data: DesktopStorageData }
+  | { state: 'error'; exists: true; error: string };
 
 interface NAIStorageBridge {
   load(): DesktopStorageSnapshot;
-  save(section: 'sets' | 'savedLibrary' | 'favorites' | 'characterFavorites' | 'draft' | 'customTags' | 'customTagPresets' | 'settings' | 'artistMix', value: PromptSet[] | SavedLibraryItem[] | string[] | PromptDraft | CustomTag[] | CustomTagPreset[] | AppSettings | ArtistMixDraft): void;
-  saveSync(section: 'sets' | 'savedLibrary' | 'favorites' | 'characterFavorites' | 'draft' | 'customTags' | 'customTagPresets' | 'settings' | 'artistMix', value: PromptSet[] | SavedLibraryItem[] | string[] | PromptDraft | CustomTag[] | CustomTagPreset[] | AppSettings | ArtistMixDraft): boolean;
+  retryLoad?(): DesktopStorageSnapshot;
+  openProfileFolder?(): Promise<boolean>;
+  save<K extends keyof DesktopStorageSectionMap>(section: K, value: DesktopStorageSectionMap[K]): void;
+  saveSync<K extends keyof DesktopStorageSectionMap>(section: K, value: DesktopStorageSectionMap[K]): boolean;
   transactCustomTags?(operation: CustomTagLibraryOperation, payload: object, bytes?: Uint8Array): Promise<CustomTagLibrarySnapshot>;
   importCustomTags?(): Promise<CustomTagPackResult>;
   importCustomTagsPath?(filePath: string): Promise<CustomTagPackResult>;
@@ -28,6 +31,16 @@ interface NAIStorageBridge {
   getPathForFile?(file: File): string;
   saveLibraryImage?(metadata: { id: string; mime?: SavedLibraryItem['mime']; originalName?: string }, bytes: Uint8Array): Promise<{ imageAsset: string; mime?: SavedLibraryItem['mime']; originalName?: string }>;
   deleteLibraryImage?(imageAsset: string): Promise<boolean>;
+}
+
+interface DesktopStorageSectionMap {
+  sets: PromptSet[];
+  savedLibrary: SavedLibraryItem[];
+  favorites: string[];
+  characterFavorites: string[];
+  draft: PromptDraft | null;
+  settings: AppSettings;
+  artistMix: ArtistMixDraft;
 }
 
 interface MetadataPostResult {

@@ -1,5 +1,6 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { mixCompanionCapacity } from './artist-mix-layout.ts';
+import { MAX_PROMPT_RANDOM_ARTISTS } from './random.ts';
 import { CUSTOM_TAG_MAX_LENGTH, type AnimationMode, type AppSettings, type ArtistMixDraft, type CustomTag, type CustomTagPackResult, type CustomTagPreset, type PreviewCachePreset, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedLibraryItem, type SavedPromptData, type SavedPromptItem, type SavedPromptSnapshot, type StudioTheme, type WeightedTag } from './types.ts';
 
 export type FavoriteKind = 'artists' | 'characters';
@@ -21,7 +22,7 @@ function normalizeArtistWeight(value: unknown): number {
   return Number(Math.max(0.1, Math.min(2, Math.round(source * 10) / 10)).toFixed(1));
 }
 
-type DesktopSnapshot = { exists?: boolean; data?: { version?: number; sets?: PromptSet[]; savedLibrary?: unknown; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[]; customTagLibrary?: { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } } };
+type DesktopSnapshot = { state?: 'missing' | 'ready' | 'error'; exists?: boolean; error?: string; data?: { version?: number; sets?: PromptSet[]; savedLibrary?: unknown; favorites?: string[]; characterFavorites?: string[]; draft?: unknown; settings?: unknown; artistMix?: unknown; customTags?: CustomTag[]; customTagPresets?: CustomTagPreset[]; customTagLibrary?: { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } } };
 
 function bridge(): typeof window.naiStorage | undefined {
   try { return typeof window === 'undefined' ? undefined : window.naiStorage; } catch { return undefined; }
@@ -44,6 +45,10 @@ const desktopSnapshot: DesktopSnapshot = (() => {
   try { return bridge()?.load() as DesktopSnapshot ?? {}; } catch { return {}; }
 })();
 let cachedCustomTagPresets: CustomTagPreset[] | null = null;
+
+export function workspaceRecoveryError(): string {
+  return desktopSnapshot.state === 'error' ? (desktopSnapshot.error || 'The workspace file needs recovery before it can be opened.') : '';
+}
 
 export function loadCustomTagLibraryWarning(): string { return desktopSnapshot.data?.customTagLibrary?.warning ?? ''; }
 
@@ -301,14 +306,14 @@ export function saveFavorites(favorites: Set<string>, kind: FavoriteKind = 'arti
   bridge()?.save(kind === 'characters' ? 'characterFavorites' : 'favorites', values);
 }
 
-/** Normalize the persisted count range without imposing a catalog-size cap. */
+/** Normalize persisted replacement counts to the Prompt Builder safety cap. */
 export function normalizeRandomRange(value: unknown): { min: number; max: number } {
   const source = value && typeof value === 'object' ? value as { min?: unknown; max?: unknown } : {};
   const rawMin = Number(source.min);
   const rawMax = Number(source.max);
-  const min = Math.max(2, Number.isFinite(rawMin) ? Math.round(rawMin) : 2);
+  const min = Math.min(MAX_PROMPT_RANDOM_ARTISTS, Math.max(2, Number.isFinite(rawMin) ? Math.round(rawMin) : 2));
   const requestedMax = Number.isFinite(rawMax) ? Math.round(rawMax) : 5;
-  return { min, max: Math.max(min, requestedMax) };
+  return { min, max: Math.min(MAX_PROMPT_RANDOM_ARTISTS, Math.max(min, requestedMax)) };
 }
 
 export function normalizeAnimationMode(value: unknown): AnimationMode {

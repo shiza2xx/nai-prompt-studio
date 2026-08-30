@@ -1,6 +1,6 @@
 import { bindArtistCardPreview } from './artist-card-preview';
 import { extractImageMetadata, type ImageMetadata, type MetadataCharacter } from './image-metadata';
-import { escapeMetadataHtml, extractMetadataArtists, MetadataArtistHighlighter, serializeMetadataArtists } from './metadata-artist-highlight';
+import { escapeMetadataHtml, MetadataArtistHighlighter, serializeMetadataArtists } from './metadata-artist-highlight';
 import { metadataTagPopoverPlacement, type MetadataTagRect } from './metadata-tag-placement';
 import { dispatchMetadataTagSave, type MetadataTagCategory, type MetadataTagSaveHandler } from './metadata-tag-save';
 import { createMetadataDisplayPreview } from './metadata-display-preview';
@@ -566,7 +566,7 @@ export class MetadataWorkspace {
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const mime: MetadataSavePayload['preview']['mime'] = bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP' ? 'image/webp' : 'image/png';
-      const result = await extractImageMetadata(file);
+      const result = await extractImageMetadata(file, bytes);
       if (request !== this.readToken) return;
       const displayBlob = await createMetadataDisplayPreview(new Blob([bytes], { type: mime }));
       if (request !== this.readToken) return;
@@ -666,7 +666,7 @@ export class MetadataWorkspace {
     if (!this.result) return null;
     const catalog = this.catalogArtists();
     if (catalog === this.cachedArtistMixCatalog && this.cachedArtistMix !== undefined) return this.cachedArtistMix;
-    const artists = extractMetadataArtists(this.result.base.positive, catalog);
+    const artists = this.artistHighlighter().extract(this.result.base.positive);
     this.cachedArtistMixCatalog = catalog;
     this.cachedArtistMix = artists.length ? { artists, serializedPrompt: serializeMetadataArtists(artists) } : null;
     return this.cachedArtistMix;

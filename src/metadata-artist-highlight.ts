@@ -33,11 +33,10 @@ function artistName(value: string): string {
 
 /** A structured, DOM-free artist extraction API for Metadata saves. */
 export function extractMetadataArtists(basePositive: string, cards: readonly CatalogCard[]): WeightedTag[] {
-  const catalog = new Map<string, CatalogCard>();
-  for (const card of cards) {
-    const key = artistKey(artistName(card.tag));
-    if (key && !catalog.has(key)) catalog.set(key, card);
-  }
+  return new MetadataArtistHighlighter(cards).extract(basePositive);
+}
+
+function extractArtists(basePositive: string, catalog: ReadonlyMap<string, CatalogCard>, matcher: RegExp | null): WeightedTag[] {
   const found: WeightedTag[] = [];
   const foundByIdentity = new Map<string, { index: number; authority: number; position: number }>();
   const add = (name: string, weight: number, authority: number, position: number, card?: CatalogCard): void => {
@@ -85,12 +84,15 @@ export function extractMetadataArtists(basePositive: string, cards: readonly Cat
     const name = match[1].trim();
     add(name, 1, 1, match.index, catalog.get(artistKey(name)));
   }
-  // Known names may occur as ordinary positive tags. Boundary matching avoids substrings.
-  const normalized = normalizePrompt(basePositive);
-  for (const [key, card] of catalog) {
-    const pattern = new RegExp(`(?<!${WORD_CHARACTER})${namePattern(normalizeName(artistName(card.tag)))}(?!${WORD_CHARACTER})`, 'giu');
-    if (pattern.test(normalized.text)) add(card.tag, 1, 0, basePositive.length, card);
+  // Match ordinary known tags with the retained combined matcher, then retain
+  // the legacy catalog-order insertion semantics when adding their records.
+  const ordinaryMatches = new Set<string>();
+  if (matcher) {
+    const normalized = normalizePrompt(basePositive).text;
+    matcher.lastIndex = 0;
+    for (let match = matcher.exec(normalized); match; match = matcher.exec(normalized)) ordinaryMatches.add(artistKey(match[0]));
   }
+  for (const [key, card] of catalog) if (ordinaryMatches.has(key)) add(card.tag, 1, 0, basePositive.length, card);
   return found
     .map(item => ({ item, position: foundByIdentity.get(item.id)?.position ?? basePositive.length }))
     .sort((left, right) => left.position - right.position)
@@ -151,11 +153,16 @@ interface ExplicitArtistCandidate {
  */
 export class MetadataArtistHighlighter {
   private readonly matchesByKey = new Map<string, ArtistMatch>();
+  private readonly catalogByKey = new Map<string, CatalogCard>();
   private readonly matcher: RegExp | null;
   private readonly imageResolver: (card: CatalogCard) => string;
 
   constructor(cards: readonly CatalogCard[], imageResolver: (card: CatalogCard) => string = card => `./catalog/${card.image}`) {
     this.imageResolver = imageResolver;
+    for (const card of cards) {
+      const key = artistKey(artistName(card.tag));
+      if (key && !this.catalogByKey.has(key)) this.catalogByKey.set(key, card);
+    }
     const matches = cards
       .map(card => ({ card, normalizedName: normalizeName(card.tag) }))
       .filter((item): item is ArtistMatch => Boolean(item.normalizedName))
@@ -167,6 +174,11 @@ export class MetadataArtistHighlighter {
     }
     const patterns = [...this.matchesByKey.values()].map(match => namePattern(match.normalizedName));
     this.matcher = patterns.length ? new RegExp(`(?<!${WORD_CHARACTER})(?:${patterns.join('|')})(?!${WORD_CHARACTER})`, 'gu') : null;
+  }
+
+  /** Reuse the retained catalog index for Metadata save extraction. */
+  extract(basePositive: string): WeightedTag[] {
+    return extractArtists(basePositive, this.catalogByKey, this.matcher);
   }
 
   render(prompt: string): string {

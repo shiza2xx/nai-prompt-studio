@@ -134,16 +134,17 @@ function decodeJson(bytes, label) {
   } catch (error) { if (String(error.message).startsWith('Invalid .naipack:')) throw error; fail(`malformed ${label}`); }
 }
 
-function readArchiveFile(archivePath, name, maxBytes) {
-  let info;
-  try { info = asar.statFile(archivePath, name, false); } catch { fail(`missing ${name}`); }
+function readArchiveFile(context, name, maxBytes, { retain = name === 'pack.json' || name === 'manifest.json' } = {}) {
+  const info = context.files.get(name);
+  if (!info) fail(`missing ${name}`);
   if (!isRecord(info) || own(info, 'link') || own(info, 'files') || info.unpacked || !Number.isSafeInteger(info.size) || info.size < 0 || info.size > maxBytes || typeof info.offset !== 'string' || !/^\d+$/.test(info.offset) || !Number.isSafeInteger(Number(info.offset))) fail(`unsafe ${name} size or type`);
-  const archiveSize = fs.statSync(archivePath).size; const headerSize = (() => { const fd = fs.openSync(archivePath, 'r'); try { const prefix = Buffer.alloc(8); fs.readSync(fd, prefix, 0, 8, 0); return prefix.readUInt32LE(4); } finally { fs.closeSync(fd); } })();
-  if (8 + headerSize + Number(info.offset) + info.size > archiveSize) fail(`unsafe ${name} data range`);
+  if (8 + context.headerSize + Number(info.offset) + info.size > context.archiveSize) fail(`unsafe ${name} data range`);
+  const cached = context.extracted.get(name);
+  if (cached) return cached;
   // Keep extraction explicitly non-following even after the header walk.  This
   // is defense in depth for ASAR's default followLinks=true behavior and keeps
   // the trust boundary independent of a future header/API change.
-  let bytes; try { bytes = asar.extractFile(archivePath, name, false); } catch { fail(`cannot read ${name}`); }
+  let bytes; try { bytes = asar.extractFile(context.archivePath, name, false); } catch { fail(`cannot read ${name}`); }
   if (!Buffer.isBuffer(bytes) || bytes.length !== info.size || bytes.length > maxBytes) fail(`invalid ${name} payload`);
   if (info.integrity) {
     const blockSize = info.integrity.blockSize;
@@ -155,6 +156,7 @@ function readArchiveFile(archivePath, name, maxBytes) {
       if (info.integrity.blocks[index] !== sha256(bytes.subarray(offset, Math.min(bytes.length, offset + blockSize)))) fail(`ASAR block integrity mismatch for ${name}`);
     }
   }
+  if (retain) context.extracted.set(name, bytes);
   return bytes;
 }
 
@@ -178,6 +180,7 @@ function validatePackArchive(archivePath, { stagingDir } = {}) {
     files.set(normalized, entry.node);
   }
   if (!files.has('pack.json') || !files.has('manifest.json')) fail('pack.json and manifest.json are required');
+  const context = { archivePath, archiveSize: stat.size, headerSize: header.headerSize, files, extracted: new Map() };
   const dataEntries = [...files.entries()].map(([name, info]) => {
     if (!isRecord(info) || !Number.isSafeInteger(info.size) || info.size < 0 || typeof info.offset !== 'string' || !/^\d+$/.test(info.offset) || !Number.isSafeInteger(Number(info.offset))) fail(`unsafe ${name} size or offset`);
     return { name, offset: Number(info.offset), size: info.size };
@@ -185,9 +188,9 @@ function validatePackArchive(archivePath, { stagingDir } = {}) {
   let dataOffset = 0;
   for (const entry of dataEntries) { if (entry.offset !== dataOffset) fail('malformed ASAR data layout'); dataOffset += entry.size; }
   if (8 + header.headerSize + dataOffset !== stat.size) fail('malformed ASAR trailing data');
-  const packBytes = readArchiveFile(archivePath, 'pack.json', MAX_MANIFEST_BYTES); const pack = decodeJson(packBytes, 'pack.json');
+  const packBytes = readArchiveFile(context, 'pack.json', MAX_MANIFEST_BYTES); const pack = decodeJson(packBytes, 'pack.json');
   if (!exactKeys(pack, ['format', 'schemaVersion', 'manifestSha256', 'cardCount', 'totalPreviewBytes']) || pack.format !== PACK_FORMAT || pack.schemaVersion !== PACK_SCHEMA_VERSION || !HASH.test(pack.manifestSha256) || !Number.isSafeInteger(pack.cardCount) || pack.cardCount < 0 || pack.cardCount > MAX_CARDS || !Number.isSafeInteger(pack.totalPreviewBytes) || pack.totalPreviewBytes < 0 || pack.totalPreviewBytes > MAX_TOTAL_PREVIEW_BYTES) fail('invalid pack metadata');
-  const manifestBytes = readArchiveFile(archivePath, 'manifest.json', MAX_MANIFEST_BYTES); if (sha256(manifestBytes) !== pack.manifestSha256) fail('manifest digest mismatch');
+  const manifestBytes = readArchiveFile(context, 'manifest.json', MAX_MANIFEST_BYTES); if (sha256(manifestBytes) !== pack.manifestSha256) fail('manifest digest mismatch');
   const manifest = validateManifestObject(decodeJson(manifestBytes, 'manifest.json')); if (manifest.cards.length !== pack.cardCount) fail('card count mismatch');
   const refs = new Map(); let totalPreviewBytes = 0;
   for (const card of manifest.cards) if (card.preview) {
@@ -197,26 +200,26 @@ function validatePackArchive(archivePath, { stagingDir } = {}) {
     if (existing && (existing.mime !== card.preview.mime || existing.bytes !== card.preview.bytes || existing.sha256 !== card.preview.sha256)) fail('conflicting shared preview metadata');
     refs.set(card.preview.file, card.preview);
   }
-  if (hasPreviewDirectory !== (refs.size > 0)) fail('preview directory does not match manifest references');
-  for (const [ref, preview] of refs) {
-    const bytes = readArchiveFile(archivePath, ref, MAX_PREVIEW_BYTES);
-    if (bytes.length !== preview.bytes || sha256(bytes) !== preview.sha256) fail('preview size or digest mismatch');
-    try { validateImagePayload(bytes, preview.mime); } catch { fail('preview MIME or image signature mismatch'); }
-    totalPreviewBytes += bytes.length; if (totalPreviewBytes > MAX_TOTAL_PREVIEW_BYTES) fail('previews exceed 512 MiB');
-  }
-  if (totalPreviewBytes !== pack.totalPreviewBytes) fail('preview byte total mismatch');
-  for (const file of files.keys()) if (file.startsWith('previews/') && !refs.has(file)) fail('unreferenced preview entry');
   let stage = null;
-  if (stagingDir) {
-    fs.mkdirSync(stagingDir, { recursive: true });
-    const parentStat = fs.lstatSync(stagingDir); if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) fail('staging directory is unsafe');
-    stage = fs.mkdtempSync(path.join(path.resolve(stagingDir), '.naipack-'));
-    try {
+  try {
+    if (hasPreviewDirectory !== (refs.size > 0)) fail('preview directory does not match manifest references');
+    if (stagingDir) {
+      fs.mkdirSync(stagingDir, { recursive: true });
+      const parentStat = fs.lstatSync(stagingDir); if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) fail('staging directory is unsafe');
+      stage = fs.mkdtempSync(path.join(path.resolve(stagingDir), '.naipack-'));
       fs.writeFileSync(path.join(stage, 'pack.json'), packBytes, { flag: 'wx' }); fs.writeFileSync(path.join(stage, 'manifest.json'), manifestBytes, { flag: 'wx' });
       if (refs.size) fs.mkdirSync(path.join(stage, 'previews'), { recursive: false });
-      for (const ref of refs.keys()) { const target = path.join(stage, ref.replace('/', path.sep)); fs.writeFileSync(target, readArchiveFile(archivePath, ref, MAX_PREVIEW_BYTES), { flag: 'wx' }); }
-    } catch (error) { try { fs.rmSync(stage, { recursive: true, force: true }); } catch {} throw error; }
-  }
+    }
+    for (const [ref, preview] of refs) {
+      const bytes = readArchiveFile(context, ref, MAX_PREVIEW_BYTES, { retain: false });
+      if (bytes.length !== preview.bytes || sha256(bytes) !== preview.sha256) fail('preview size or digest mismatch');
+      try { validateImagePayload(bytes, preview.mime); } catch { fail('preview MIME or image signature mismatch'); }
+      totalPreviewBytes += bytes.length; if (totalPreviewBytes > MAX_TOTAL_PREVIEW_BYTES) fail('previews exceed 512 MiB');
+      if (stage) fs.writeFileSync(path.join(stage, ref.replace('/', path.sep)), bytes, { flag: 'wx' });
+    }
+    if (totalPreviewBytes !== pack.totalPreviewBytes) fail('preview byte total mismatch');
+    for (const file of files.keys()) if (file.startsWith('previews/') && !refs.has(file)) fail('unreferenced preview entry');
+  } catch (error) { if (stage) { try { fs.rmSync(stage, { recursive: true, force: true }); } catch {} } throw error; }
   return { pack, manifest, previews: refs, archivePath: path.resolve(archivePath), stage };
 }
 

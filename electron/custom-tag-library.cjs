@@ -20,6 +20,8 @@ function stable(value) {
   return JSON.stringify(value);
 }
 function digestMirror(presets, tags) { return sha256(Buffer.from(stable({ customTagPresets: presets, customTags: tags }))); }
+function manifestDocument(item) { return { format: FORMAT, schemaVersion: VERSION, preset: item.preset, cardOrder: item.cards.map(card => card.id), cards: item.cards }; }
+function digestPreset(item) { return sha256(Buffer.from(stable(manifestDocument(item)))); }
 function timestamp(value, fallback) { const parsed = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback; }
 function cleanName(value, limit) { return String(value ?? '').trim().replace(/\s+/g, ' ').slice(0, limit); }
 function safeId(value) { const result = String(value ?? '').trim(); return ID.test(result) ? result : ''; }
@@ -96,6 +98,13 @@ function validateIndex(value, expectedOrder) {
   if (!Array.isArray(value.presetOrder) || !value.presetOrder.length || value.presetOrder.some(id => !strictId(id)) || new Set(value.presetOrder).size !== value.presetOrder.length) throw new Error('Invalid preset order');
   if (expectedOrder && JSON.stringify(value.presetOrder) !== JSON.stringify(expectedOrder)) throw new Error('Custom tag index order mismatch');
   if (typeof value.mirrorDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.mirrorDigest) || !strictTimestamp(value.updatedAt) || (value.warning != null && typeof value.warning !== 'string')) throw new Error('Invalid custom tag index metadata');
+  if (value.presetState != null) {
+    if (!value.presetState || typeof value.presetState !== 'object' || Array.isArray(value.presetState) || Object.keys(value.presetState).some(id => !strictId(id) || !value.presetOrder.includes(id))) throw new Error('Invalid custom tag preset state');
+    for (const id of value.presetOrder) {
+      const state = value.presetState[id];
+      if (!state || !Number.isSafeInteger(state.revision) || state.revision <= 0 || typeof state.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(state.sha256)) throw new Error('Invalid custom tag preset state');
+    }
+  }
   return value;
 }
 function canonicalPath(value) { const normalized = path.normalize(path.resolve(value)); return process.platform === 'win32' ? normalized.toLocaleLowerCase() : normalized; }
@@ -234,7 +243,16 @@ function legacyReadOnlySnapshot(legacy, customTagsDir, now, reason) {
 
 class CustomTagLibrary {
   constructor({ customTagsDir, workspaceFile, now = () => new Date().toISOString(), failpoint = null }) {
-    this.customTagsDir = path.resolve(customTagsDir); this.workspaceFile = path.resolve(workspaceFile); this.root = path.join(this.customTagsDir, 'library-v1'); this.now = now; this.failpoint = failpoint;
+    this.customTagsDir = path.resolve(customTagsDir); this.workspaceFile = path.resolve(workspaceFile); this.root = path.join(this.customTagsDir, 'library-v1'); this.now = now; this.failpoint = failpoint; this.previewReferenceIndex = null; this.runtimeCanonical = null;
+  }
+  invalidatePreviewReferenceIndex() { this.previewReferenceIndex = null; }
+  previewReferences() {
+    if (this.previewReferenceIndex) return this.previewReferenceIndex;
+    const index = new Map();
+    const canonical = this.readCanonical();
+    for (const manifest of canonical.manifests) for (const card of manifest.cards) if (card.preview) index.set(`${manifest.preset.id}\u0000${card.preview.file}`, true);
+    this.previewReferenceIndex = index;
+    return index;
   }
   hit(name) { if (this.failpoint) this.failpoint(name); }
   indexFile() { return path.join(this.root, 'index.json'); }
@@ -248,7 +266,33 @@ class CustomTagLibrary {
     if (manifests[0].preset.id !== DEFAULT_PRESET_ID) throw new Error('Default preset must be first');
     const [presets, tags] = this.compatibilityArrays(manifests);
     if (index.mirrorDigest !== digestMirror(presets, tags) && !preservedDamagedLegacyMirror(index)) throw new Error('Custom tag index mirror digest mismatch');
-    return { index, manifests };
+    const computedState = Object.fromEntries(manifests.map(item => [item.preset.id, { revision: index.presetState?.[item.preset.id]?.revision ?? 1, sha256: digestPreset(item) }]));
+    const presetStateCurrent = index.presetState && index.presetOrder.every(id => index.presetState[id]?.sha256 === computedState[id].sha256);
+    const normalizedIndex = presetStateCurrent ? index : { ...index, presetState: computedState, updatedAt: this.now() };
+    if (!presetStateCurrent && canonicalPath(this.root) === canonicalPath(path.join(this.customTagsDir, 'library-v1'))) atomicJson(this.indexFile(), normalizedIndex);
+    const canonical = { index: normalizedIndex, manifests };
+    this.retainCanonical(canonical);
+    return canonical;
+  }
+  retainCanonical(canonical) {
+    const cardIndex = new Map(); const semanticIndex = new Map(); const previewRefs = new Map(); const manifestSignatures = new Map();
+    for (const item of canonical.manifests) { const stat = fs.statSync(this.manifestFile(item.preset.id)); manifestSignatures.set(item.preset.id, `${stat.size}:${stat.mtimeMs}`); }
+    for (const item of canonical.manifests) for (const card of item.cards) {
+      cardIndex.set(card.id, { presetId: item.preset.id, card });
+      semanticIndex.set(semanticIdentity(card), card.id);
+      if (card.preview) previewRefs.set(`${item.preset.id}\u0000${card.preview.file}`, true);
+    }
+    this.runtimeCanonical = { index: canonical.index, manifests: canonical.manifests, cardIndex, semanticIndex, previewRefs, manifestSignatures };
+  }
+  transactionCanonical() {
+    if (!this.runtimeCanonical) { this.readCanonical(); return this.runtimeCanonical; }
+    let index;
+    try { index = validateIndex(readJson(this.indexFile())); } catch { this.readCanonical(); return this.runtimeCanonical; }
+    if (stable(index.presetOrder) !== stable(this.runtimeCanonical.index.presetOrder) || stable(index.presetState) !== stable(this.runtimeCanonical.index.presetState) || index.mirrorDigest !== this.runtimeCanonical.index.mirrorDigest) { this.readCanonical(); return this.runtimeCanonical; }
+    try {
+      for (const id of index.presetOrder) { const stat = fs.statSync(this.manifestFile(id)); if (this.runtimeCanonical.manifestSignatures.get(id) !== `${stat.size}:${stat.mtimeMs}`) { this.readCanonical(); return this.runtimeCanonical; } }
+    } catch { this.readCanonical(); return this.runtimeCanonical; }
+    return this.runtimeCanonical;
   }
   readLegacy() {
     if (!fs.existsSync(this.workspaceFile)) return { exists: false, valid: true, workspace: {}, presets: [], tags: [] };
@@ -285,16 +329,19 @@ class CustomTagLibrary {
   }
   writeTree(root, manifests, mirrorDigestValue = '', warning = '') {
     for (const item of manifests) { const file = this.manifestFile(item.preset.id, root); ensureContainedDirectory(root, path.dirname(file)); atomicJson(file, { format: FORMAT, schemaVersion: VERSION, preset: item.preset, cardOrder: item.cards.map(card => card.id), cards: item.cards }); }
-    atomicJson(path.join(root, 'index.json'), { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), mirrorDigest: mirrorDigestValue, updatedAt: this.now(), ...(warning ? { warning } : {}) });
+    atomicJson(path.join(root, 'index.json'), { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), presetState: Object.fromEntries(manifests.map(item => [item.preset.id, { revision: 1, sha256: digestPreset(item) }])), mirrorDigest: mirrorDigestValue, updatedAt: this.now(), ...(warning ? { warning } : {}) });
   }
   migrate(legacy) {
+    this.invalidatePreviewReferenceIndex();
     const stage = path.join(this.customTagsDir, `.library-v1-stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`); fs.mkdirSync(stage, { recursive: false });
     try { const migration = this.migrationManifests(legacy, stage); const warnings = []; if (migration.skipped) warnings.push(`${migration.skipped} damaged legacy Custom Tags record${migration.skipped === 1 ? '' : 's'} could not be migrated; the legacy mirror was preserved.`); if (migration.normalized) warnings.push(`${migration.normalized} legacy Custom Tags record group${migration.normalized === 1 ? '' : 's'} required safe schema normalization.`); const warning = warnings.join(' '); const mirrorDigest = migration.skipped ? digestMirror(legacy.presets, legacy.tags) : digestMirror(...this.compatibilityArrays(migration.manifests)); this.writeTree(stage, migration.manifests, mirrorDigest, warning); this.hit('migration:staged'); this.validateTree(stage); fs.renameSync(stage, this.root); this.hit('migration:activated'); return { ...this.readCanonical(), skipped: migration.skipped }; }
     catch (error) { try { fs.rmSync(stage, { recursive: true, force: true }); } catch {} throw error; }
   }
   validateTree(root) { const previous = this.root; this.root = root; try { return this.readCanonical(); } finally { this.root = previous; } }
   replayJournal() {
+    this.invalidatePreviewReferenceIndex();
     if (!fs.existsSync(this.journalFile())) return;
+    this.runtimeCanonical = null;
     const journal = readJson(this.journalFile()); if (!journal || journal.format !== FORMAT || journal.schemaVersion !== VERSION || typeof journal.operationId !== 'string' || !/^[a-f0-9-]{36}$/i.test(journal.operationId) || !Array.isArray(journal.manifests)) throw new Error('Invalid custom tag operation journal');
     validateIndex(journal.index);
     const legacy = this.readLegacy(); this.commitJournal(journal, { mirror: !legacy.exists || legacy.valid });
@@ -313,7 +360,7 @@ class CustomTagLibrary {
       atomicImmutable(target, bytes, () => this.hit('mirror:asset-staged'));
     }
   }
-  commitJournal(journal, { mirror = true } = {}) {
+  commitJournal(journal, { mirror = true, trustedDelta = false } = {}) {
     const manifestIds = journal.manifests.map(item => item?.preset?.id);
     if (!manifestIds.length || manifestIds[0] !== DEFAULT_PRESET_ID || new Set(manifestIds).size !== manifestIds.length || manifestIds.some(id => !strictId(id))) throw new Error('Invalid custom tag journal index');
     validateIndex(journal.index, manifestIds);
@@ -334,7 +381,10 @@ class CustomTagLibrary {
         this.hit('transaction:asset');
       }
     }
-    const manifests = validateManifestSet(journal.manifests, this.root, this.now());
+    // Direct ordinary transactions are constructed from the retained, fully
+    // validated runtime state and validate only their cloned preset(s) before
+    // journaling. Replay/import/recovery never take this shortcut.
+    const manifests = trustedDelta ? journal.manifests : validateManifestSet(journal.manifests, this.root, this.now());
     const [presets, tags] = this.compatibilityArrays(manifests);
     if (journal.index.mirrorDigest !== digestMirror(presets, tags)) throw new Error('Custom tag journal mirror digest mismatch');
     const changedPresetIds = Array.isArray(journal.changedPresetIds) ? new Set(journal.changedPresetIds) : null;
@@ -352,6 +402,7 @@ class CustomTagLibrary {
         try { this.cleanupDeletedPreset(cleanup.presetId, cleanup.previews, journal.manifests); } catch { /* Committed state remains authoritative if cleanup cannot complete. */ }
       }
     }
+    this.retainCanonical({ index: journal.index, manifests });
   }
   writeMirror(manifests, digest) {
     const current = this.readLegacy();
@@ -388,6 +439,7 @@ class CustomTagLibrary {
     return { snapshot: this.commit(manifests), warning: 'Custom Tags compatibility mirror changes were conservatively merged; no canonical deletions were inferred.' };
   }
   load() {
+    this.invalidatePreviewReferenceIndex();
     // A pending journal can update workspace.json as part of replay. Do not
     // compare the committed canonical tree to a pre-replay mirror afterwards:
     // that stale snapshot would look like external drift and could resurrect
@@ -410,11 +462,20 @@ class CustomTagLibrary {
     return snapshot;
   }
   commit(manifests, cleanup, delta = null) {
-    const [mirrorPresets, mirrorTags] = this.compatibilityArrays(manifests); const mirrorDigestValue = digestMirror(mirrorPresets, mirrorTags);
+    this.invalidatePreviewReferenceIndex();
     const changedPresetIds = delta?.changedPresetIds;
     const changedMirrorPreviews = delta?.changedMirrorPreviews;
-    const journal = { format: FORMAT, schemaVersion: VERSION, operationId: crypto.randomUUID(), manifests, ...(cleanup ? { cleanup } : {}), ...(Array.isArray(changedPresetIds) ? { changedPresetIds } : {}), ...(Array.isArray(changedMirrorPreviews) ? { changedMirrorPreviews } : {}), index: { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), mirrorDigest: mirrorDigestValue, updatedAt: this.now() } };
-    atomicJson(this.journalFile(), journal); this.hit('transaction:journal'); this.commitJournal(journal); return runtimeSnapshot(manifests);
+    if (Array.isArray(changedPresetIds)) for (const id of changedPresetIds) {
+      const index = manifests.findIndex(item => item.preset.id === id); if (index < 0) throw new Error('Changed Custom Tags preset is missing');
+      const directory = ensureContainedDirectory(this.root, path.join(this.root, 'presets', id));
+      manifests[index] = normalizeManifest(manifestDocument(manifests[index]), id, directory, this.now());
+    }
+    const [mirrorPresets, mirrorTags] = this.compatibilityArrays(manifests); const mirrorDigestValue = digestMirror(mirrorPresets, mirrorTags);
+    const previousState = this.runtimeCanonical?.index?.presetState ?? {};
+    const changed = new Set(Array.isArray(changedPresetIds) ? changedPresetIds : manifests.map(item => item.preset.id));
+    const presetState = Object.fromEntries(manifests.map(item => [item.preset.id, { revision: changed.has(item.preset.id) ? ((previousState[item.preset.id]?.revision ?? 0) + 1) : (previousState[item.preset.id]?.revision ?? 1), sha256: digestPreset(item) }]));
+    const journal = { format: FORMAT, schemaVersion: VERSION, operationId: crypto.randomUUID(), manifests, ...(cleanup ? { cleanup } : {}), ...(Array.isArray(changedPresetIds) ? { changedPresetIds } : {}), ...(Array.isArray(changedMirrorPreviews) ? { changedMirrorPreviews } : {}), index: { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), presetState, mirrorDigest: mirrorDigestValue, updatedAt: this.now() } };
+    atomicJson(this.journalFile(), journal); this.hit('transaction:journal'); this.commitJournal(journal, { trustedDelta: Array.isArray(changedPresetIds) }); return runtimeSnapshot(manifests);
   }
   exportablePreset(presetId) {
     this.replayJournal(); const canonical = this.readCanonical();
@@ -477,7 +538,8 @@ class CustomTagLibrary {
       const operationId = crypto.randomUUID(); const assetCopies = [];
       for (const card of importedCards) if (card.preview) assetCopies.push({ source: path.join(stage, card.preview.file.replace('/', path.sep)), target: `presets/${presetId}/${card.preview.file}` });
       const changedMirrorPreviews = importedCards.filter(card => card.preview).map(card => ({ presetId, file: card.preview.file }));
-      const journal = { format: FORMAT, schemaVersion: VERSION, operationId, manifests, changedPresetIds: [presetId], changedMirrorPreviews, index: { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), mirrorDigest: mirrorDigestValue, updatedAt: now }, assetCopies };
+      const presetState = { ...(canonical.index.presetState ?? {}), [presetId]: { revision: 1, sha256: digestPreset({ preset, cards: importedCards }) } };
+      const journal = { format: FORMAT, schemaVersion: VERSION, operationId, manifests, changedPresetIds: [presetId], changedMirrorPreviews, index: { format: FORMAT, schemaVersion: VERSION, presetOrder: manifests.map(item => item.preset.id), presetState, mirrorDigest: mirrorDigestValue, updatedAt: now }, assetCopies };
       const indexFile = this.indexFile(); const indexBefore = fs.existsSync(indexFile) ? fs.readFileSync(indexFile) : null;
       const workspaceBefore = fs.existsSync(this.workspaceFile) ? fs.readFileSync(this.workspaceFile) : null;
       const indexBackup = `${indexFile}.bak`; const workspaceBackup = `${this.workspaceFile}.bak`;
@@ -508,32 +570,34 @@ class CustomTagLibrary {
   }
   transact(operation, payload = {}, bytes) {
     const legacyState = this.readLegacy(); if (legacyState.exists && !legacyState.valid) throw new Error('Custom Tags changes are disabled while workspace.json is malformed.');
-    this.replayJournal(); const canonical = this.readCanonical(); if (/damaged legacy Custom Tags record/i.test(canonical.index.warning ?? '')) throw new Error('Custom Tags changes are disabled until damaged legacy records are repaired or recovered.'); const manifests = canonical.manifests.map(item => ({ preset: { ...item.preset }, cards: item.cards.map(card => ({ ...card, ...(card.preview ? { preview: { ...card.preview } } : {}) })) })); const byPreset = new Map(manifests.map(item => [item.preset.id, item])); const now = this.now();
+    this.replayJournal(); const canonical = this.transactionCanonical(); if (/damaged legacy Custom Tags record/i.test(canonical.index.warning ?? '')) throw new Error('Custom Tags changes are disabled until damaged legacy records are repaired or recovered.'); const manifests = canonical.manifests.slice(); const byPreset = new Map(manifests.map(item => [item.preset.id, item])); const mutablePresetIds = new Set(); const mutablePreset = id => { let item = byPreset.get(id); if (!item) return null; if (mutablePresetIds.has(id)) return item; const clone = { preset: { ...item.preset }, cards: item.cards.map(card => ({ ...card, ...(card.preview ? { preview: { ...card.preview } } : {}) })) }; manifests[manifests.indexOf(item)] = clone; byPreset.set(id, clone); mutablePresetIds.add(id); return clone; }; const now = this.now();
     if (operation === 'preset:create') { const preset = normalizePreset(payload, now, false); if (!preset || byPreset.has(preset.id)) throw new Error('Invalid or duplicate preset'); if (manifests.some(item => item.preset.name.toLocaleLowerCase() === preset.name.toLocaleLowerCase())) throw new Error('Preset names must be unique'); manifests.push({ preset, cards: [] }); }
-    else if (operation === 'preset:update') { const item = byPreset.get(payload.id); if (!item || payload.id === DEFAULT_PRESET_ID) throw new Error('Unknown preset'); const name = cleanName(payload.name, 80); if (!name || manifests.some(other => other !== item && other.preset.name.toLocaleLowerCase() === name.toLocaleLowerCase())) throw new Error('Preset names must be unique'); item.preset = { ...item.preset, name, updatedAt: now }; }
+    else if (operation === 'preset:update') { const current = byPreset.get(payload.id); if (!current || payload.id === DEFAULT_PRESET_ID) throw new Error('Unknown preset'); const name = cleanName(payload.name, 80); if (!name || manifests.some(other => other !== current && other.preset.name.toLocaleLowerCase() === name.toLocaleLowerCase())) throw new Error('Preset names must be unique'); const item = mutablePreset(payload.id); item.preset = { ...item.preset, name, updatedAt: now }; }
     else if (operation === 'preset:delete') {
       const item = byPreset.get(payload.id); if (!item || payload.id === DEFAULT_PRESET_ID) throw new Error('Unknown preset');
       const mode = payload.mode == null ? 'move' : payload.mode;
       if (mode !== 'move' && mode !== 'delete') throw new Error('Invalid preset deletion mode');
       const deletedPreviews = item.cards.filter(card => card.preview).map(card => ({ ...card.preview }));
       if (mode === 'move') {
-        const target = byPreset.get(DEFAULT_PRESET_ID);
+        const target = mutablePreset(DEFAULT_PRESET_ID);
         const targetSemantics = new Set(manifests.flatMap(entry => entry === item ? [] : entry.cards.map(card => semanticIdentity(card))));
         for (const card of item.cards) { const identity = semanticIdentity(card); if (!identity || targetSemantics.has(identity)) throw new Error('A custom tag with this name already exists in that category.'); targetSemantics.add(identity); }
         for (const card of item.cards) { if (card.preview) this.copyPreview(item.preset.id, DEFAULT_PRESET_ID, card.preview); target.cards.push({ ...card, presetId: DEFAULT_PRESET_ID, updatedAt: now }); }
       }
       manifests.splice(manifests.indexOf(item), 1);
       assertUniqueCardSemantics(manifests);
-      return this.commit(manifests, { presetId: item.preset.id, previews: deletedPreviews });
+      const changedPresetIds = mode === 'move' ? [DEFAULT_PRESET_ID] : [];
+      return this.commit(manifests, { presetId: item.preset.id, previews: deletedPreviews }, { changedPresetIds });
     }
-    else if (operation === 'card:delete') { let found = false; for (const item of manifests) { const index = item.cards.findIndex(card => card.id === payload.id); if (index >= 0) { item.cards.splice(index, 1); found = true; break; } } if (!found) throw new Error('Unknown custom card'); }
+    else if (operation === 'card:delete') { const indexed = canonical.cardIndex?.get(payload.id); const current = indexed ? byPreset.get(indexed.presetId) : null; const currentIndex = current?.cards.findIndex(card => card.id === payload.id) ?? -1; if (!current || currentIndex < 0) throw new Error('Unknown custom card'); const item = mutablePreset(indexed.presetId); item.cards.splice(currentIndex, 1); }
     else if (operation === 'card:upsert') {
       const presetId = byPreset.has(payload.presetId) ? payload.presetId : DEFAULT_PRESET_ID; const legacy = normalizeLegacyCard({ ...payload, presetId }, new Set(byPreset.keys()), now); if (!legacy) throw new Error('Invalid custom card');
-      let previous = null; let previousPresetId = null; let previousIndex = -1; for (const item of manifests) { const index = item.cards.findIndex(card => card.id === legacy.id); if (index >= 0) { previous = item.cards[index]; previousPresetId = item.preset.id; previousIndex = index; item.cards.splice(index, 1); break; } }
+      const semanticOwner = canonical.semanticIndex?.get(semanticIdentity(legacy)); if (semanticOwner && semanticOwner !== legacy.id) throw new Error('A custom tag with this name already exists in that category.');
+      let previous = null; let previousPresetId = null; let previousIndex = -1; const indexed = canonical.cardIndex?.get(legacy.id); if (indexed) { const item = mutablePreset(indexed.presetId); previousIndex = item.cards.findIndex(card => card.id === legacy.id); if (previousIndex >= 0) { previous = item.cards[previousIndex]; previousPresetId = item.preset.id; item.cards.splice(previousIndex, 1); } }
       let preview = previous?.preview;
       if (bytes != null) preview = this.storePreview(presetId, bytes, payload.mime, payload.originalName, 'transaction:asset');
       if (preview && previousPresetId && previousPresetId !== presetId && bytes == null) this.copyPreview(previousPresetId, presetId, preview);
-      if (legacy.kind === 'tag' && !preview) throw new Error('Prompt cards require an image'); const card = { id: legacy.id, kind: legacy.kind, tag: legacy.tag, ...(legacy.kind === 'tag' ? { zone: legacy.zone } : {}), presetId, description: legacy.description, createdAt: previous?.createdAt ?? legacy.createdAt, updatedAt: legacy.updatedAt, ...(preview ? { preview } : {}) }; const destination = byPreset.get(presetId); if (previousPresetId === presetId && previousIndex >= 0) destination.cards.splice(previousIndex, 0, card); else destination.cards.push(card);
+      if (legacy.kind === 'tag' && !preview) throw new Error('Prompt cards require an image'); const card = { id: legacy.id, kind: legacy.kind, tag: legacy.tag, ...(legacy.kind === 'tag' ? { zone: legacy.zone } : {}), presetId, description: legacy.description, createdAt: previous?.createdAt ?? legacy.createdAt, updatedAt: legacy.updatedAt, ...(preview ? { preview } : {}) }; const destination = mutablePreset(presetId); if (previousPresetId === presetId && previousIndex >= 0) destination.cards.splice(previousIndex, 0, card); else destination.cards.push(card);
     } else throw new Error('Unknown Custom Tags transaction');
     assertUniqueCardSemantics(manifests);
     // Normal edits should touch only the preset manifest that actually
@@ -548,7 +612,10 @@ class CustomTagLibrary {
   }
   resolvePreview(presetId, relativeFile) {
     if (!strictId(presetId) || typeof relativeFile !== 'string' || !/^previews\/[a-f0-9]{64}\.(?:png|jpg|webp)$/.test(relativeFile)) throw new Error('Invalid preview path');
-    const canonical = this.readCanonical(); const manifest = canonical.manifests.find(item => item.preset.id === presetId); const preview = manifest?.cards.map(card => card.preview).find(item => item?.file === relativeFile); if (!preview) throw new Error('Preview is not referenced');
+    if (!this.previewReferences().has(`${presetId}\u0000${relativeFile}`)) throw new Error('Preview is not referenced');
+    // Authorization is cached, never the bytes or filesystem trust check.
+    // Every protocol request still verifies containment, regular-file status,
+    // and symlink/junction safety through containedAsset.
     return containedAsset(path.join(this.root, 'presets', presetId, 'previews'), path.basename(relativeFile));
   }
   storePreview(presetId, payload, mime, originalName = '', phase = 'transaction:asset') {

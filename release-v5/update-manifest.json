@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "version": "0.6.6",
-  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.6.exe",
-  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.6/NAI-Prompt-Studio-V5-Setup-0.6.6.exe",
-  "size": 97987397,
-  "sha512": "f3904cccdd1e6b49b06c1a9a364c3315d5cb6dee70fe016440dd443145b3bade9b5d09a4f8f17e7246fee069c4f4f11500d034d21d36a88b099350110ef23fd8",
-  "releaseNotes": "v0.6.6 adds shareable Custom Tags packs, booru tag extraction, per-character visual constructors, Saved Characters, and smoother metadata and catalog performance.",
+  "version": "0.6.7",
+  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.7.exe",
+  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.7/NAI-Prompt-Studio-V5-Setup-0.6.7.exe",
+  "size": 96287542,
+  "sha512": "b5ac847714864d62fd5a45cfad1ca1df69e45acad92a4e9e066e6f0597278338c21c093c1c4cc5e780ae88a5297622909693007b75cf8fb00a80ad538ba4c739",
+  "releaseNotes": "v0.6.7 makes card-heavy workflows feel faster and steadier, preserves previews more reliably across the studio, keeps image references at their best available quality, and improves the overall polish of long creative sessions.",
   "catalogs": [
     {
       "id": "artists",

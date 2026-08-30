@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { COMPONENT_VERSION as catalogPackComponentVersion, resolveCatalogComponentVersion } from '../catalog-packs-version.mjs';
+await import('../test-suites/catalog-components.mjs');
+await import('../test-suites/catalog-runtime.mjs');
+const require = createRequire(import.meta.url);
+const { COMPONENT_VERSION: runtimeComponentVersion } = require('../../electron/catalog-components.cjs');
+assert.equal(catalogPackComponentVersion, runtimeComponentVersion, 'catalog pack tooling consumes the runtime component authority');
+assert.equal(resolveCatalogComponentVersion(['node', 'catalog-packs.mjs']), runtimeComponentVersion, 'catalog packs are independent of package.json');
+assert.throws(() => resolveCatalogComponentVersion(['node', 'catalog-packs.mjs', '--component-version=0.6.6']), /must remain 0\.6\.3/);
+assert.match(readFileSync(new URL('../catalog-packs-version.mjs', import.meta.url), 'utf8'), /COMPONENT_VERSION/);
+console.log('Catalog contract tests passed.');

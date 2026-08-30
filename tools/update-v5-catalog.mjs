@@ -6,7 +6,8 @@
  * markup, downloads validated WebP files into a staging directory, and swaps
  * the catalog and artist directory only after the whole stage succeeds.
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -14,6 +15,9 @@ export const GALLERY = 'danbooru-artist-tags-2-v5';
 export const GALLERY_URL = `https://nax.moe/?gallery=${GALLERY}`;
 export const EXPECTED_CARD_COUNT = 4198;
 const root = resolve(import.meta.dirname, '..');
+const GALLERY_PAGE_CONCURRENCY = 4;
+const IMAGE_CONCURRENCY = 6;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 function decodeHtml(value) {
   return String(value ?? '')
@@ -67,7 +71,17 @@ export async function discoverCards(fetchImpl = fetch) {
   const first = await fetchPage(1, fetchImpl);
   const firstParsed = parseGalleryPage(first);
   const pages = firstParsed.pages.length ? firstParsed.pages : [1];
-  const results = await Promise.all(pages.filter(page => page !== 1).map(async page => parseGalleryPage(await fetchPage(page, fetchImpl))));
+  const remaining = pages.filter(page => page !== 1);
+  const results = new Array(remaining.length);
+  let nextPage = 0;
+  const worker = async () => {
+    while (true) {
+      const index = nextPage++;
+      if (index >= remaining.length) return;
+      results[index] = parseGalleryPage(await fetchPage(remaining[index], fetchImpl));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(GALLERY_PAGE_CONCURRENCY, remaining.length) }, worker));
   const allCards = [firstParsed, ...results].flatMap(result => result.cards);
   const seen = new Set();
   return allCards.filter(card => { const key = card.image; if (seen.has(key)) return false; seen.add(key); return true; });
@@ -116,11 +130,6 @@ export function makeCatalog(cards, existing) {
   return { version: 2, catalogId: 'nai-v5', generatedAt: new Date().toISOString(), sources: { nax: { url: GALLERY_URL, license: 'CC BY 4.0', gallery: GALLERY }, danbooru: { url: 'https://huggingface.co/datasets/SpadeA/danbooru-tag-csv', license: 'MIT' } }, artists, characters: existing?.characters ?? [], tags: [...new Set(danbooruTags.filter(item => item.category !== 1).map(item => item.tag))], danbooruTags };
 }
 
-function oldCardFor(card, existingArtists) {
-  const source = String(card.sourceUrl ?? card.image ?? '');
-  return existingArtists.find(previous => String(previous?.sourceUrl ?? '') === source);
-}
-
 function loadStageState(stageStateFile) {
   try {
     const value = JSON.parse(readFileSync(stageStateFile, 'utf8'));
@@ -137,6 +146,13 @@ export function seedStageFromLive(cards, existingArtists, stageArtistDir, liveAr
   let reused = 0;
   const state = loadStageState(stageStateFile);
   state.entries ??= {};
+  // Preserve Array.find's former first-match behavior without scanning the
+  // whole previous catalog for every incoming card.
+  const existingBySource = new Map();
+  for (const previous of existingArtists) {
+    const source = String(previous?.sourceUrl ?? '');
+    if (source && !existingBySource.has(source)) existingBySource.set(source, previous);
+  }
   for (const card of cards) {
     const cardImage = String(card.image ?? '');
     const filename = /^https?:\/\//i.test(cardImage)
@@ -148,17 +164,16 @@ export function seedStageFromLive(cards, existingArtists, stageArtistDir, liveAr
     const target = join(stageArtistDir, filename);
     const staged = state.entries[filename];
     if (existsSync(target) && staged?.sourceUrl === sourceUrl && staged?.catalogId === catalogId) {
-      try { if (isWebp(readFileSync(target))) { reused += 1; continue; } } catch { /* redownload below */ }
+      try { if (validWebpPart(target)) { reused += 1; continue; } } catch { /* redownload below */ }
     }
-    const previous = oldCardFor(card, existingArtists);
+    const previous = existingBySource.get(sourceUrl);
     const candidates = [filename, String(previous?.image ?? '').split(/[\\/]/).pop()].filter(Boolean);
     let copied = false;
     for (const candidate of candidates) {
       const source = join(liveArtistDir, candidate);
       if (!existsSync(source)) continue;
       try {
-        const buffer = readFileSync(source);
-        if (!isWebp(buffer)) continue;
+        if (!validWebpPart(source)) continue;
         mkdirSync(dirname(target), { recursive: true });
         copyFileSync(source, target);
         state.entries[filename] = { sourceUrl, catalogId };
@@ -179,12 +194,13 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
   let prior = {};
   try { prior = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first run */ }
   const state = { completed: 0, total: cards.length, downloaded: 0, reused: 0, failed: [], entries: prior.entries && typeof prior.entries === 'object' ? prior.entries : {}, updatedAt: new Date().toISOString() };
-  const queue = [...cards];
-  const concurrency = 6;
+  let cursor = 0;
   const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
   async function worker() {
-    while (queue.length) {
-      const card = queue.shift();
+    while (true) {
+      const index = cursor++;
+      if (index >= cards.length) return;
+      const card = cards[index];
       const target = join(targetRoot, card.image);
       const part = `${target}.part`;
       mkdirSync(dirname(target), { recursive: true });
@@ -194,7 +210,7 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
       const catalogId = String(card.catalogId ?? card.id ?? '');
       const staged = state.entries[filename];
       if (existsSync(target) && staged?.sourceUrl === sourceUrl && staged?.catalogId === catalogId) {
-        try { complete = isWebp(readFileSync(target)); } catch { complete = false; }
+        try { complete = validWebpPart(target); } catch { complete = false; }
       }
       if (complete) state.reused += 1;
       if (!complete) {
@@ -202,9 +218,10 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
           try {
             const response = await fetchImpl(card.sourceUrl, { signal: AbortSignal.timeout(45_000) });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const buffer = Buffer.from(await response.arrayBuffer());
-            if (!isWebp(buffer)) throw new Error('response is not WebP');
-            writeFileSync(part, buffer);
+            const contentLength = Number(response.headers?.get?.('content-length') ?? response.headers?.['content-length']);
+            if (Number.isFinite(contentLength) && (contentLength < 12 || contentLength > MAX_IMAGE_BYTES)) throw new Error('response exceeds WebP size limit');
+            await streamWebpPart(response, part);
+            if (!validWebpPart(part)) throw new Error('response is not WebP');
             renameSync(part, target);
             state.downloaded += 1;
             state.entries[filename] = { sourceUrl, catalogId };
@@ -221,10 +238,39 @@ async function downloadCards(cards, stageRoot, fetchImpl) {
       if (state.completed % 25 === 0 || state.completed === state.total) saveState();
     }
   }
-  await Promise.all(Array.from({ length: concurrency }, worker));
+  await Promise.all(Array.from({ length: Math.min(IMAGE_CONCURRENCY, cards.length) }, worker));
   saveState();
   if (state.failed.length) throw new Error(`V5 card validation failed for ${state.failed.length} card(s)`);
   return state;
+}
+
+async function streamWebpPart(response, part) {
+  const output = createWriteStream(part, { flags: 'w' });
+  let bytes = 0;
+  const write = async value => {
+    const chunk = Buffer.from(value);
+    bytes += chunk.length;
+    if (bytes > MAX_IMAGE_BYTES) throw new Error('response exceeds WebP size limit');
+    if (!output.write(chunk)) await once(output, 'drain');
+  };
+  try {
+    const body = response.body;
+    if (body?.getReader) {
+      const reader = body.getReader();
+      try { while (true) { const item = await reader.read(); if (item.done) break; await write(item.value); } } finally { reader.releaseLock?.(); }
+    } else if (body?.[Symbol.asyncIterator]) {
+      for await (const chunk of body) await write(chunk);
+    } else {
+      await write(await response.arrayBuffer());
+    }
+    const finished = once(output, 'finish'); output.end(); await finished;
+  } catch (error) { output.destroy(); try { unlinkSync(part); } catch {} throw error; }
+}
+
+function validWebpPart(file) {
+  let descriptor;
+  try { descriptor = openSync(file, 'r'); const header = Buffer.alloc(12); return readSync(descriptor, header, 0, 12, 0) === 12 && isWebp(header); }
+  finally { if (descriptor !== undefined) closeSync(descriptor); }
 }
 
 function moveIntoPlace(source, target, backups) {

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createLocalEnvironment, localPaths, projectRoot } from './local-env.mjs';
-import { patchInstallerStoreCopy, restoreInstallerStoreCopy } from './electron-builder-nsis-store.mjs';
+import { prepareIsolatedNsisTemplates } from './electron-builder-nsis-store.mjs';
 import { buildSelfExtractingSetup } from './self-extract.mjs';
 
 const packageJson = (await import('../package.json', { with: { type: 'json' } })).default;
@@ -18,6 +18,14 @@ const launcherPath = join(releaseDir, launcherName);
 const compiledLauncherDir = join(localPaths.root, 'installer-launcher');
 const compiledLauncher = join(compiledLauncherDir, 'NAI-Installer-Launcher.exe');
 const env = createLocalEnvironment();
+const isolatedTemplates = prepareIsolatedNsisTemplates();
+env.NAI_NSIS_TEMPLATES_DIR = isolatedTemplates.templatesDir;
+// NODE_OPTIONS is parsed as a shell-like argument string. Quote the preload
+// path because the project root may contain spaces (for example, "NovelAI
+// Prompts"). Use forward slashes too: backslashes inside the quoted option are
+// consumed as escapes by Node before the module path is resolved.
+const nsisTemplateOverride = join(projectRoot, 'tools', 'nsis-template-override.cjs').replaceAll('\\', '/');
+env.NODE_OPTIONS = [env.NODE_OPTIONS, `--require="${nsisTemplateOverride}"`].filter(Boolean).join(' ');
 
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: projectRoot, env, stdio: 'inherit', windowsHide: true });
@@ -37,12 +45,7 @@ if (!existsSync(csc)) throw new Error(`Required Windows C# compiler is missing: 
 if (existsSync(compiledLauncher)) rmSync(compiledLauncher, { force: true });
 run(csc, ['/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', `/win32icon:${join(projectRoot, 'build', 'icon.ico')}`, `/out:${compiledLauncher}`, join(projectRoot, 'tools', 'installer-launcher', 'Program.cs')]);
 
-patchInstallerStoreCopy();
-try {
-  run(process.execPath, [join(projectRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis']);
-} finally {
-  restoreInstallerStoreCopy();
-}
+run(process.execPath, [join(projectRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'), '--win', 'nsis']);
 if (!existsSync(rawPath)) throw new Error(`electron-builder did not create ${rawPath}.`);
 await import('node:fs/promises').then(({ rename }) => rename(rawPath, payloadPath));
 await buildSelfExtractingSetup(compiledLauncher, payloadPath, launcherPath);

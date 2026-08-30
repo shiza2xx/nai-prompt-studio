@@ -28,6 +28,38 @@ export interface CharacterPage {
   hasNext: boolean;
 }
 
+interface SearchIndex {
+  cards: readonly CatalogCard[];
+  normalizedTags: readonly string[];
+  results: Map<string, readonly number[]>;
+}
+
+const SEARCH_CACHE_LIMIT = 32;
+const characterSearchIndexes = new WeakMap<object, SearchIndex>();
+
+function searchIndexFor(cards: readonly CatalogCard[]): SearchIndex {
+  const existing = characterSearchIndexes.get(cards);
+  if (existing) return existing;
+  const index = { cards, normalizedTags: cards.map(card => card.tag.toLocaleLowerCase()), results: new Map<string, readonly number[]>() };
+  characterSearchIndexes.set(cards, index);
+  return index;
+}
+
+function cachedSearchHits(cards: readonly CatalogCard[], query: string): readonly number[] {
+  const index = searchIndexFor(cards);
+  const cached = index.results.get(query);
+  if (cached) {
+    // Map insertion order is the LRU list: refreshing a hit moves it to MRU.
+    index.results.delete(query); index.results.set(query, cached);
+    return cached;
+  }
+  const hits: number[] = [];
+  for (let position = 0; position < cards.length; position += 1) if (!query || index.normalizedTags[position]!.includes(query)) hits.push(position);
+  index.results.set(query, hits);
+  if (index.results.size > SEARCH_CACHE_LIMIT) index.results.delete(index.results.keys().next().value!);
+  return hits;
+}
+
 /** Return every catalog match before pagination is applied. */
 export function filterCharacters(
   cards: readonly CatalogCard[],
@@ -36,10 +68,11 @@ export function filterCharacters(
   favoriteIds: ReadonlySet<string> = new Set<string>(),
 ): CatalogCard[] {
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  return cards.filter(card => {
+  // Favorites are intentionally evaluated after cached text hits: the favorite
+  // set is mutable while the catalog array is not, so caching it would stale.
+  return cachedSearchHits(cards, normalizedQuery).map(position => cards[position]!).filter(card => {
     const isFavorite = favoriteIds.has(card.catalogId ?? card.id) || favoriteIds.has(card.id);
-    return (!favoritesOnly || isFavorite)
-      && (!normalizedQuery || card.tag.toLocaleLowerCase().includes(normalizedQuery));
+    return !favoritesOnly || isFavorite;
   });
 }
 

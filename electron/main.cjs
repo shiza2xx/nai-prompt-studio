@@ -8,6 +8,7 @@ const { containedAsset, validateImagePayload, writeAsset } = require('./custom-t
 const { createCustomTagLibrary, writeWorkspaceSection } = require('./custom-tag-library.cjs');
 const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
 const { normalizeDescriptors, ensureComponent, ensureSelectedComponents, loadState, statuses, readInstallerSelections } = require('./catalog-components.cjs');
+const { ComponentProgressCoalescer } = require('./component-progress-coalescer.cjs');
 const { checkForUpdate, downloadInstaller, validateManifest, UpdateAbortError } = require('./app-updater.cjs');
 const { loadPost: loadBooruPost } = require('./booru-metadata.cjs');
 
@@ -55,14 +56,29 @@ function storageFile() {
   return appPaths.workspaceFile;
 }
 
+function emptyStorage(library) {
+  return { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: library.tags, customTagPresets: library.presets, customTagLibrary: library, settings: null, artistMix: null };
+}
+let cachedStorageHealth = null;
+function rememberStorageHealth(snapshot) { cachedStorageHealth = snapshot; return snapshot; }
+
+// Storage health is deliberately distinct from file existence.  In particular,
+// an unreadable or malformed workspace must never look like a fresh profile:
+// doing so would invite the renderer to overwrite the only recovery source.
 function readStorage() {
   const file = storageFile();
-  if (!fs.existsSync(file)) {
-    const library = customTagLibrary.load();
-    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: library.tags, customTagPresets: library.presets, customTagLibrary: library, settings: null, artistMix: null } };
+  try {
+    if (!fs.existsSync(file)) {
+      const library = customTagLibrary.load();
+      return rememberStorageHealth({ state: 'missing', exists: false, data: emptyStorage(library) });
+    }
+  } catch (error) {
+    return rememberStorageHealth({ state: 'error', exists: true, error: `The workspace file could not be checked: ${error instanceof Error ? error.message : String(error)}` });
   }
   try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const text = fs.readFileSync(file, 'utf8');
+    const data = JSON.parse(text);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('The workspace root must be a JSON object.');
     const merged = { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: [], customTagPresets: [], settings: null, artistMix: null, ...data };
     if (Number(data.version) < 2) {
       merged.characterFavorites = Array.isArray(data.favorites) ? data.favorites.filter(value => String(value).startsWith('character-')) : [];
@@ -76,19 +92,32 @@ function readStorage() {
     merged.customTags = library.tags;
     merged.customTagPresets = library.presets;
     merged.customTagLibrary = library;
-    return { exists: true, data: merged };
-  } catch {
-    const library = customTagLibrary.load();
-    return { exists: false, data: { version: 3, sets: [], savedLibrary: [], favorites: [], characterFavorites: [], draft: null, customTags: library.tags, customTagPresets: library.presets, customTagLibrary: library, settings: null, artistMix: null } };
+    return rememberStorageHealth({ state: 'ready', exists: true, data: merged });
+  } catch (error) {
+    return rememberStorageHealth({ state: 'error', exists: true, error: `The workspace file could not be read safely: ${error instanceof Error ? error.message : String(error)}` });
   }
 }
 
+const STORAGE_SECTIONS = new Set(['sets', 'savedLibrary', 'favorites', 'characterFavorites', 'draft', 'settings', 'artistMix']);
 function saveStorageSection(section, value) {
-  // Legacy section contract: ['sets', 'favorites', 'characterFavorites', 'draft', 'customTags', 'customTagPresets']; new saves use savedLibrary.
-  if (!['sets', 'savedLibrary', 'favorites', 'characterFavorites', 'draft', 'settings', 'artistMix'].includes(section)) return;
+  if (!STORAGE_SECTIONS.has(section)) {
+    const diagnostic = `Unsupported generic storage section: ${String(section)}`;
+    console.error(`[storage] ${diagnostic}`);
+    throw new Error(diagnostic);
+  }
+  const health = cachedStorageHealth ?? readStorage();
+  if (health.state === 'error') throw new Error('Workspace recovery is required before changes can be saved.');
   const file = storageFile();
-  if (!fs.existsSync(file)) customTagLibrary.load();
-  writeWorkspaceSection(file, section, value);
+  try {
+    if (!fs.existsSync(file)) customTagLibrary.load();
+    writeWorkspaceSection(file, section, value);
+    if (health.state === 'missing') cachedStorageHealth = { state: 'ready', exists: true };
+  } catch (error) {
+    // writeWorkspaceSection is the last line of defense against an on-disk
+    // malformed root. Once it rejects, do not allow later generic writes.
+    rememberStorageHealth({ state: 'error', exists: true, error: `The workspace file could not be saved safely: ${error instanceof Error ? error.message : String(error)}` });
+    throw error;
+  }
 }
 
 function customTagResultError(error) {
@@ -180,6 +209,13 @@ async function exportCustomTagPack(presetId) {
 ipcMain.on('storage:load', event => {
   event.returnValue = readStorage();
 });
+ipcMain.on('storage:retry-load', event => { event.returnValue = readStorage(); });
+ipcMain.handle('storage:open-profile-folder', async () => {
+  const target = appPaths.dataDir;
+  const result = await shell.openPath(target);
+  if (result) throw new Error(result);
+  return true;
+});
 ipcMain.on('storage:save', (_event, section, value) => {
   try { saveStorageSection(section, value); }
   catch (error) { console.error(`[storage] ${error instanceof Error ? error.message : String(error)}`); }
@@ -259,9 +295,11 @@ function componentDescriptors() {
   return [];
 }
 function componentManifestPath() { return path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'catalog', 'catalog-components.json'); }
-function emitComponentProgress(event) {
+function sendComponentProgress(event) {
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send('catalog:component-progress', event);
 }
+const componentProgressCoalescer = new ComponentProgressCoalescer(sendComponentProgress);
+function emitComponentProgress(event) { componentProgressCoalescer.push(event); }
 let componentController = null;
 let componentPromise = null;
 function packagedCatalogAssetMode() { return app.isPackaged; }
@@ -281,8 +319,9 @@ ipcMain.handle('catalog:ensure-selected', async () => {
   const descriptors = componentDescriptors();
   if (!descriptors.length) return { selected: readInstallerSelections(appPaths.dataDir), results: [], total: 0, missingManifest: true };
   componentController = new AbortController();
+  componentProgressCoalescer.clear();
   componentPromise = ensureSelectedComponents({ catalogDir: appPaths.catalogDir, dataDir: appPaths.dataDir, descriptors, signal: componentController.signal, onProgress: emitComponentProgress })
-    .finally(() => { componentController = null; componentPromise = null; });
+    .finally(() => { componentProgressCoalescer.clear(); componentController = null; componentPromise = null; });
   return componentPromise;
 });
 ipcMain.handle('catalog:component-download', async (_event, componentId, repair = false) => {
@@ -291,19 +330,21 @@ ipcMain.handle('catalog:component-download', async (_event, componentId, repair 
   const descriptor = componentDescriptors().find(item => item.id === String(componentId));
   if (!descriptor) throw new Error('Unknown catalog component.');
   componentController = new AbortController();
+  componentProgressCoalescer.clear();
   componentPromise = ensureComponent({ catalogDir: appPaths.catalogDir, descriptor, repair: Boolean(repair), signal: componentController.signal, onProgress: emitComponentProgress })
-    .finally(() => { componentController = null; componentPromise = null; });
+    .finally(() => { componentProgressCoalescer.clear(); componentController = null; componentPromise = null; });
   return componentPromise;
 });
-ipcMain.handle('catalog:component-cancel', async () => { if (!componentController) return false; componentController.abort(); return true; });
+ipcMain.handle('catalog:component-cancel', async () => { if (!componentController) return false; componentProgressCoalescer.clear(); componentController.abort(); return true; });
 ipcMain.handle('catalog:component-repair', async (_event, componentId) => {
   if (!app.isPackaged) throw new Error('Catalog component repairs are disabled in development mode.');
   if (componentPromise) throw new Error('A catalog component transfer is already running.');
   const descriptor = componentDescriptors().find(item => item.id === String(componentId));
   if (!descriptor) throw new Error('Unknown catalog component.');
   componentController = new AbortController();
+  componentProgressCoalescer.clear();
   componentPromise = ensureComponent({ catalogDir: appPaths.catalogDir, descriptor, repair: true, signal: componentController.signal, onProgress: emitComponentProgress })
-    .finally(() => { componentController = null; componentPromise = null; });
+    .finally(() => { componentProgressCoalescer.clear(); componentController = null; componentPromise = null; });
   return componentPromise;
 });
 ipcMain.handle('catalog:update', async () => {
