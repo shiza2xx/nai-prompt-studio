@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict'; import {readFileSync,readdirSync} from 'node:fs'; import {mixCompanionCapacity,mixCompanionScale,mixOrbitLayout} from '../../src/artist-mix-layout.ts'; import * as f from './source-fixtures.mjs'; const {uiSource,customTagsWorkspaceSource,savedLibraryWorkspaceSource,styleSource,typesSource,previewSource,previewCacheSource,metadataHighlightSource,warmupSource,thumbnailSource,storageSource,globalSource,metadataWorkspaceSource,electronSource,customTagLibrarySource,customTagPackSource,componentSource,catalogUpdaterSource,updateV5Source,preloadSource,appPathsSource,indexSource,packageSource,lockSource,tsconfigSource,localEnvSource,localRunnerSource,desktopBuildSource,catalogPacksSource,catalogPacksVersionSource,thinCatalogSource,releaseManifestSource,installerBuildSource,iconPreparationSource,iconResizeSource,installerLauncherSource,installerProofSource,installerProofRunnerSource,installerStorePatchSource,nsisIncludeSource,npmrcSource}=f;
+import assert from 'node:assert/strict'; import {existsSync,readFileSync,readdirSync} from 'node:fs'; import {mixCompanionCapacity,mixCompanionScale,mixOrbitLayout} from '../../src/artist-mix-layout.ts'; import * as f from './source-fixtures.mjs'; const {uiSource,customTagsWorkspaceSource,savedLibraryWorkspaceSource,styleSource,typesSource,previewSource,previewCacheSource,metadataHighlightSource,warmupSource,thumbnailSource,storageSource,globalSource,metadataWorkspaceSource,electronSource,customTagLibrarySource,customTagPackSource,componentSource,catalogUpdaterSource,updateV5Source,preloadSource,appPathsSource,indexSource,packageSource,lockSource,tsconfigSource,localEnvSource,localRunnerSource,desktopBuildSource,catalogPacksSource,catalogPacksVersionSource,thinCatalogSource,releaseManifestSource,installerBuildSource,iconPreparationSource,iconResizeSource,installerLauncherSource,installerProofSource,installerProofRunnerSource,installerStorePatchSource,nsisIncludeSource,npmrcSource}=f;
 assert.match(electronSource, /app-update:progress/);
 assert.match(electronSource, /app-update:cancel/);
 assert.match(electronSource, /app-update:install/);
@@ -31,14 +31,17 @@ assert.match(catalogPacksSource, /count: 281/);
 assert.match(catalogPacksSource, /extra: \['catalog\.json'\]/);
 assert.match(catalogPacksSource, /function guideImageInputs/);
 assert.match(catalogPacksSource, /filenames = \[\.\.\.guideInputs, 'guide\/manifest\.json'\]/);
-const guideManifestFixture = JSON.parse(readFileSync(new URL('../../public/catalog/guide/manifest.json', import.meta.url), 'utf8'));
-const guideManifestEntries = Array.isArray(guideManifestFixture) ? guideManifestFixture : guideManifestFixture.entries;
-const uniqueGuideImages = new Set(guideManifestEntries.map(entry => String(entry.image).replaceAll('\\', '/')));
-const sourceGuidePngs = readdirSync(new URL('../../public/catalog/guide', import.meta.url), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.png'));
-assert.equal(guideManifestEntries.length, 281);
-assert.equal(uniqueGuideImages.size, 277);
-assert.equal(sourceGuidePngs.length, 289);
-assert.ok(sourceGuidePngs.length > uniqueGuideImages.size);
+const guideManifestPath = new URL('../../public/catalog/guide/manifest.json', import.meta.url);
+if (existsSync(guideManifestPath)) {
+  const guideManifestFixture = JSON.parse(readFileSync(guideManifestPath, 'utf8'));
+  const guideManifestEntries = Array.isArray(guideManifestFixture) ? guideManifestFixture : guideManifestFixture.entries;
+  const uniqueGuideImages = new Set(guideManifestEntries.map(entry => String(entry.image).replaceAll('\\', '/')));
+  const sourceGuidePngs = readdirSync(new URL('../../public/catalog/guide', import.meta.url), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.png'));
+  assert.equal(guideManifestEntries.length, 281);
+  assert.equal(uniqueGuideImages.size, 277);
+  assert.equal(sourceGuidePngs.length, 289);
+  assert.ok(sourceGuidePngs.length > uniqueGuideImages.size);
+}
 assert.doesNotMatch(catalogPacksSource, /catalog-pack-staging|cpSync/);
 assert.doesNotMatch(catalogPacksSource, /createHash\('sha512'\)\.update\(readFileSync/);
 assert.match(thinCatalogSource, /catalog\.json/);

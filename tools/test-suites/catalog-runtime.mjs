@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict'; import {mkdtempSync,mkdirSync,readFileSync,readdirSync,renameSync,rmSync,symlinkSync,writeFileSync} from 'node:fs'; import {join} from 'node:path'; import {createRequire} from 'node:module'; import {commitSnapshot,discoverCards,EXPECTED_CARD_COUNT,GALLERY_URL,isWebp,makeCatalog,parseGalleryPage,seedStageFromLive,stableAssetFilename,stableCatalogId} from '../update-v5-catalog.mjs'; import {ARTIST_PAGE_SIZE,CHARACTER_PAGE_SIZE,filterCharacters,paginateArtists,paginateCharacters} from '../../src/catalog-browser.ts'; import {mixCompanionCapacity,mixCompanionScale,mixOrbitLayout} from '../../src/artist-mix-layout.ts'; import {normalizeArtistWeight,resolveRandomPoolRange} from '../../src/random.ts'; const require=createRequire(import.meta.url); const nativeFs=require('node:fs'); const {loadCatalog:loadRuntimeCatalog,parseGalleryPage:parseRuntimeGalleryPage,normalizeImageUrl:normalizeRuntimeImageUrl,runUpdate:runRuntimeCatalogUpdate,catalogAssetFromProtocolUrl,resolveActiveCatalogAsset}=require('../../electron/catalog-updater.cjs'); const {ComponentProgressCoalescer}=require('../../electron/component-progress-coalescer.cjs');
+import assert from 'node:assert/strict'; import {existsSync,mkdtempSync,mkdirSync,readFileSync,readdirSync,renameSync,rmSync,symlinkSync,writeFileSync} from 'node:fs'; import {join} from 'node:path'; import {createRequire} from 'node:module'; import {commitSnapshot,discoverCards,EXPECTED_CARD_COUNT,GALLERY_URL,isWebp,makeCatalog,parseGalleryPage,seedStageFromLive,stableAssetFilename,stableCatalogId} from '../update-v5-catalog.mjs'; import {ARTIST_PAGE_SIZE,CHARACTER_PAGE_SIZE,filterCharacters,paginateArtists,paginateCharacters} from '../../src/catalog-browser.ts'; import {mixCompanionCapacity,mixCompanionScale,mixOrbitLayout} from '../../src/artist-mix-layout.ts'; import {normalizeArtistWeight,resolveRandomPoolRange} from '../../src/random.ts'; const require=createRequire(import.meta.url); const nativeFs=require('node:fs'); const {loadCatalog:loadRuntimeCatalog,parseGalleryPage:parseRuntimeGalleryPage,normalizeImageUrl:normalizeRuntimeImageUrl,runUpdate:runRuntimeCatalogUpdate,catalogAssetFromProtocolUrl,resolveActiveCatalogAsset}=require('../../electron/catalog-updater.cjs'); const {ComponentProgressCoalescer}=require('../../electron/component-progress-coalescer.cjs');
 const testTempRoot = join(process.cwd(), '.test-tmp-v063', '1788114714459-' + process.pid); mkdirSync(testTempRoot,{recursive:true}); const localTemp = prefix => mkdtempSync(join(testTempRoot, prefix + '-')); process.once('exit',()=>{try{rmSync(testTempRoot,{recursive:true,force:true})}catch{}});
 // Catalog search indexes normalization once per catalog identity and keeps
 // favorites outside cached base hits so a mutable favorite set stays current.
@@ -40,11 +40,15 @@ const runtimeCardAsset = 'cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-c
 assert.equal(catalogAssetFromProtocolUrl(`nai-catalog://asset/${runtimeCardAsset}`), runtimeCardAsset);
 assert.equal(catalogAssetFromProtocolUrl(`nai-catalog://cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-card.webp`), runtimeCardAsset);
 assert.throws(() => catalogAssetFromProtocolUrl('nai-catalog://outside/cards/artist/danbooru-artist-tags-2-v5/artist-v5-new-card.webp'), /Invalid runtime catalog card asset/);
-const guideManifest = JSON.parse(readFileSync(new URL('../../public/catalog/guide/manifest.json', import.meta.url), 'utf8'));
-assert.equal(guideManifest.length, 281);
-assert.equal(guideManifest.some(entry => /^2\.[34]\./.test(entry.section)), false);
-assert.equal(guideManifest.filter(entry => /^5\.[1-4]\./.test(entry.section)).length, 33);
-assert.equal(guideManifest.filter(entry => /^4\.[1-8]\./.test(entry.section)).length, 248);
+const guideManifestPath = new URL('../../public/catalog/guide/manifest.json', import.meta.url);
+// Full catalog packs are release assets rather than Git-tracked CI fixtures.
+if (existsSync(guideManifestPath)) {
+  const guideManifest = JSON.parse(readFileSync(guideManifestPath, 'utf8'));
+  assert.equal(guideManifest.length, 281);
+  assert.equal(guideManifest.some(entry => /^2\.[34]\./.test(entry.section)), false);
+  assert.equal(guideManifest.filter(entry => /^5\.[1-4]\./.test(entry.section)).length, 33);
+  assert.equal(guideManifest.filter(entry => /^4\.[1-8]\./.test(entry.section)).length, 248);
+}
 const parsed = parseGalleryPage(fixture);
 assert.deepEqual(parsed.pages, [1, 2]);
 assert.equal(parsed.cards.length, 2);
