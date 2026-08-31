@@ -100,6 +100,10 @@ export class MetadataWorkspace {
   private tagDialogError = '';
   private tagDialogCategory: MetadataTagCategory = 'frame';
   private tagDialogPresetId = 'default';
+  /** The selected metadata-tag destination is intentionally session-only. */
+  private lastMetadataTagFolderId: string | null = null;
+  /** The selected metadata-tag category is intentionally session-only. */
+  private lastMetadataTagCategory: MetadataTagCategory = 'frame';
   private tagDialogReturnFocus: HTMLElement | null = null;
   private tagDialogCleanup: (() => void) | null = null;
   private selectionCleanup: (() => void) | null = null;
@@ -142,8 +146,8 @@ export class MetadataWorkspace {
   /** Rendered beside the app shell so viewport-fixed UI is not captured by the panel animation transform. */
   overlayMarkup(): string {
     const folders = this.customTagFolders();
-    const selectedFolder = folders.find(folder => folder.id === this.tagDialogPresetId) ?? folders[0] ?? { id: 'default', name: 'My Tags' };
-    const folderOptions = folders.map((folder, index) => `<li id="metadata-tag-folder-option-${escapeHtml(folder.id)}" role="option" data-metadata-folder-option="${escapeHtml(folder.id)}" aria-selected="${folder.id === selectedFolder.id}" tabindex="${folder.id === selectedFolder.id ? '0' : '-1'}">${escapeHtml(folder.name)}</li>`).join('');
+    const selectedFolder = folders.find(folder => folder.id === this.tagDialogPresetId) ?? { id: this.tagDialogPresetId, name: 'Folder unavailable' };
+    const folderOptions = folders.map(folder => `<li id="metadata-tag-folder-option-${escapeHtml(folder.id)}" role="option" data-metadata-folder-option="${escapeHtml(folder.id)}" aria-selected="${folder.id === selectedFolder.id}" tabindex="${folder.id === selectedFolder.id ? '0' : '-1'}">${escapeHtml(folder.name)}</li>`).join('');
     const tagPreviewAvailable = this.hasSelectionSavePreview() && Boolean(this.selectionText);
     const listboxId = 'metadata-tag-folder-listbox';
     return `<div class="metadata-tag-dialog-backdrop${this.tagDialogOpen ? '' : ' is-hidden'}" id="metadata-tag-dialog" aria-hidden="${!this.tagDialogOpen}"><section class="metadata-tag-dialog" role="dialog" aria-modal="true" aria-labelledby="metadata-tag-dialog-title"><header><div><p class="eyebrow">CUSTOM TAG</p><h3 id="metadata-tag-dialog-title">Save selected tag</h3></div><button class="icon-button" type="button" id="metadata-tag-cancel" aria-label="Close Save tag dialog">×</button></header><label class="field"><span>Tag text</span><input id="metadata-tag-text" value="${escapeHtml(this.selectionText)}" readonly></label><div class="field metadata-tag-folder-field"><span id="metadata-tag-folder-label">Folder</span><button id="metadata-tag-folder" class="metadata-tag-folder" type="button" role="combobox" aria-haspopup="listbox" aria-expanded="${this.tagFolderOpen}" aria-controls="${listboxId}" aria-labelledby="metadata-tag-folder-label metadata-tag-folder-value"><span id="metadata-tag-folder-value">${escapeHtml(selectedFolder.name)}</span><span class="metadata-tag-folder-arrow" aria-hidden="true"></span></button><ul id="${listboxId}" class="metadata-tag-folder-listbox${this.tagFolderOpen ? '' : ' is-hidden'}" role="listbox" aria-labelledby="metadata-tag-folder-label">${folderOptions || '<li id="metadata-tag-folder-option-default" role="option" data-metadata-folder-option="default" aria-selected="true" tabindex="0">My Tags</li>'}</ul></div><fieldset class="field metadata-tag-category-field"><legend>Category</legend><div class="metadata-tag-category"><label><input type="radio" name="metadata-tag-category" value="frame"${this.tagDialogCategory === 'frame' ? ' checked' : ''}> Frame</label><label><input type="radio" name="metadata-tag-category" value="scene"${this.tagDialogCategory === 'scene' ? ' checked' : ''}> Scene</label><label><input type="radio" name="metadata-tag-category" value="render"${this.tagDialogCategory === 'render' ? ' checked' : ''}> Quality</label><label><input type="radio" name="metadata-tag-category" value="character"${this.tagDialogCategory === 'character' ? ' checked' : ''}> Character</label></div></fieldset><p class="metadata-tag-dialog-error" id="metadata-tag-dialog-error" role="alert">${escapeHtml(this.tagDialogError)}</p><footer><button class="secondary" type="button" id="metadata-tag-cancel-footer">Cancel</button><button class="primary" type="button" id="metadata-tag-save"${tagPreviewAvailable && this.onSaveTag && this.selectionText.length <= CUSTOM_TAG_MAX_LENGTH ? '' : ' disabled'}>Save tag</button></footer></section></div><div class="metadata-tag-popover is-hidden" id="metadata-tag-popover" aria-hidden="true"><div class="metadata-tag-popover-surface"><button class="primary" type="button" id="metadata-save-selection">Save tag</button></div></div>`;
@@ -254,13 +258,15 @@ export class MetadataWorkspace {
       this.tagDialogReturnFocus = trigger?.isConnected ? trigger : null;
       this.tagDialogOpen = true;
       this.tagDialogError = this.selectionText.length > CUSTOM_TAG_MAX_LENGTH ? `Tags must be ${CUSTOM_TAG_MAX_LENGTH.toLocaleString()} characters or fewer.` : '';
-      this.tagDialogCategory = 'frame';
-      this.tagDialogPresetId = this.customTagFolders()[0]?.id ?? 'default';
+      this.tagDialogCategory = this.lastMetadataTagCategory;
+      const folders = this.customTagFolders();
+      const retained = folders.find(folder => folder.id === this.lastMetadataTagFolderId)?.id;
+      this.tagDialogPresetId = retained ?? folders[0]?.id ?? 'default';
+      if (this.tagDialogPresetId) this.lastMetadataTagFolderId = this.tagDialogPresetId;
       this.hideSelectionPopover();
       this.syncTagDialogDom();
       window.setTimeout(() => this.root?.querySelector<HTMLInputElement>('#metadata-tag-save')?.focus(), 0);
     };
-    trigger?.addEventListener('pointerdown', open);
     trigger?.addEventListener('click', open);
   }
 
@@ -272,8 +278,7 @@ export class MetadataWorkspace {
     const text = dialog.querySelector<HTMLInputElement>('#metadata-tag-text');
     if (text) text.value = this.selectionText;
     const folders = this.customTagFolders();
-    const selectedFolder = folders.find(folder => folder.id === this.tagDialogPresetId) ?? folders[0] ?? { id: 'default', name: 'My Tags' };
-    this.tagDialogPresetId = selectedFolder.id;
+    const selectedFolder = folders.find(folder => folder.id === this.tagDialogPresetId) ?? { id: this.tagDialogPresetId, name: 'Folder unavailable' };
     const folder = dialog.querySelector<HTMLButtonElement>('#metadata-tag-folder');
     if (folder) {
       folder.setAttribute('aria-expanded', String(this.tagFolderOpen));
@@ -313,13 +318,14 @@ export class MetadataWorkspace {
         fallback?.focus({ preventScroll: true });
       }, 0);
     };
-    root.querySelectorAll<HTMLInputElement>('input[name="metadata-tag-category"]').forEach(input => input.addEventListener('change', () => { this.tagDialogCategory = input.value as MetadataTagCategory; }));
+    root.querySelectorAll<HTMLInputElement>('input[name="metadata-tag-category"]').forEach(input => input.addEventListener('change', () => { this.tagDialogCategory = input.value as MetadataTagCategory; this.lastMetadataTagCategory = this.tagDialogCategory; }));
     const folderButton = root.querySelector<HTMLButtonElement>('#metadata-tag-folder');
     const folderList = root.querySelector<HTMLElement>('#metadata-tag-folder-listbox');
     const folderValues = () => this.customTagFolders().map(folder => folder.id);
     const setFolder = (id: string, focus = false) => {
       if (!folderValues().includes(id)) return;
       this.tagDialogPresetId = id;
+      this.lastMetadataTagFolderId = id;
       if (focus) root.querySelector<HTMLElement>(`[data-metadata-folder-option="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
       this.syncTagDialogDom();
     };
@@ -472,8 +478,14 @@ export class MetadataWorkspace {
       this.resetSelectionContext(true);
       return;
     }
-    const folder = this.tagDialogPresetId || 'default';
+    const folder = this.customTagFolders().find(item => item.id === this.tagDialogPresetId);
+    if (!folder) {
+      this.tagDialogError = 'The selected folder is no longer available. Choose another folder before saving.';
+      this.syncTagDialogDom();
+      return;
+    }
     const category = (this.root?.querySelector<HTMLInputElement>('input[name="metadata-tag-category"]:checked')?.value ?? this.tagDialogCategory) as MetadataTagCategory;
+    this.lastMetadataTagCategory = category;
     const readToken = this.readToken;
     const sourceGeneration = this.sourceGeneration;
     this.tagDialogError = '';
@@ -486,9 +498,10 @@ export class MetadataWorkspace {
       // dialog and ordinary markup remain zero-copy even for large images.
       const preview = this.getSelectionSavePreview();
       if (!preview) return;
-      const saved = await dispatchMetadataTagSave(this.onSaveTag, this.selectionText, category, folder, preview);
+      const saved = await dispatchMetadataTagSave(this.onSaveTag, this.selectionText, category, folder.id, preview);
       if (readToken !== this.readToken || sourceGeneration !== this.sourceGeneration) return;
       if (saved) {
+        this.lastMetadataTagFolderId = folder.id;
         this.status = 'Tag saved to Custom Tags.';
         this.tagDialogOpen = false;
         this.tagFolderOpen = false;

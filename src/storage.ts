@@ -583,7 +583,7 @@ export function saveCustomTags(tags: CustomTag[]): void {
   void normalized;
 }
 
-export async function transactCustomTags(operation: 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete', payload: object, bytes?: Uint8Array): Promise<{ version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } | null> {
+export async function transactCustomTags(operation: 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder', payload: object, bytes?: Uint8Array): Promise<{ version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } | null> {
   const storage = bridge();
   if (!storage?.transactCustomTags) return null;
   return storage.transactCustomTags(operation, payload, bytes);

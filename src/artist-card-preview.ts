@@ -5,6 +5,7 @@ let activeTarget: HTMLElement | null = null;
 let activeByPointer = false;
 let activeByFocus = false;
 let previewRequestToken = 0;
+let previewDragSuppressed = false;
 const boundTargets = new WeakSet<HTMLElement>();
 let previewImageLoader: ((source: string) => Promise<string | undefined>) | null = null;
 
@@ -53,6 +54,10 @@ function restartPreviewReveal(host: HTMLElement): void {
 }
 
 function showPreview(target: HTMLElement, byPointer: boolean): void {
+  if (previewDragSuppressed) {
+    clearArtistCardPreview();
+    return;
+  }
   activeTarget = target;
   const requestToken = ++previewRequestToken;
   if (byPointer) activeByPointer = true;
@@ -116,6 +121,18 @@ export function clearArtistCardPreview(): void {
   if (!host) return;
   host.classList.remove('is-visible');
   host.setAttribute('aria-hidden', 'true');
+}
+
+/** Suppress the shared hover/focus preview for the native Custom Tags drag lifecycle. */
+export function beginArtistCardPreviewDrag(): void {
+  previewDragSuppressed = true;
+  clearArtistCardPreview();
+}
+
+/** End Custom Tags drag suppression and leave the shared preview in its hidden state. */
+export function endArtistCardPreviewDrag(): void {
+  previewDragSuppressed = false;
+  clearArtistCardPreview();
 }
 
 function bindTarget(target: HTMLElement): void {

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "version": "0.6.7",
-  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.7.exe",
-  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.7/NAI-Prompt-Studio-V5-Setup-0.6.7.exe",
-  "size": 96287542,
-  "sha512": "b5ac847714864d62fd5a45cfad1ca1df69e45acad92a4e9e066e6f0597278338c21c093c1c4cc5e780ae88a5297622909693007b75cf8fb00a80ad538ba4c739",
-  "releaseNotes": "v0.6.7 makes card-heavy workflows feel faster and steadier, preserves previews more reliably across the studio, keeps image references at their best available quality, and improves the overall polish of long creative sessions.",
+  "version": "0.6.8",
+  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.8.exe",
+  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.8/NAI-Prompt-Studio-V5-Setup-0.6.8.exe",
+  "size": 96288431,
+  "sha512": "11579d8ee13fe4c4b062b866cc15c31f1c3ac64beb22078076107f8ee9e9d50c048a90adc66e0ad51e57abc924689133a9b20ec9496058f913e41fe4c10f270f",
+  "releaseNotes": "v0.6.8 makes Custom Tags easier to organize, with reliable card ordering and safer Image Metadata tag saves. Card interactions are steadier and faster during everyday prompt work.",
   "catalogs": [
     {
       "id": "artists",

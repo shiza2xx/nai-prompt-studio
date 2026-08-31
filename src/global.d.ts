@@ -67,7 +67,7 @@ interface NAIMetadataBridge {
   cancelPost(): Promise<boolean>;
 }
 
-type CustomTagLibraryOperation = 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete';
+type CustomTagLibraryOperation = 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder';
 interface CustomTagLibrarySnapshot { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string; }
 
 declare global {

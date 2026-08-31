@@ -17,6 +17,7 @@ export type MetadataTagSaveHandler = (payload: MetadataTagSavePayload) => Promis
 
 /** Dispatch the selected-tag action without constructing or dispatching a library payload. */
 export async function dispatchMetadataTagSave(handler: MetadataTagSaveHandler | undefined, selectionText: string, category: MetadataTagCategory, presetId: string, preview: MetadataTagSavePreview): Promise<boolean> {
-  if (!handler || !selectionText.trim()) return false;
-  return Boolean(await handler({ tag: selectionText.trim(), category, presetId: presetId || 'default', preview }));
+  const destination = presetId.trim();
+  if (!handler || !selectionText.trim() || !destination) return false;
+  return Boolean(await handler({ tag: selectionText.trim(), category, presetId: destination, preview }));
 }

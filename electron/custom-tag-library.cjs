@@ -591,13 +591,45 @@ class CustomTagLibrary {
     }
     else if (operation === 'card:delete') { const indexed = canonical.cardIndex?.get(payload.id); const current = indexed ? byPreset.get(indexed.presetId) : null; const currentIndex = current?.cards.findIndex(card => card.id === payload.id) ?? -1; if (!current || currentIndex < 0) throw new Error('Unknown custom card'); const item = mutablePreset(indexed.presetId); item.cards.splice(currentIndex, 1); }
     else if (operation === 'card:upsert') {
-      const presetId = byPreset.has(payload.presetId) ? payload.presetId : DEFAULT_PRESET_ID; const legacy = normalizeLegacyCard({ ...payload, presetId }, new Set(byPreset.keys()), now); if (!legacy) throw new Error('Invalid custom card');
+      // Modern renderer transactions must name an existing destination. The
+      // legacy normalizer still deliberately falls back during load/migration,
+      // but a live save must never redirect a missing folder to My Tags.
+      if (!strictId(payload.presetId) || !byPreset.has(payload.presetId)) throw new Error('Unknown custom tag preset');
+      const presetId = payload.presetId; const legacy = normalizeLegacyCard({ ...payload, presetId }, new Set(byPreset.keys()), now); if (!legacy) throw new Error('Invalid custom card');
       const semanticOwner = canonical.semanticIndex?.get(semanticIdentity(legacy)); if (semanticOwner && semanticOwner !== legacy.id) throw new Error('A custom tag with this name already exists in that category.');
       let previous = null; let previousPresetId = null; let previousIndex = -1; const indexed = canonical.cardIndex?.get(legacy.id); if (indexed) { const item = mutablePreset(indexed.presetId); previousIndex = item.cards.findIndex(card => card.id === legacy.id); if (previousIndex >= 0) { previous = item.cards[previousIndex]; previousPresetId = item.preset.id; item.cards.splice(previousIndex, 1); } }
       let preview = previous?.preview;
       if (bytes != null) preview = this.storePreview(presetId, bytes, payload.mime, payload.originalName, 'transaction:asset');
       if (preview && previousPresetId && previousPresetId !== presetId && bytes == null) this.copyPreview(previousPresetId, presetId, preview);
       if (legacy.kind === 'tag' && !preview) throw new Error('Prompt cards require an image'); const card = { id: legacy.id, kind: legacy.kind, tag: legacy.tag, ...(legacy.kind === 'tag' ? { zone: legacy.zone } : {}), presetId, description: legacy.description, createdAt: previous?.createdAt ?? legacy.createdAt, updatedAt: legacy.updatedAt, ...(preview ? { preview } : {}) }; const destination = mutablePreset(presetId); if (previousPresetId === presetId && previousIndex >= 0) destination.cards.splice(previousIndex, 0, card); else destination.cards.push(card);
+    }
+    else if (operation === 'card:move') {
+      if (bytes != null) throw new Error('Card moves cannot include preview bytes');
+      const cardId = strictId(payload.id); const destinationId = strictId(payload.destinationPresetId);
+      if (!cardId || !destinationId || !byPreset.has(destinationId)) throw new Error('Unknown custom tag move destination');
+      const indexed = canonical.cardIndex?.get(cardId); const source = indexed ? byPreset.get(indexed.presetId) : null;
+      if (!source || !indexed?.card || source.preset.id === destinationId) throw new Error('Invalid custom tag move');
+      const destination = byPreset.get(destinationId);
+      if (!destination) throw new Error('Unknown custom tag move destination');
+      const identity = semanticIdentity(indexed.card);
+      if (destination.cards.some(card => semanticIdentity(card) === identity)) throw new Error('A custom tag with this name already exists in that category.');
+      // Copy the immutable preview before mutating either manifest. If the
+      // copy fails, the transaction has not changed canonical metadata.
+      if (indexed.card.preview) this.copyPreview(source.preset.id, destinationId, indexed.card.preview);
+      const sourceMutable = mutablePreset(source.preset.id); const destinationMutable = mutablePreset(destinationId);
+      const index = sourceMutable.cards.findIndex(card => card.id === cardId);
+      if (index < 0) throw new Error('Unknown custom card');
+      const [card] = sourceMutable.cards.splice(index, 1);
+      destinationMutable.cards.push({ ...card, presetId: destinationId, updatedAt: now });
+    }
+    else if (operation === 'card:reorder') {
+      if (bytes != null) throw new Error('Card reorders cannot include preview bytes');
+      const presetId = strictId(payload.presetId); const orderedCardIds = payload.orderedCardIds;
+      if (!presetId || !byPreset.has(presetId) || !Array.isArray(orderedCardIds)) throw new Error('Invalid custom tag card order');
+      const current = byPreset.get(presetId); const currentIds = current.cards.map(card => card.id);
+      if (orderedCardIds.length !== currentIds.length || orderedCardIds.some(id => !strictId(id)) || new Set(orderedCardIds).size !== orderedCardIds.length || new Set(orderedCardIds).size !== new Set(currentIds).size || orderedCardIds.some(id => !currentIds.includes(id))) throw new Error('Invalid custom tag card order');
+      const byId = new Map(current.cards.map(card => [card.id, card]));
+      const destination = mutablePreset(presetId); destination.cards = orderedCardIds.map(id => byId.get(id));
     } else throw new Error('Unknown Custom Tags transaction');
     assertUniqueCardSemantics(manifests);
     // Normal edits should touch only the preset manifest that actually
@@ -605,7 +637,7 @@ class CustomTagLibrary {
     // metadata mirror, while unchanged preview bytes are left untouched.
     const previousByPreset = new Map(canonical.manifests.map(item => [item.preset.id, item]));
     const changedPresetIds = manifests.filter(item => stable(item) !== stable(previousByPreset.get(item.preset.id))).map(item => item.preset.id);
-    const changedMirrorPreviews = operation === 'card:upsert'
+    const changedMirrorPreviews = operation === 'card:upsert' || operation === 'card:move'
       ? manifests.flatMap(item => item.cards.filter(card => card.id === payload.id && card.preview).map(card => ({ presetId: item.preset.id, file: card.preview.file })))
       : [];
     return this.commit(manifests, undefined, { changedPresetIds, changedMirrorPreviews });

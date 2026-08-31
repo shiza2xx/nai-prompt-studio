@@ -60,7 +60,7 @@ export class WorkspaceController {
     this.chromeHost = root.querySelector<HTMLElement>('[data-app-chrome-host]')!;
     this.workspaceHost = root.querySelector<HTMLElement>('[data-workspace-host]')!;
     this.overlayHost = root.querySelector<HTMLElement>('[data-overlay-host]')!;
-    for (const type of ['click', 'input', 'change', 'submit', 'keydown'] as const) root.addEventListener(type, this.onAction);
+    for (const type of ['click', 'input', 'change', 'submit', 'keydown', 'dragstart', 'dragover', 'drop', 'dragend'] as const) root.addEventListener(type, this.onAction);
   }
 
   updateChrome(shellClass: string, markup: string): void {
@@ -97,7 +97,7 @@ export class WorkspaceController {
     this.activeLifecycle?.deactivate?.();
     this.activeLifecycle?.dispose();
     this.activeLifecycle = null;
-    for (const type of ['click', 'input', 'change', 'submit', 'keydown'] as const) this.root.removeEventListener(type, this.onAction);
+    for (const type of ['click', 'input', 'change', 'submit', 'keydown', 'dragstart', 'dragover', 'drop', 'dragend'] as const) this.root.removeEventListener(type, this.onAction);
     this.root.replaceChildren();
   }
 }

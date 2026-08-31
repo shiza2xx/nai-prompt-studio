@@ -10,7 +10,7 @@ import { MetadataWorkspace, type MetadataSaveKind, type MetadataSavePayload } fr
 import { WorkspaceController, type WorkspaceId } from './workspace-controller';
 import { PromptWorkspaceModule } from './workspaces/prompt-workspace';
 import { SavedLibraryWorkspaceModule } from './workspaces/saved-library-workspace';
-import { CustomTagsWorkspaceModule } from './workspaces/custom-tags-workspace';
+import { CustomTagsWorkspaceModule, type CustomTagSort } from './workspaces/custom-tags-workspace';
 import { PreviewCache, PREVIEW_IMAGE_SELECTOR, type PreviewImageLike, type PreviewLease, type PreviewPriority, type PreviewRootLike } from './preview-cache';
 import { createOfficialArtistThumbnail } from './artist-thumbnail';
 import { buildArtistsPrompt, buildBasePrompt, buildCharacterPrompt, serializeTag } from './prompt';
@@ -27,7 +27,7 @@ type ConstructorTarget = { kind: 'base'; zone: ConstructorZone } | { kind: 'char
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.7';
+const APP_VERSION = '0.6.8';
 const initialWorkspaceRecoveryError = workspaceRecoveryError();
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
@@ -184,6 +184,7 @@ let customImageMime: CustomTag['mime'] | null = null;
 let customImageName = '';
 let customTagPackStatus = '';
 let customTagPackStatusKind: 'success' | 'error' | 'cancelled' | '' = '';
+let customTagSort: CustomTagSort = 'default';
 const customImageUrls = new Map<string, string>();
 const savedLibraryImageUrls = new Map<string, string>();
 let savedLibrarySearch = '';
@@ -220,6 +221,7 @@ const savedLibraryWorkspaceModule = new SavedLibraryWorkspaceModule(() => ({
 const customTagsWorkspaceModule = new CustomTagsWorkspaceModule(() => ({
   tags: customTags, presets: customTagPresets, selectedPresetId: selectedCustomPresetId, editingId: editingCustomTagId,
   formKind: customTagFormKind, search: customTagSearch, filter: customTagFilter, creatingPreset: creatingCustomPreset,
+  sort: customTagSort,
   renamingPresetId: renamingCustomPresetId, deletingPresetId: deletingCustomPresetId, deleteError: customPresetDeleteError,
   warning: customTagLibraryWarning, packStatus: customTagPackStatus, packStatusKind: customTagPackStatusKind,
   packAvailable: Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags),
@@ -229,6 +231,7 @@ const customTagsWorkspaceModule = new CustomTagsWorkspaceModule(() => ({
 }), {
   search: value => { customTagSearch = value; scheduleSearch(() => { if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); }); },
   filter: value => { customTagFilter = value; if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); },
+  sort: value => { customTagSort = value; if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); },
   selectPreset: value => { selectedCustomPresetId = value === 'all' ? 'all' : value; deletingCustomPresetId = null; render(); },
   beginCreatePreset: () => { creatingCustomPreset = true; render(); window.setTimeout(() => document.querySelector<HTMLInputElement>('#custom-preset-name')?.focus(), 0); },
   cancelCreatePreset: () => { creatingCustomPreset = false; render(); }, createPreset: name => { void createCustomPreset(name); },
@@ -238,6 +241,8 @@ const customTagsWorkspaceModule = new CustomTagsWorkspaceModule(() => ({
   cancelDeletePreset: () => { deletingCustomPresetId = null; customPresetDeleteError = ''; render(); }, confirmDeletePreset: (presetId, mode) => { void deleteCustomPreset(presetId, mode); },
   editTag: tagId => { const item = customTags.find(tag => tag.id === tagId); if (!item) return; editingCustomTagId = item.id; customTagFormKind = item.kind === 'artist' ? 'artist' : 'tag'; selectedCustomPresetId = customTagPresetId(item); customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); },
   deleteTag: tagId => { void deleteCustomTag(tagId); }, cancelEdit: () => { editingCustomTagId = null; customTagFormKind = 'tag'; customImageBytes = null; customImageMime = null; customImageName = ''; clearDraftCustomImage(); render(); },
+  moveTag: (tagId, presetId) => { void moveCustomTag(tagId, presetId); },
+  reorder: ids => { void reorderCustomTags(ids); },
   setKind: kind => { customTagFormKind = kind; render(); }, readImage: file => { void readCustomImage(file); }, saveTag: () => { void saveCustomTagFromForm(); },
   importPack: () => { setCustomTagPackStatus('Opening .naipack…'); void importCustomTags().then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error))); },
   exportPreset: presetId => { setCustomTagPackStatus('Preparing .naipack…'); void exportCustomTags(presetId).then(finishCustomTagPackResult).catch(error => finishCustomTagPackResult(customTagPackError(error))); }
@@ -2018,6 +2023,53 @@ async function deleteCustomTag(tagId: string): Promise<void> {
   saveCustomTags(customTags);
   render();
 }
+
+async function moveCustomTag(tagId: string, destinationPresetId: string): Promise<void> {
+  const item = customTags.find(tag => tag.id === tagId);
+  const destination = customTagPresets.find(preset => preset.id === destinationPresetId);
+  if (!item || !destination || customTagPresetId(item) === destinationPresetId) return;
+  try {
+    if (window.naiStorage?.transactCustomTags) {
+      const snapshot = await transactCustomTags('card:move', { id: tagId, destinationPresetId });
+      if (!snapshot) throw new Error('Custom Tags transaction is unavailable.');
+      applyCustomTagSnapshot(snapshot);
+    } else {
+      customTags = customTags.map(tag => tag.id === tagId ? { ...tag, presetId: destinationPresetId, updatedAt: new Date().toISOString() } : tag);
+      rebuildEffectiveArtistCatalog();
+      saveCustomTags(customTags);
+    }
+  } catch (error) {
+    customTagLibraryWarning = error instanceof Error ? error.message : 'The card could not be moved.';
+    render();
+    return;
+  }
+  render();
+}
+
+async function reorderCustomTags(orderedIds: string[]): Promise<void> {
+  if (selectedCustomPresetId === 'all' || customTagSearch.trim() || customTagFilter !== 'all' || customTagSort !== 'default') return;
+  const preset = customTagPresets.find(item => item.id === selectedCustomPresetId);
+  if (!preset) return;
+  const current = customTags.filter(tag => customTagPresetId(tag) === preset.id);
+  const expected = current.map(tag => tag.id);
+  if (orderedIds.length !== expected.length || new Set(orderedIds).size !== expected.length || orderedIds.some(idValue => !expected.includes(idValue))) return;
+  try {
+    if (window.naiStorage?.transactCustomTags) {
+      const snapshot = await transactCustomTags('card:reorder', { presetId: preset.id, orderedCardIds: orderedIds });
+      if (!snapshot) throw new Error('Custom Tags transaction is unavailable.');
+      applyCustomTagSnapshot(snapshot);
+    } else {
+      const byId = new Map(current.map(tag => [tag.id, tag]));
+      let index = 0;
+      customTags = customTags.map(tag => customTagPresetId(tag) === preset.id ? byId.get(orderedIds[index++])! : tag);
+      saveCustomTags(customTags);
+    }
+  } catch (error) {
+    customTagLibraryWarning = error instanceof Error ? error.message : 'The card order could not be saved.';
+  }
+  render();
+}
+
 function closeArtistPicker(): void {
   clearHoverPreviewCache();
   const picker = document.querySelector<HTMLElement>('#artist-picker-backdrop');

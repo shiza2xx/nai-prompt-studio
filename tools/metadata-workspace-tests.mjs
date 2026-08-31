@@ -26,6 +26,7 @@ const librarySaved = await (async () => { libraryCalls += 1; return true; })();
 assert.equal(librarySaved, true, 'the explicit library action remains an independent callback');
 assert.equal(libraryCalls, 1);
 assert.equal(await dispatchMetadataTagSave(undefined, 'selected tag', 'frame', 'default', preview), false);
+assert.equal(await dispatchMetadataTagSave(payload => { tagCalls += 1; return payload.presetId === 'folder-2'; }, 'selected tag', 'frame', '', preview), false, 'a missing folder id must not be redirected to My Tags');
 
 const workspaceSource = readFileSync(new URL('../src/metadata-workspace.ts', import.meta.url), 'utf8');
 const inspectMethod = workspaceSource.slice(workspaceSource.indexOf('private inspectSelection'), workspaceSource.indexOf('\n  private positionSelectionPopover', workspaceSource.indexOf('private inspectSelection')));
@@ -54,6 +55,13 @@ const overlayMethod = workspaceSource.slice(workspaceSource.indexOf('  overlayMa
 assert.match(overlayMethod, /role="combobox"[\s\S]*aria-haspopup="listbox"/, 'metadata folder control must be an accessible custom combobox');
 assert.match(overlayMethod, /role="listbox"/, 'metadata folder control must expose a listbox');
 assert.match(overlayMethod, /role="option"[\s\S]*aria-selected/, 'metadata folder options must expose selected state');
+assert.match(workspaceSource, /lastMetadataTagFolderId/, 'metadata destination memory must be session-local');
+assert.match(workspaceSource, /retained = folders\.find\(folder => folder\.id === this\.lastMetadataTagFolderId\)/, 'metadata dialog must restore the last valid folder');
+assert.match(workspaceSource, /private lastMetadataTagCategory: MetadataTagCategory = 'frame'/, 'metadata category memory starts at Frame per renderer session');
+assert.match(workspaceSource, /this\.tagDialogCategory = this\.lastMetadataTagCategory/, 'new Save tag dialogs restore the last selected category');
+assert.match(workspaceSource, /this\.lastMetadataTagCategory = this\.tagDialogCategory/, 'category selection updates session memory');
+assert.match(selectedTagMethod, /selected folder is no longer available/, 'a deleted metadata destination must keep the dialog open with an error');
+assert.doesNotMatch(workspaceSource.slice(workspaceSource.indexOf('private syncTagDialogDom'), workspaceSource.indexOf('\n  private bindTagDialog', workspaceSource.indexOf('private syncTagDialogDom'))), /this\.tagDialogPresetId = selectedFolder\.id/, 'dialog sync must not silently replace an unavailable destination');
 assert.doesNotMatch(overlayMethod, /<select[^>]+metadata-tag-folder/, 'metadata folder control must not use a native select');
 assert.match(workspaceSource, /CUSTOM_TAG_MAX_LENGTH/, 'metadata selection and save validation share the 4096 limit');
 const folderBinding = workspaceSource.slice(workspaceSource.indexOf('private bindTagDialog'), workspaceSource.indexOf('\n  private inspectSelection', workspaceSource.indexOf('private bindTagDialog')));
