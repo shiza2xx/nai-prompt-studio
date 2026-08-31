@@ -20,5 +20,7 @@ jobs:
           Get-ChildItem electron,tools -Recurse -File | Where-Object Extension -in '.cjs','.mjs' | ForEach-Object { node --check $_.FullName; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
       - run: node node_modules/typescript/bin/tsc --noEmit
       - run: npm test
-      - run: npm run build
+      # Release builds additionally thin the local catalog payload. Catalogs are
+      # release assets and are intentionally absent from a clean CI checkout.
+      - run: npm run build:ci
       - run: npm run release:preflight

@@ -20,6 +20,7 @@
     "web:dev": "node tools/run-local.mjs node node_modules/vite/bin/vite.js",
     "desktop:dev": "node tools/start-desktop-dev.mjs",
     "build": "node tools/run-local.mjs node tools/prepare-icon.mjs && node tools/run-local.mjs node node_modules/typescript/bin/tsc --noEmit && node tools/run-local.mjs node node_modules/vite/bin/vite.js build && node tools/run-local.mjs powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/thin-dist-catalog.ps1",
+    "build:ci": "node tools/run-local.mjs node tools/prepare-icon.mjs && node tools/run-local.mjs node node_modules/typescript/bin/tsc --noEmit && node tools/run-local.mjs node node_modules/vite/bin/vite.js build --mode ci --outDir .qa-artifacts/ci-dist",
     "desktop:build": "node tools/run-local.mjs node tools/build-desktop.mjs",
     "preview": "node tools/run-local.mjs node node_modules/vite/bin/vite.js preview",
     "catalog:update:v5": "node tools/run-local.mjs node tools/update-v5-catalog.mjs",
