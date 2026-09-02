@@ -19,7 +19,7 @@ assert.doesNotMatch(uiSource, /Gothic Ivory/);
 assert.match(indexSource, /celestial-light','ember-peach','gothic-ivory','galaxy/);
 assert.match(indexSource, /name="theme-color" content="#000000"/);
 assert.match(electronSource, /backgroundColor: '#000000'/);
-assert.match(uiSource, /v060-themes/);
+assert.doesNotMatch(uiSource, /v060-themes/, 'legacy v0.6 update-tour candidates are not part of the Studio Guide');
 assert.match(styleSource, /\[data-theme="celestial-light"\][\s\S]*color-scheme: light/);
 assert.match(styleSource, /\[data-theme="ember-peach"\]/);
 const galaxyThemeTokens = styleSource.match(/\[data-theme="galaxy"\]\s*\{([^}]*)\}/)?.[1] ?? '';
@@ -191,7 +191,7 @@ assert.match(styleSource, /\.mix-anchor-group\.is-multi-anchor[\s\S]*grid-templa
 assert.match(styleSource, /\.mix-orbit-primary\.mix-anchor-group\.is-multi-anchor \{ max-width: min\(560px, calc\(100% - 20px\)\); \}/);
 assert.doesNotMatch(styleSource.match(/\.mix-orbit\[data-layout-density="compact"\] \.mix-anchor-group\.is-multi-anchor[\s\S]*?\n\}/)?.[0] ?? '', /width: 96px|height: 64px/);
 assert.match(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'), /Eight interface themes/);
-assert.equal(packageSource.version, '0.6.8');
+assert.equal(packageSource.version, '0.6.9');
 assert.equal(lockSource.version, packageSource.version);
 assert.equal(lockSource.packages[''].version, packageSource.version);
 assert.match(installerBuildSource, /nsis-template-override\.cjs'\)\.replaceAll\('\\\\', '\/'\)/);

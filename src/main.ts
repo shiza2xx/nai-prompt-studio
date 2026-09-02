@@ -19,15 +19,21 @@ import { MAX_PROMPT_RANDOM_ARTISTS, normalizeArtistWeight, promptArtistPoolSize,
 import { canonicalCustomTagIdentity, canonicalGroupIdentity, classifyGuideEntries, constructorCardTags, groupConstructorCards, hasPromptTagGroup, mergeConstructorCards, qualityPresetTags, searchConstructorFolders, splitTagGroup, togglePromptTagGroup, type ConstructorCard, type ConstructorFolder, type ConstructorPresetFolder, type ConstructorZone } from './prompt-constructor';
 import { deleteLibraryImage, exportCustomTags, hasExistingProfile, importCustomTags, importCustomTagsPath, loadArtistMix, loadCustomTagLibraryWarning, loadCustomTagPresets, loadCustomTags, loadDraft, loadFavorites, loadSavedLibrary, loadSettings, loadSets, normalizeAnimationMode, normalizeArtistMix, normalizeCustomTagPresets, normalizePreviewCachePreset, saveArtistMix, saveCustomTagPresets, saveCustomTags, saveDraft, saveFavorites, saveSavedLibrary, saveSettings, saveSets, saveLibraryImage, transactCustomTags, workspaceRecoveryError } from './storage';
 import { CUSTOM_TAG_MAX_LENGTH, PREVIEW_CACHE_BUDGETS, type AnimationMode, type AppSettings, type ArtistMixDraft, type BasePrompt, type CatalogCard, type Character, type CustomTag, type CustomTagKind, type CustomTagPackResult, type CustomTagPreset, type CustomTagZone, type GuideExample, type OfflineCatalog, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedCharacterItem, type SavedLibraryItem, type SavedPromptData, type SavedPromptSnapshot, type WeightedTag } from './types';
+import releaseNotes from './release-notes.json';
+import { shouldShowWhatsNew } from './release-state';
 import type { CatalogComponentProgress, CatalogComponentStatus, UpdateManifest, UpdateProgress } from './global';
 
 type Zone = 'frame' | 'scene' | 'render' | 'undesired';
-type Modal = 'artists' | 'characters' | 'character-details' | 'character-remove' | 'constructor' | 'saved-library' | null;
+type Modal = 'artists' | 'characters' | 'character-details' | 'character-remove' | 'constructor' | 'saved-library' | 'onboarding' | 'whats-new' | null;
 type ConstructorTarget = { kind: 'base'; zone: ConstructorZone } | { kind: 'character'; characterId: string };
 
 const FALLBACK_TAGS = ['girl', 'boy', '1girl', '1boy', 'masterpiece', 'best quality', 'upper body', 'full body', 'looking at viewer'];
 const DEFAULT_RANGE = { min: 2, max: 5 };
-const APP_VERSION = '0.6.8';
+const APP_VERSION = '0.6.9';
+const forbiddenReleasePunctuation = /[\u2014\u2013]/;
+const validReleaseCopy = (value: unknown): value is string => typeof value === 'string' && Boolean(value.trim()) && !forbiddenReleasePunctuation.test(value);
+const cleanupNotice = releaseNotes.cleanupNotice;
+if (releaseNotes.version !== APP_VERSION || !validReleaseCopy(releaseNotes.summary) || !Array.isArray(releaseNotes.whatsNew) || releaseNotes.whatsNew.length < 1 || releaseNotes.whatsNew.some(item => !item || !validReleaseCopy(item.title) || !validReleaseCopy(item.copy)) || !cleanupNotice || !validReleaseCopy(cleanupNotice.title) || !validReleaseCopy(cleanupNotice.copy) || !Array.isArray(cleanupNotice.steps) || cleanupNotice.steps.length < 3 || cleanupNotice.steps.some(step => !validReleaseCopy(step))) throw new Error('The local release notes record is invalid or does not match the application version.');
 const initialWorkspaceRecoveryError = workspaceRecoveryError();
 const accordionOpenState: Record<Zone, boolean> = { frame: true, scene: true, render: true, undesired: false };
 const existingProfileAtStartup = hasExistingProfile();
@@ -109,6 +115,12 @@ const gridPreviewCache = new PreviewCache({
 });
 const contentPreviewCache = new PreviewCache({ variant: 'content', maxBytes: activePreviewBudgets().content, foregroundConcurrency: 4, backgroundConcurrency: 2 });
 const hoverPreviewCache = new PreviewCache({ variant: 'official-artist-original', maxBytes: activePreviewBudgets().hover, foregroundConcurrency: 4, backgroundConcurrency: 2 });
+const CUSTOM_TAG_ORIGINAL_RECENT_LIMIT = 24;
+let customTagOriginalObserver: IntersectionObserver | null = null;
+let customTagOriginalScope: HTMLElement | null = null;
+let customTagOriginalLease: PreviewLease | null = null;
+let customTagOriginalGeneration = 0;
+const customTagOriginalRecentSources: string[] = [];
 // Keep this name as a local compatibility alias for startup/catalog callers.
 const previewCache = gridPreviewCache;
 let previewIdleCancel: (() => void) | null = null;
@@ -140,6 +152,12 @@ let appUpdateUnsubscribe: (() => void) | null = null;
 let onboardingOpen = false;
 let onboardingSteps: Array<{ id: string; title: string; copy: string }> = [];
 let onboardingIndex = 0;
+let guideAcknowledgesRelease = false;
+let guideReturnFocus: HTMLElement | null = null;
+let whatsNewOpen = false;
+let whatsNewClosing = false;
+let whatsNewReturnFocus: HTMLElement | null = null;
+let feedbackStatus = '';
 let mixThreadFrame: number | undefined;
 let mixPickerMode: 'primary' | 'companion' | 'replace-anchor' = 'primary';
 let mixPickerReplaceTarget: string | null = null;
@@ -170,6 +188,9 @@ let customTags: CustomTag[] = loadCustomTags();
 let appliedCustomArtistSignature = '';
 let customTagLibraryWarning = loadCustomTagLibraryWarning();
 if (customTagLibraryWarning) console.warn(`[custom-tags] ${customTagLibraryWarning}`);
+let customTagMovePendingId: string | null = null;
+let customTagMoveError = '';
+let customTagMoveToken = 0;
 let selectedCustomPresetId = DEFAULT_CUSTOM_TAG_PRESET_ID;
 let customTagSearch = '';
 let customTagFilter: CustomTagZone | 'artist' | 'all' = 'all';
@@ -227,6 +248,7 @@ const customTagsWorkspaceModule = new CustomTagsWorkspaceModule(() => ({
   packAvailable: Boolean(window.naiStorage?.importCustomTags && window.naiStorage?.exportCustomTags),
   draftImageUrl: customImageBytes && customImageMime ? customImageUrls.get('__draft__') ?? '' : '',
   shadowedArtistIds: shadowedCustomArtistIds, defaultPresetId: DEFAULT_CUSTOM_TAG_PRESET_ID,
+  movePendingId: customTagMovePendingId, moveError: customTagMoveError,
   imageUrl: customTagImageUrl, escape: escapeHtml
 }), {
   search: value => { customTagSearch = value; scheduleSearch(() => { if (workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade); }); },
@@ -450,10 +472,16 @@ function themeOptions(): string { return studioThemes.map(theme => `<option valu
 function onboardingMarkup(): string {
   if (!onboardingOpen || !onboardingSteps.length) return '';
   const step = onboardingSteps[onboardingIndex];
-  const isThemeStep = step.id === 'v060-themes';
-  const chooser = isThemeStep ? `<div class="onboarding-theme-choices" role="group" aria-label="Choose a studio theme">${studioThemes.map(theme => `<button type="button" class="theme-swatch ${settings.theme === theme.id ? 'selected' : ''}" data-guide-theme="${theme.id}" aria-pressed="${settings.theme === theme.id}"><i data-theme-swatch="${theme.id}"></i>${theme.label}</button>`).join('')}</div>` : '';
-  return `<div class="modal-backdrop onboarding-backdrop"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="guide-title"><p class="eyebrow">STUDIO GUIDE ${onboardingIndex + 1} / ${onboardingSteps.length}</p><h2 id="guide-title">${escapeHtml(step.title)}</h2><p>${escapeHtml(step.copy)}</p>${chooser}<div class="onboarding-actions"><button class="secondary" id="guide-skip" type="button">Skip guide</button><button class="primary" id="guide-next" type="button">${onboardingIndex + 1 === onboardingSteps.length ? 'Open studio' : 'Next'}</button></div></section></div>`;
+  return `<div class="modal-backdrop onboarding-backdrop" id="onboarding-backdrop"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="guide-title"><p class="eyebrow">STUDIO GUIDE ${onboardingIndex + 1} / ${onboardingSteps.length}</p><h2 id="guide-title">${escapeHtml(step.title)}</h2><p>${escapeHtml(step.copy)}</p><div class="onboarding-actions"><button class="secondary" id="guide-skip" type="button">Skip guide</button><button class="primary" id="guide-next" type="button">${onboardingIndex + 1 === onboardingSteps.length ? 'Open studio' : 'Next'}</button></div></section></div>`;
 }
+
+function whatsNewMarkup(): string {
+  if (!whatsNewOpen) return '';
+  const items = releaseNotes.whatsNew.map(item => `<li><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.copy)}</span></li>`).join('');
+  const cleanupSteps = cleanupNotice.steps.map((step, index) => `<li><span class="whats-new-step-number" aria-hidden="true">${index + 1}</span><span>${escapeHtml(step)}</span></li>`).join('');
+  return `<div class="modal-backdrop whats-new-backdrop" id="whats-new-backdrop"><section class="whats-new-card" role="dialog" aria-modal="true" aria-labelledby="whats-new-title" aria-describedby="whats-new-summary whats-new-cleanup-copy"><header><div><p class="eyebrow">WHAT'S NEW · ${escapeHtml(releaseNotes.version)}</p><h2 id="whats-new-title">A smoother Custom Tags workflow</h2></div><button class="icon-button" id="close-whats-new" type="button" aria-label="Close What's New">×</button></header><div class="whats-new-scroll" tabindex="0" aria-label="What's New details"><p id="whats-new-summary" class="whats-new-summary">${escapeHtml(releaseNotes.summary)}</p><ul class="whats-new-list">${items}</ul><section class="whats-new-cleanup" aria-labelledby="whats-new-cleanup-title"><p class="eyebrow">STORAGE NOTE</p><h3 id="whats-new-cleanup-title">${escapeHtml(cleanupNotice.title)}</h3><p id="whats-new-cleanup-copy">${escapeHtml(cleanupNotice.copy)}</p><ol class="whats-new-steps">${cleanupSteps}</ol></section></div><p id="feedback-status" class="feedback-status" role="status" aria-live="polite">${escapeHtml(feedbackStatus)}</p><div class="whats-new-actions"><button class="secondary" type="button" data-open-feedback>Send feedback</button><button class="primary" id="whats-new-continue" type="button">Continue</button></div></section></div>`;
+}
+
 function startGuide(replay = false): void {
   const overview = [
     { id: 'overview-prompt', title: 'Prompt Builder', copy: 'Build frame, scene, render, artist and character prompt blocks in one workspace.' },
@@ -463,13 +491,82 @@ function startGuide(replay = false): void {
     { id: 'overview-metadata', title: 'Image Metadata', copy: 'Drop a PNG or WebP image to inspect and copy its NovelAI generation data.' },
     { id: 'overview-settings', title: 'Settings', copy: 'Choose a theme, control motion and manage catalog or application updates.' }
   ];
-  const update = [{ id: 'v040-mix-anchors', title: 'Multiple Artist Mix anchors', copy: 'Pin companion cards as anchors. Mix and global rerolls preserve every pinned artist.' }, { id: 'v040-theme-updates', title: 'Themes and updates', copy: 'Settings includes studio themes, catalog refresh controls and secure GitHub update checks.' }, { id: 'v050-saved-library', title: 'Saved Library', copy: 'Save complete prompt and Artist Mix records, then edit or copy them from one library.' }, { id: 'v060-themes', title: 'Eight studio themes', copy: 'Choose a theme now. Your selection applies immediately and stays on this device.' }];
-  const candidates = replay || !existingProfileAtStartup ? overview : update;
-  onboardingSteps = replay ? candidates : candidates.filter(step => !settings.seenGuideIds.includes(step.id));
+  onboardingSteps = replay ? overview : overview.filter(step => !settings.seenGuideIds.includes(step.id));
   onboardingIndex = 0; onboardingOpen = onboardingSteps.length > 0;
-  if (!replay && !onboardingOpen) { settings = { ...settings, lastSeenVersion: APP_VERSION }; saveSettings(settings); }
+  guideAcknowledgesRelease = !replay && !existingProfileAtStartup;
+  guideReturnFocus = replay && document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  if (onboardingOpen) modal = 'onboarding';
+  if (!onboardingOpen && guideAcknowledgesRelease) { settings = { ...settings, lastSeenVersion: APP_VERSION }; saveSettings(settings); guideAcknowledgesRelease = false; }
 }
-function finishGuide(): void { settings = { ...settings, seenGuideIds: [...new Set([...settings.seenGuideIds, ...onboardingSteps.map(step => step.id)])], lastSeenVersion: APP_VERSION }; saveSettings(settings); onboardingOpen = false; render(); }
+function finishGuide(): void {
+  const acknowledgeRelease = guideAcknowledgesRelease;
+  const trigger = guideReturnFocus;
+  settings = { ...settings, seenGuideIds: [...new Set([...settings.seenGuideIds, ...onboardingSteps.map(step => step.id)])], ...(acknowledgeRelease ? { lastSeenVersion: APP_VERSION } : {}) };
+  saveSettings(settings);
+  guideAcknowledgesRelease = false;
+  guideReturnFocus = null;
+  onboardingOpen = false;
+  if (modal === 'onboarding') modal = null;
+  render();
+  if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+  else if (trigger) document.querySelector<HTMLElement>('#replay-guide')?.focus({ preventScroll: true });
+}
+
+function focusOnboarding(): void {
+  window.setTimeout(() => document.querySelector<HTMLElement>('#onboarding-backdrop [role="dialog"] button:not([disabled])')?.focus(), 0);
+}
+
+function prepareWhatsNew(replay = false): void {
+  whatsNewReturnFocus = replay && document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  feedbackStatus = '';
+  whatsNewOpen = true;
+  whatsNewClosing = false;
+  modal = 'whats-new';
+}
+
+function startWhatsNew(replay = false): void {
+  prepareWhatsNew(replay);
+  render();
+  focusWhatsNew();
+}
+
+function focusWhatsNew(): void {
+  window.setTimeout(() => document.querySelector<HTMLElement>('#whats-new-backdrop [role="dialog"] button:not([disabled])')?.focus(), 0);
+}
+
+function dismissWhatsNew(): void {
+  if (!whatsNewOpen || whatsNewClosing) return;
+  whatsNewClosing = true;
+  settings = { ...settings, lastSeenVersion: APP_VERSION };
+  saveSettings(settings);
+  const trigger = whatsNewReturnFocus;
+  closeRenderedDialog('#whats-new-backdrop', () => {
+    whatsNewOpen = false;
+    whatsNewClosing = false;
+    whatsNewReturnFocus = null;
+    feedbackStatus = '';
+    if (modal === 'whats-new') modal = null;
+    render();
+    if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    else if (trigger) document.querySelector<HTMLElement>('#replay-whats-new')?.focus({ preventScroll: true });
+  });
+}
+
+function setFeedbackStatus(status: string): void {
+  feedbackStatus = status;
+  document.querySelectorAll<HTMLElement>('#feedback-status, #settings-feedback-status').forEach(node => { node.textContent = status; });
+}
+
+async function openFeedback(): Promise<void> {
+  setFeedbackStatus('');
+  try {
+    const opened = await window.naiExternal?.openFeedback();
+    if (opened !== true) throw new Error('Feedback could not be opened.');
+    setFeedbackStatus('');
+  } catch {
+    setFeedbackStatus('Feedback could not be opened. Try again.');
+  }
+}
 
 function mixMotionEnabled(): boolean {
   return motionEnabled();
@@ -831,7 +928,7 @@ function componentSettingsMarkup(browserOnly: boolean): string {
 function settingsWorkspace(): string {
   const browserOnly = !window.naiCatalog;
   const catalogControls = browserOnly ? '' : `<div class="catalog-update-status" id="catalog-update-status" role="status" aria-live="polite">${escapeHtml(catalogUpdateStatus || catalogUpdateError || 'Ready to check.')}</div><div class="catalog-update-progress" id="catalog-update-progress"${catalogUpdateBusy ? '' : ' hidden'}><div class="progress-track"><span style="width:0%"></span></div><small id="catalog-update-progress-label">Preparing...</small></div><div class="settings-actions"><button class="primary" id="download-missing-v5" type="button" ${catalogUpdateBusy ? 'disabled' : ''}>${catalogUpdateBusy ? 'Updating...' : 'Update catalog now'}</button><button class="secondary" id="cancel-v5-update" type="button"${catalogUpdateBusy ? '' : ' hidden'}>Cancel</button></div>`;
-  return `<section id="settings-panel" class="${workspacePanelClass('settings')} settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">PREVIEWS</p><h3>Memory budget</h3><label class="settings-field">Artist preview cache<select id="preview-cache-preset"><option value="large"${settings.previewCachePreset === 'large' ? ' selected' : ''}>Large · 1.5 GB total</option><option value="balanced"${settings.previewCachePreset === 'balanced' ? ' selected' : ''}>Balanced · 576 MB total</option></select></label><p class="settings-help">Official artist cards use runtime thumbnails; originals are kept only while hovering.</p></section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview for every workspace.</p><button class="secondary" id="replay-guide" type="button">Replay guide</button></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
+  return `<section id="settings-panel" class="${workspacePanelClass('settings')} settings-workspace" role="tabpanel" aria-labelledby="settings-tab"><header class="workspace-intro"><div><p class="eyebrow">STUDIO SETTINGS</p><h2>Make the studio yours.</h2><p>Preferences, catalog data and updates stay beside the application.</p></div></header><div class="settings-grid"><section class="settings-card"><p class="eyebrow">APPEARANCE</p><h3>Theme and motion</h3><label class="settings-field">Theme<select id="studio-theme">${themeOptions()}</select></label>${settingsAnimationModeMarkup()}</section><section class="settings-card"><p class="eyebrow">PREVIEWS</p><h3>Memory budget</h3><label class="settings-field">Artist preview cache<select id="preview-cache-preset"><option value="large"${settings.previewCachePreset === 'large' ? ' selected' : ''}>Large · 1.5 GB total</option><option value="balanced"${settings.previewCachePreset === 'balanced' ? ' selected' : ''}>Balanced · 576 MB total</option></select></label><p class="settings-help">Official artist cards use runtime thumbnails; originals are kept only while hovering.</p></section><section class="settings-card"><p class="eyebrow">STARTUP</p><h3>Automatic checks</h3><label class="settings-toggle"><input id="startup-catalog-update" type="checkbox" ${settings.updateCatalogOnStartup ? 'checked' : ''}><span>Update V5 catalog on startup</span></label><label class="settings-toggle"><input id="startup-app-update" type="checkbox" ${settings.checkAppUpdatesOnStartup ? 'checked' : ''}><span>Check app updates on startup</span></label><label class="settings-toggle"><input id="preload-character-previews" type="checkbox" ${settings.preloadCharacterPreviews ? 'checked' : ''}><span>Preload character previews</span></label></section><section class="settings-card"><p class="eyebrow">GUIDE</p><h3>Studio tour</h3><p>Replay the English overview or the current release notes.</p><div class="settings-actions"><button class="secondary" id="replay-guide" type="button">Replay guide</button><button class="secondary" id="replay-whats-new" type="button">Replay What's New</button></div></section><section class="settings-card"><p class="eyebrow">FEEDBACK</p><h3>Help shape the studio</h3><p>Tell us what is working and what would make prompt building better.</p><button class="secondary" type="button" data-open-feedback>Send feedback</button><p id="settings-feedback-status" class="feedback-status" role="status" aria-live="polite">${escapeHtml(feedbackStatus)}</p></section><section class="settings-card settings-catalog-card"><div class="settings-card-heading"><div><p class="eyebrow">CARD LIBRARIES</p><h3>Catalog components</h3></div><span class="catalog-count">${officialArtists.length.toLocaleString()} official cards</span></div><p>Each library is independently verified and can be downloaded or repaired without deleting local data.</p>${componentSettingsMarkup(browserOnly)}${appUpdateMarkup(browserOnly)}${catalogControls}</section></div></section>`;
 }
 
 function artistPickerMarkup(): string {
@@ -894,6 +991,10 @@ function savedLibraryModalMarkup(): string {
 function customTagImageUrl(tag: CustomTag): string {
   const transient = customImageUrls.get(tag.id);
   if (transient) return transient;
+  // Canonical previews are content-addressed. A folder move keeps this URL
+  // stable, while a replacement image necessarily changes its digest.
+  const filename = tag.imageAsset?.replace(/\\/g, '/').split('/').at(-1) ?? '';
+  if (tag.id && /^[a-f0-9]{64}\.(?:png|jpg|webp)$/.test(filename)) return `nai-custom://card/${encodeURIComponent(tag.id)}/${filename}`;
   return tag.imageAsset ? `nai-custom://asset/${encodeURIComponent(tag.imageAsset)}` : './plus.png';
 }
 
@@ -1029,6 +1130,7 @@ function switchWorkspace(workspace: 'prompt' | 'artist-mix' | 'saved-library' | 
   if (workspace === activeWorkspace) return;
   cancelStartupIdlePreviews();
   if (activeWorkspace === 'metadata') metadataWorkspace.deactivate();
+  if (activeWorkspace === 'custom-tags') releaseCustomTagOriginalScope();
   clearHoverPreviewCache();
   focusMode = false;
   activeWorkspace = workspace;
@@ -1067,7 +1169,7 @@ function render(): void {
   if (!workspaceController) workspaceController = new WorkspaceController(app, routeDelegatedShellAction);
   workspaceController.updateChrome(shellClass, chrome);
   workspaceController.mount(activeWorkspace as WorkspaceId, activeMarkup);
-  workspaceController.updateOverlays(`${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${activeWorkspace === 'metadata' ? metadataWorkspace.overlayMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}`);
+  workspaceController.updateOverlays(`${activeWorkspace === 'prompt' ? `${artistPickerMarkup()}${characterPickerMarkup()}${constructorModalMarkup()}` : activeWorkspace === 'artist-mix' ? mixPickerMarkup() : ''}${activeWorkspace === 'metadata' ? metadataWorkspace.overlayMarkup() : ''}${savedLibraryModalMarkup()}${onboardingMarkup()}${whatsNewMarkup()}`);
   pendingWorkspaceTransition = null;
   bindEvents();
   bindPreviewFade(app.querySelector<HTMLElement>('.app-shell') ?? app);
@@ -1077,8 +1179,11 @@ function render(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-guide-theme]').forEach(button => button.addEventListener('click', () => {
     const theme = button.dataset.guideTheme;
     if (!studioThemes.some(item => item.id === theme)) return;
-    settings = { ...settings, theme: theme as AppSettings['theme'] }; applyTheme(); saveSettings(settings); render();
+     settings = { ...settings, theme: theme as AppSettings['theme'] }; applyTheme(); saveSettings(settings); render();
   }));
+  document.querySelector('#close-whats-new')?.addEventListener('click', dismissWhatsNew);
+  document.querySelector('#whats-new-continue')?.addEventListener('click', dismissWhatsNew);
+  document.querySelectorAll<HTMLElement>('[data-open-feedback]').forEach(button => button.addEventListener('click', () => void openFeedback()));
   if (activeWorkspace === 'metadata') metadataWorkspace.bind(app, render);
   if (activeWorkspace === 'settings') bindSettingsEvents();
   if (activeWorkspace === 'artist-mix') bindArtistMixEvents();
@@ -1103,13 +1208,67 @@ function updatePrompt(): void {
 function hydratePreviewScope(scope: ParentNode): void {
   const images = Array.from(scope.querySelectorAll(PREVIEW_IMAGE_SELECTOR)) as unknown as PreviewImageLike[];
   for (const image of images) {
+    // Full-resolution Custom Tags are deliberately excluded from the generic
+    // background queue; their dedicated viewport loader is bounded below.
+    if (image.dataset.customOriginal === 'true') continue;
     const cache = previewCacheForImage(image);
     cache.hydrateImage(image, { priority: image.dataset.previewCache === 'grid' ? 'current-page' : 'background', isCurrent: () => true });
   }
 }
+function hydrateCustomTagOriginals(scope: ParentNode): void {
+  const grid = (scope instanceof HTMLElement && scope.id === 'custom-tag-grid') ? scope : scope.querySelector<HTMLElement>('#custom-tag-grid');
+  if (!grid) return;
+  if (customTagOriginalScope !== grid) {
+    customTagOriginalObserver?.disconnect();
+    if (customTagOriginalScope) for (const image of customTagOriginalScope.querySelectorAll<HTMLImageElement>('img[data-custom-original="true"]')) contentPreviewCache.releaseImage(image);
+    customTagOriginalScope = grid;
+    customTagOriginalGeneration += 1;
+  }
+  const generation = customTagOriginalGeneration;
+  const images = [...grid.querySelectorAll<HTMLImageElement>('img[data-custom-original="true"]')];
+  const nearVisible = images.slice(0, 6);
+  const retainSource = (source: string) => {
+    const value = source.trim(); if (!value) return;
+    const prior = customTagOriginalRecentSources.indexOf(value); if (prior >= 0) customTagOriginalRecentSources.splice(prior, 1);
+    customTagOriginalRecentSources.push(value);
+    while (customTagOriginalRecentSources.length > CUSTOM_TAG_ORIGINAL_RECENT_LIMIT) customTagOriginalRecentSources.shift();
+    customTagOriginalLease ??= contentPreviewCache.acquireLease('custom-tags-recent-originals', customTagOriginalRecentSources);
+    customTagOriginalLease.update(customTagOriginalRecentSources);
+  };
+  const hydrate = (image: HTMLImageElement, priority: PreviewPriority) => { retainSource(image.dataset.previewSrc ?? ''); return contentPreviewCache.hydrateImage(image, { priority, isCurrent: () => customTagOriginalScope === grid && grid.isConnected && generation === customTagOriginalGeneration }); };
+  for (const image of nearVisible) hydrate(image, 'visible');
+  customTagOriginalObserver?.disconnect();
+  if (typeof IntersectionObserver !== 'undefined') {
+    customTagOriginalObserver = new IntersectionObserver(entries => {
+      if (customTagOriginalScope !== grid || generation !== customTagOriginalGeneration) return;
+      for (const entry of entries) if (entry.isIntersecting) { const image = entry.target as HTMLImageElement; hydrate(image, 'visible'); customTagOriginalObserver?.unobserve(image); }
+    }, { root: grid, rootMargin: '320px 0px' });
+    for (const image of images) if (!nearVisible.includes(image)) customTagOriginalObserver.observe(image);
+  }
+}
+function pruneCustomTagOriginalSources(sources: Iterable<string>): void {
+  const removed = new Set([...sources].map(source => String(source).trim()).filter(Boolean)); if (!removed.size) return;
+  for (let index = customTagOriginalRecentSources.length - 1; index >= 0; index -= 1) if (removed.has(customTagOriginalRecentSources[index])) customTagOriginalRecentSources.splice(index, 1);
+  customTagOriginalLease?.update(customTagOriginalRecentSources);
+}
+function releaseCustomTagOriginalScope(): void {
+  customTagOriginalObserver?.disconnect();
+  if (customTagOriginalScope) for (const image of customTagOriginalScope.querySelectorAll<HTMLImageElement>('img[data-custom-original="true"]')) contentPreviewCache.releaseImage(image);
+  customTagOriginalScope = null;
+  customTagOriginalGeneration += 1;
+}
 function bindPreviewFade(scope: ParentNode = document): void {
   if (typeof previewCache !== 'undefined' && typeof hydratePreviewScope === 'function') hydratePreviewScope(scope);
-  scope.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image').forEach(image => {
+  if (typeof hydrateCustomTagOriginals === 'function') hydrateCustomTagOriginals(scope);
+  const previewImages = [...scope.querySelectorAll<HTMLImageElement>('.card-image img:first-of-type, .character-catalog-card .preview-image')];
+  // ParentNode test doubles and detached fragments do not always expose a
+  // selector method beyond the shared legacy query. Real DOM scopes include
+  // custom-library images so their direct image failures get the same fade
+  // lifecycle without changing the legacy selector contract.
+  if (typeof scope.querySelector === 'function') previewImages.push(...scope.querySelectorAll<HTMLImageElement>('.custom-library-card > img'));
+  previewImages.forEach(image => {
+    if (image.dataset?.previewFadeBound === 'true') return;
+    if (image.dataset) image.dataset.previewFadeBound = 'true';
     const markReady = () => {
       if (image.naturalWidth <= 0) return;
       image.classList.add('is-decoded');
@@ -1173,6 +1332,8 @@ function handleModalKeydown(event: KeyboardEvent): void {
     else if (modal === 'character-details' || modal === 'character-remove') { event.preventDefault(); closeDetails(); }
     else if (modal === 'constructor') { event.preventDefault(); closeConstructor(); }
     else if (modal === 'saved-library') { event.preventDefault(); closeLibraryModal(); }
+    else if (modal === 'onboarding') { event.preventDefault(); finishGuide(); }
+    else if (modal === 'whats-new') { event.preventDefault(); dismissWhatsNew(); }
     else if (!modal && focusMode && activeWorkspace === 'artist-mix') { event.preventDefault(); focusMode = false; render(); }
     return;
   }
@@ -1661,12 +1822,18 @@ function presetNameKey(value: string): string { return value.trim().replace(/\s+
 function customArtistSignature(tags: readonly CustomTag[]): string {
   return tags
     .filter(tag => tag.kind === 'artist')
-    .map(tag => [tag.id, tag.tag, tag.presetId ?? '', tag.imageAsset ?? '', tag.mime ?? '', tag.description ?? '', tag.updatedAt].join('\u001f'))
+    // Folder moves and bookkeeping timestamps do not affect artist content.
+    // The canonical preview filename is its content digest, so it changes
+    // only when the image itself is replaced.
+    .map(tag => [tag.id, tag.tag, tag.imageAsset?.replace(/\\/g, '/').split('/').at(-1) ?? '', tag.mime ?? '', tag.description ?? ''].join('\u001f'))
     .sort()
     .join('\u001e');
 }
 
 function applyCustomTagSnapshot(snapshot: { presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string }): void {
+  // A separate authoritative mutation arrived while a move was in flight.
+  // Invalidate that operation before it can restore an obsolete local state.
+  if (customTagMovePendingId) { customTagMovePendingId = null; customTagMoveToken += 1; }
   const nextArtistSignature = customArtistSignature(snapshot.tags);
   customTagPresets = snapshot.presets;
   customTags = snapshot.tags;
@@ -1676,6 +1843,7 @@ function applyCustomTagSnapshot(snapshot: { presets: CustomTagPreset[]; tags: Cu
   }
   customTagLibraryWarning = snapshot.warning ?? '';
   if (snapshot.warning) console.warn(`[custom-tags] ${snapshot.warning}`);
+  if (activeWorkspace === 'custom-tags' && workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade);
 }
 
 async function createCustomPreset(nameValue?: string): Promise<void> {
@@ -1723,6 +1891,7 @@ function reconcileDeletedCustomTags(deletedTags: readonly CustomTag[], shadowedA
   if (previewSources.length) {
     gridPreviewCache.invalidateSources(previewSources);
     contentPreviewCache.invalidateSources(previewSources);
+    pruneCustomTagOriginalSources(previewSources);
     hoverPreviewCache.invalidateSources(previewSources);
   }
   const activeDeletedArtists = deletedTags.filter(item => item.kind === 'artist' && !shadowedArtistIds.has(item.id));
@@ -2027,23 +2196,38 @@ async function deleteCustomTag(tagId: string): Promise<void> {
 async function moveCustomTag(tagId: string, destinationPresetId: string): Promise<void> {
   const item = customTags.find(tag => tag.id === tagId);
   const destination = customTagPresets.find(preset => preset.id === destinationPresetId);
-  if (!item || !destination || customTagPresetId(item) === destinationPresetId) return;
+  if (!item || !destination || customTagPresetId(item) === destinationPresetId || customTagMovePendingId) return;
+  const token = ++customTagMoveToken;
+  const beforeTags = customTags;
+  const beforeWarning = customTagLibraryWarning;
+  customTagMovePendingId = tagId;
+  customTagMoveError = '';
+  customTags = customTags.map(tag => tag.id === tagId ? { ...tag, presetId: destinationPresetId, updatedAt: new Date().toISOString() } : tag);
+  if (activeWorkspace === 'custom-tags' && workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade);
   try {
     if (window.naiStorage?.transactCustomTags) {
       const snapshot = await transactCustomTags('card:move', { id: tagId, destinationPresetId });
       if (!snapshot) throw new Error('Custom Tags transaction is unavailable.');
+      if (token !== customTagMoveToken) return;
+      customTagMovePendingId = null;
       applyCustomTagSnapshot(snapshot);
+      return;
     } else {
-      customTags = customTags.map(tag => tag.id === tagId ? { ...tag, presetId: destinationPresetId, updatedAt: new Date().toISOString() } : tag);
-      rebuildEffectiveArtistCatalog();
+      if (token !== customTagMoveToken) return;
       saveCustomTags(customTags);
+      customTagMovePendingId = null;
     }
   } catch (error) {
-    customTagLibraryWarning = error instanceof Error ? error.message : 'The card could not be moved.';
-    render();
+    if (token !== customTagMoveToken) return;
+    customTagMovePendingId = null;
+    customTagMoveError = error instanceof Error ? error.message : 'The card could not be moved.';
+    customTags = beforeTags;
+    customTagLibraryWarning = beforeWarning;
+    if (activeWorkspace === 'custom-tags' && workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade);
     return;
   }
-  render();
+  customTagMoveError = '';
+  if (activeWorkspace === 'custom-tags' && workspaceController) customTagsWorkspaceModule.refresh(workspaceController, bindPreviewFade);
 }
 
 async function reorderCustomTags(orderedIds: string[]): Promise<void> {
@@ -2578,7 +2762,8 @@ function bindSettingsEvents(): void {
   });
   document.querySelector<HTMLInputElement>('#startup-catalog-update')?.addEventListener('change', event => { settings = { ...settings, updateCatalogOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
   document.querySelector<HTMLInputElement>('#startup-app-update')?.addEventListener('change', event => { settings = { ...settings, checkAppUpdatesOnStartup: (event.target as HTMLInputElement).checked }; saveSettings(settings); });
-  document.querySelector('#replay-guide')?.addEventListener('click', () => { startGuide(true); render(); });
+  document.querySelector('#replay-guide')?.addEventListener('click', () => { startGuide(true); render(); focusOnboarding(); });
+  document.querySelector('#replay-whats-new')?.addEventListener('click', () => startWhatsNew(true));
   document.querySelector('#check-app-update')?.addEventListener('click', () => void checkAppUpdate(true));
   document.querySelector('#download-app-update')?.addEventListener('click', () => void downloadAppUpdate());
   document.querySelector('#resume-app-update')?.addEventListener('click', () => void downloadAppUpdate());
@@ -2959,9 +3144,13 @@ function renderStartup(): void {
   document.querySelector('#startup-retry-failed')?.addEventListener('click', () => void retryStartupFailures());
 }
 function openStudioAfterStartup(): void {
+  if (!startupVisible) return;
   startupVisible = false; startupEntryPending = animationMode !== 'off';
-  startGuide(false);
+  if (!existingProfileAtStartup) startGuide(false);
+  else if (shouldShowWhatsNew(true, settings.lastSeenVersion, APP_VERSION)) prepareWhatsNew(false);
   render();
+  if (onboardingOpen) focusOnboarding();
+  else if (whatsNewOpen) focusWhatsNew();
   void refreshComponentStatuses();
   window.setTimeout(() => { if (settings.updateCatalogOnStartup) void startCatalogUpdate(); if (settings.checkAppUpdatesOnStartup) void checkAppUpdate(false); }, 500);
 }
@@ -3221,6 +3410,6 @@ else {
   void bootApp();
 }
 window.addEventListener('resize', scheduleMixOrbitThreads);
-window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); previewIdleCancel?.(); gridPreviewCache.dispose(); contentPreviewCache.dispose(); hoverPreviewCache.dispose(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); workspaceController?.dispose(); workspaceController = null; });
+window.addEventListener('beforeunload', () => { if (mixThreadFrame !== undefined) window.cancelAnimationFrame(mixThreadFrame); if (mixThreadSettleFrame !== undefined) window.cancelAnimationFrame(mixThreadSettleFrame); if (mixThreadFallbackTimer !== undefined) window.clearTimeout(mixThreadFallbackTimer); mixThreadObserver?.disconnect(); releaseCustomTagOriginalScope(); customTagOriginalLease?.release(); previewIdleCancel?.(); gridPreviewCache.dispose(); contentPreviewCache.dispose(); hoverPreviewCache.dispose(); metadataWorkspace.dispose(); for (const key of [...customImageUrls.keys()]) revokeCustomImageUrl(key); for (const key of [...savedLibraryImageUrls.keys()]) revokeSavedLibraryImageUrl(key); const draft = currentDraft(); saveDraft(draft); window.naiStorage?.saveSync('draft', draft); workspaceController?.dispose(); workspaceController = null; });
 
 export { normalizeRange, randomizeArtists, prompt };

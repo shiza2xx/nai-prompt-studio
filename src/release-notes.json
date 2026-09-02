@@ -1,0 +1,27 @@
+{
+  "version": "0.6.9",
+  "summary": "v0.6.9 brings faster, more stable Custom Tags previews, immediate card moves without a full-grid reload, and profile-local runtime temp, cache, and catalog work data.",
+  "whatsNew": [
+    {
+      "title": "Faster, steadier previews",
+      "copy": "Custom Tags previews load faster and stay stable as you browse."
+    },
+    {
+      "title": "Immediate card moves",
+      "copy": "Move cards between folders and see the change without reloading the full grid."
+    },
+    {
+      "title": "Work stays with your profile",
+      "copy": "Runtime temp, cache, and catalog work stay with this profile."
+    }
+  ],
+  "cleanupNotice": {
+    "title": "A note about older system temporary files",
+    "copy": "We're sorry. v0.6.9 restores installed runtime temporary files to the installed app's own profile directory at data/temp instead of the Windows system %TEMP%. Cache files stay in data/cache. Earlier builds could duplicate preview, cache, and temporary files in the system location and consume substantial system-drive space. Historical leftovers are not removed automatically.",
+    "steps": [
+      "Close NAI Prompt Studio and its installer.",
+      "First, use Windows Settings > System > Storage > Temporary files and review and remove temporary files.",
+      "For targeted cleanup, press Win+R, enter %TEMP%, and remove only clearly identifiable old NAI Prompt Studio, Electron, or ASAR-related leftovers. Skip anything in use or uncertain."
+    ]
+  }
+}

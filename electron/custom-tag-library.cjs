@@ -275,14 +275,38 @@ class CustomTagLibrary {
     return canonical;
   }
   retainCanonical(canonical) {
-    const cardIndex = new Map(); const semanticIndex = new Map(); const previewRefs = new Map(); const manifestSignatures = new Map();
+    const cardIndex = new Map(); const semanticIndex = new Map(); const previewRefs = new Map(); const previewFacts = new Map(); const manifestSignatures = new Map();
     for (const item of canonical.manifests) { const stat = fs.statSync(this.manifestFile(item.preset.id)); manifestSignatures.set(item.preset.id, `${stat.size}:${stat.mtimeMs}`); }
     for (const item of canonical.manifests) for (const card of item.cards) {
       cardIndex.set(card.id, { presetId: item.preset.id, card });
       semanticIndex.set(semanticIdentity(card), card.id);
-      if (card.preview) previewRefs.set(`${item.preset.id}\u0000${card.preview.file}`, true);
+      if (card.preview) {
+        const key = `${item.preset.id}\u0000${card.preview.file}`;
+        const target = containedAsset(path.join(this.root, 'presets', item.preset.id, 'previews'), path.basename(card.preview.file));
+        previewRefs.set(key, true); previewFacts.set(key, this.previewFileFact(target, card.preview));
+      }
     }
-    this.runtimeCanonical = { index: canonical.index, manifests: canonical.manifests, cardIndex, semanticIndex, previewRefs, manifestSignatures };
+    this.runtimeCanonical = { index: canonical.index, manifests: canonical.manifests, cardIndex, semanticIndex, previewRefs, previewFacts, manifestSignatures };
+    this.previewReferenceIndex = previewRefs;
+  }
+  previewFileFact(target, preview) {
+    const stat = fs.lstatSync(target);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== preview.bytes) throw new Error('Invalid preview file');
+    // ctime closes the common same-size in-place replacement path, while
+    // dev/ino protects rename replacement on platforms that expose it.
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  }
+  resolveRetainedPreview(canonical, presetId, preview) {
+    const key = `${presetId}\u0000${preview.file}`;
+    const target = containedAsset(path.join(this.root, 'presets', presetId, 'previews'), path.basename(preview.file));
+    const fact = this.previewFileFact(target, preview); const known = canonical.previewFacts?.get(key);
+    if (known === fact) return target;
+    // Metadata is retained, not blindly trusted. Re-hash only a requested
+    // file whose filesystem identity changed; untouched previews never read.
+    const bytes = fs.readFileSync(target); validateImagePayload(bytes, preview.mime);
+    if (bytes.length !== preview.bytes || sha256(bytes) !== preview.sha256) throw new Error('Preview digest no longer matches canonical metadata');
+    canonical.previewFacts?.set(key, fact);
+    return target;
   }
   transactionCanonical() {
     if (!this.runtimeCanonical) { this.readCanonical(); return this.runtimeCanonical; }
@@ -339,8 +363,11 @@ class CustomTagLibrary {
   }
   validateTree(root) { const previous = this.root; this.root = root; try { return this.readCanonical(); } finally { this.root = previous; } }
   replayJournal() {
-    this.invalidatePreviewReferenceIndex();
     if (!fs.existsSync(this.journalFile())) return;
+    // A successful retained load remains authorized until there is actual
+    // journal work to replay. Avoid discarding that index on every ordinary
+    // mutation/read path, which would force an unrelated full load later.
+    this.invalidatePreviewReferenceIndex();
     this.runtimeCanonical = null;
     const journal = readJson(this.journalFile()); if (!journal || journal.format !== FORMAT || journal.schemaVersion !== VERSION || typeof journal.operationId !== 'string' || !/^[a-f0-9-]{36}$/i.test(journal.operationId) || !Array.isArray(journal.manifests)) throw new Error('Invalid custom tag operation journal');
     validateIndex(journal.index);
@@ -403,6 +430,10 @@ class CustomTagLibrary {
       }
     }
     this.retainCanonical({ index: journal.index, manifests });
+    // The just-committed canonical state was validated above. Seed the
+    // authorization index from those retained references so the first
+    // post-transaction preview request does not revalidate every manifest.
+    this.previewReferenceIndex = this.runtimeCanonical.previewRefs;
   }
   writeMirror(manifests, digest) {
     const current = this.readLegacy();
@@ -465,10 +496,13 @@ class CustomTagLibrary {
     this.invalidatePreviewReferenceIndex();
     const changedPresetIds = delta?.changedPresetIds;
     const changedMirrorPreviews = delta?.changedMirrorPreviews;
-    if (Array.isArray(changedPresetIds)) for (const id of changedPresetIds) {
-      const index = manifests.findIndex(item => item.preset.id === id); if (index < 0) throw new Error('Changed Custom Tags preset is missing');
-      const directory = ensureContainedDirectory(this.root, path.join(this.root, 'presets', id));
-      manifests[index] = normalizeManifest(manifestDocument(manifests[index]), id, directory, this.now());
+    if (Array.isArray(changedPresetIds)) {
+      // Ordinary transactions begin from retained, fully validated canonical
+      // objects and validate their operation input/touched preview before
+      // reaching commit. Do not normalize an entire changed folder here: that
+      // would read and hash every unrelated original during a metadata move.
+      const known = new Set(manifests.map(item => item.preset.id));
+      if (new Set(changedPresetIds).size !== changedPresetIds.length || changedPresetIds.some(id => !strictId(id) || !known.has(id))) throw new Error('Changed Custom Tags preset is missing');
     }
     const [mirrorPresets, mirrorTags] = this.compatibilityArrays(manifests); const mirrorDigestValue = digestMirror(mirrorPresets, mirrorTags);
     const previousState = this.runtimeCanonical?.index?.presetState ?? {};
@@ -637,10 +671,20 @@ class CustomTagLibrary {
     // metadata mirror, while unchanged preview bytes are left untouched.
     const previousByPreset = new Map(canonical.manifests.map(item => [item.preset.id, item]));
     const changedPresetIds = manifests.filter(item => stable(item) !== stable(previousByPreset.get(item.preset.id))).map(item => item.preset.id);
-    const changedMirrorPreviews = operation === 'card:upsert' || operation === 'card:move'
+    const changedMirrorPreviews = operation === 'card:upsert'
       ? manifests.flatMap(item => item.cards.filter(card => card.id === payload.id && card.preview).map(card => ({ presetId: item.preset.id, file: card.preview.file })))
       : [];
     return this.commit(manifests, undefined, { changedPresetIds, changedMirrorPreviews });
+  }
+  resolveCardPreview(cardId, filename) {
+    if (!strictId(cardId) || typeof filename !== 'string' || !/^[a-f0-9]{64}\.(?:png|jpg|webp)$/.test(filename)) throw new Error('Invalid card preview path');
+    // The retained index is built only from a fully validated canonical load
+    // and refreshed on journal commits. It authorizes this exact card/bytes
+    // pairing without trusting a renderer-provided preset path.
+    const canonical = this.transactionCanonical();
+    const indexed = canonical.cardIndex?.get(cardId);
+    if (!indexed?.card?.preview || path.basename(indexed.card.preview.file) !== filename) throw new Error('Preview is not referenced by card');
+    return this.resolveRetainedPreview(canonical, indexed.presetId, indexed.card.preview);
   }
   resolvePreview(presetId, relativeFile) {
     if (!strictId(presetId) || typeof relativeFile !== 'string' || !/^previews\/[a-f0-9]{64}\.(?:png|jpg|webp)$/.test(relativeFile)) throw new Error('Invalid preview path');
@@ -648,7 +692,9 @@ class CustomTagLibrary {
     // Authorization is cached, never the bytes or filesystem trust check.
     // Every protocol request still verifies containment, regular-file status,
     // and symlink/junction safety through containedAsset.
-    return containedAsset(path.join(this.root, 'presets', presetId, 'previews'), path.basename(relativeFile));
+    const canonical = this.transactionCanonical(); const card = canonical.manifests.find(item => item.preset.id === presetId)?.cards.find(item => item.preview?.file === relativeFile);
+    if (!card?.preview) throw new Error('Preview is not referenced');
+    return this.resolveRetainedPreview(canonical, presetId, card.preview);
   }
   storePreview(presetId, payload, mime, originalName = '', phase = 'transaction:asset') {
     const bytes = validateImagePayload(payload, mime); const hash = sha256(bytes); const filename = `${hash}.${MIME_EXTENSION[mime]}`;
@@ -665,9 +711,27 @@ class CustomTagLibrary {
     return this.storePreview(presetId, bytes, card.mime, card.originalName, 'drift:asset');
   }
   copyPreview(fromPresetId, toPresetId, preview) {
+    const retained = this.runtimeCanonical;
+    if (retained?.previewFacts?.has(`${fromPresetId}\u0000${preview.file}`)) this.resolveRetainedPreview(retained, fromPresetId, preview);
     const source = containedAsset(path.join(this.root, 'presets', fromPresetId, 'previews'), path.basename(preview.file));
     const destinationDir = ensureContainedDirectory(this.root, path.join(this.root, 'presets', toPresetId, 'previews'));
-    const destination = path.join(destinationDir, path.basename(preview.file)); atomicImmutable(destination, fs.readFileSync(source), () => this.hit('transaction:asset-copy-staged'));
+    const destination = path.join(destinationDir, path.basename(preview.file));
+    // Previews are content-addressed and already validated while reading the
+    // canonical manifest. A same-volume hard link preserves those bytes with
+    // no second full-buffer read; fall back to the existing immutable copy
+    // path when links are unavailable (cross-volume, policy, or test hosts).
+    if (fs.existsSync(destination)) {
+      const stat = fs.lstatSync(destination);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== preview.bytes || sha256(fs.readFileSync(destination)) !== preview.sha256) throw new Error('Immutable preview collision');
+      return destination;
+    }
+    this.hit('transaction:asset-copy-staged');
+    try {
+      fs.linkSync(source, destination);
+    } catch (error) {
+      if (!['EXDEV', 'EPERM', 'EACCES', 'ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOSYS', 'EMLINK'].includes(error?.code)) throw error;
+      atomicImmutable(destination, fs.readFileSync(source), undefined, undefined);
+    }
     return destination;
   }
   cleanupDeletedPreset(presetId, deletedPreviews, manifests) {

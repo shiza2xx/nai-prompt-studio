@@ -653,6 +653,7 @@ button:disabled:hover, .primary:disabled:hover, .secondary:disabled:hover, .chip
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-animation-mode="on"]), :root:not([data-animation-mode="on"]) *, :root:not([data-animation-mode="on"]) *::before, :root:not([data-animation-mode="on"]) *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .001ms !important; }
   :root:not([data-animation-mode="on"]) .workspace-panel-incoming { animation: none !important; opacity: 1 !important; transform: none !important; }
+  :root:not([data-animation-mode="on"]) .whats-new-card { animation: none !important; opacity: 1 !important; transform: none !important; transition: none !important; }
   :root:not([data-animation-mode="on"]) .primary, :root:not([data-animation-mode="on"]) .secondary, :root:not([data-animation-mode="on"]) .chip, :root:not([data-animation-mode="on"]) .small, :root:not([data-animation-mode="on"]) .reset-prompt, :root:not([data-animation-mode="on"]) .favorite-button, :root:not([data-animation-mode="on"]) .tiny-copy, :root:not([data-animation-mode="on"]) .icon-button, :root:not([data-animation-mode="on"]) .workspace-tabs button, :root:not([data-animation-mode="on"]) .artist-pick, :root:not([data-animation-mode="on"]) .metadata-toggle button, :root:not([data-animation-mode="on"]) .metadata-copy { transition: none !important; transform: none !important; }
   :root:not([data-animation-mode="on"]) .artist-card, :root:not([data-animation-mode="on"]) .selected-artist { transition: none !important; transform: none !important; }
   :root:not([data-animation-mode="on"]) .empty-artist-card, :root:not([data-animation-mode="on"]) .empty-artist-card img { animation: none !important; transition: none !important; transform: none !important; }
@@ -662,6 +663,7 @@ button:disabled:hover, .primary:disabled:hover, .secondary:disabled:hover, .chip
 }
 :root[data-animation-mode="off"], :root[data-animation-mode="off"] *, :root[data-animation-mode="off"] *::before, :root[data-animation-mode="off"] *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .001ms !important; }
 :root[data-animation-mode="off"] .workspace-panel-incoming { animation: none !important; opacity: 1 !important; transform: none !important; }
+:root[data-animation-mode="off"] .whats-new-card { animation: none !important; opacity: 1 !important; transform: none !important; transition: none !important; }
 :root[data-animation-mode="off"] .primary, :root[data-animation-mode="off"] .secondary, :root[data-animation-mode="off"] .chip, :root[data-animation-mode="off"] .small, :root[data-animation-mode="off"] .reset-prompt, :root[data-animation-mode="off"] .favorite-button, :root[data-animation-mode="off"] .tiny-copy, :root[data-animation-mode="off"] .icon-button, :root[data-animation-mode="off"] .workspace-tabs button, :root[data-animation-mode="off"] .artist-pick, :root[data-animation-mode="off"] .metadata-toggle button, :root[data-animation-mode="off"] .metadata-copy { transition: none !important; transform: none !important; }
 :root[data-animation-mode="off"] .artist-card, :root[data-animation-mode="off"] .selected-artist { transition: none !important; transform: none !important; }
 :root[data-animation-mode="off"] .empty-artist-card, :root[data-animation-mode="off"] .empty-artist-card img { animation: none !important; transition: none !important; transform: none !important; }
@@ -794,13 +796,14 @@ button:disabled:hover, .primary:disabled:hover, .secondary:disabled:hover, .chip
 .custom-library-card.is-drop-target { border-color: var(--accent-bright); box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 24%), 0 12px 26px rgb(4 2 7 / 32%); }
 .custom-library-actions { align-items: center; flex-wrap: wrap; }
 .custom-move-details { position: relative; }
-.custom-move-details > summary { list-style: none; }
+.custom-move-details > summary { list-style: none; cursor: pointer; user-select: none; }
 .custom-move-details > summary::-webkit-details-marker { display: none; }
 .custom-move-menu { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 15; display: grid; min-width: 150px; gap: 5px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--panel-raised); box-shadow: var(--shadow); }
-.custom-move-option { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.custom-move-option { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; user-select: none; }
 .custom-move-empty { padding: 4px 6px; color: var(--muted-dim); font-size: 10px; }
 .custom-reorder-actions { display: inline-flex; gap: 3px; }
 .custom-reorder-actions .icon-button { width: 25px; height: 25px; padding: 0; }
+.custom-library-card.is-moving { border-color: var(--accent-bright); opacity: .72; }
 @media (max-width: 900px) {
   .settings-grid { grid-template-columns: 1fr; }
   .settings-catalog-card { grid-column: auto; }
@@ -869,6 +872,27 @@ html[data-workspace="artist-mix"] .app-shell { padding-bottom: 0; }
 .onboarding-card h2 { margin: 7px 0 10px; font: 600 30px var(--display); }
 .onboarding-card p:not(.eyebrow) { color: var(--muted); line-height: 1.65; }
 .onboarding-actions { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; }
+.whats-new-backdrop { z-index: 35; }
+.whats-new-card { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; width: min(620px, 100%); max-height: min(760px, calc(100dvh - 40px)); padding: 24px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel-raised); box-shadow: 0 28px 80px rgb(0 0 0 / 55%), 0 0 40px var(--glow); transition: opacity 150ms var(--motion-ease), transform 150ms var(--motion-ease); animation: whats-new-enter 180ms var(--motion-ease) both; }
+.whats-new-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.whats-new-card h2 { margin: 7px 0 0; font: 600 30px var(--display); }
+.whats-new-scroll { min-height: 0; margin: 0 -6px; padding: 0 6px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.whats-new-scroll:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; border-radius: 8px; }
+.whats-new-summary { margin: 18px 0 0; color: var(--muted); line-height: 1.6; }
+.whats-new-list { display: grid; gap: 10px; margin: 20px 0 0; padding: 0; list-style: none; }
+.whats-new-list li { display: grid; gap: 3px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
+.whats-new-list li b { color: var(--ink); font-family: var(--display); font-size: 15px; }
+.whats-new-list li span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.whats-new-cleanup { margin-top: 20px; padding: 14px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-soft); }
+.whats-new-cleanup h3 { margin: 5px 0 8px; color: var(--ink); font: 600 18px var(--display); }
+.whats-new-cleanup p:not(.eyebrow) { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.whats-new-steps { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; counter-reset: whats-new-step; }
+.whats-new-steps li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; color: var(--muted); font-size: 12px; line-height: 1.55; counter-increment: whats-new-step; }
+.whats-new-step-number { display: grid; place-items: center; width: 22px; height: 22px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--accent-bright); font: 700 11px var(--mono); }
+.whats-new-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; flex-wrap: wrap; }
+.feedback-status { min-height: 17px; margin: 12px 0 0; color: var(--danger); font-size: 11px; }
+.whats-new-backdrop.is-closing .whats-new-card { opacity: 0; transform: translateY(8px); }
+@keyframes whats-new-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 [data-theme="midnight-blue"] .brand-mark { color: var(--bg-deep); }
 [data-theme="midnight-blue"] .primary,
 [data-theme="midnight-blue"] .number-stepper-buttons button:hover:not(:disabled),

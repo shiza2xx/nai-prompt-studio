@@ -124,23 +124,39 @@ function activeGeneration(catalogDir) {
   }
   return { generation: pointer.generation, directory };
 }
-function resolveActiveCatalogAsset(catalogDir, relative, { embeddedPath } = {}) {
+function componentAssetDescriptor(catalogDir, relative, options = {}) {
+  const { resolveComponentAssetDescriptor } = require('./catalog-components.cjs');
+  return resolveComponentAssetDescriptor(catalogDir, relative, options);
+}
+
+function resolveActiveCatalogAssetDescriptor(catalogDir, relative, { embeddedPath } = {}) {
   if (!validCatalogAsset(relative)) throw new Error('Invalid runtime catalog card asset or guide asset');
-  if (!validCardAsset(relative)) {
-    const { resolveComponentAsset } = require('./catalog-components.cjs');
-    return resolveComponentAsset(catalogDir, relative);
-  }
   const active = activeGeneration(catalogDir);
   if (active) {
     const overlayAsset = containedCatalogAsset(active.directory, relative);
-    if (fs.existsSync(overlayAsset)) return overlayAsset;
+    if (fs.existsSync(overlayAsset) && (!validCardAsset(relative) || validWebpFile(overlayAsset))) return { kind: 'file', path: overlayAsset };
   }
   if (embeddedPath) {
     const looseAsset = resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative });
     if (looseAsset) return looseAsset;
   }
-  const { resolveComponentAsset } = require('./catalog-components.cjs');
-  return resolveComponentAsset(catalogDir, relative);
+  return componentAssetDescriptor(catalogDir, relative);
+}
+
+/**
+ * Compatibility resolver. New protocol/runtime callers consume the descriptor
+ * or bytes directly; this string form remains for older tests and tooling.
+ */
+function resolveActiveCatalogAsset(catalogDir, relative, options = {}) {
+  const descriptor = resolveActiveCatalogAssetDescriptor(catalogDir, relative, options);
+  return descriptor.kind === 'file' ? descriptor.path : `${descriptor.archivePath}${path.sep}${descriptor.innerPath}`;
+}
+
+async function readActiveCatalogAsset(catalogDir, relative, options = {}) {
+  const descriptor = resolveActiveCatalogAssetDescriptor(catalogDir, relative, options);
+  if (descriptor.kind === 'file') return fs.promises.readFile(descriptor.path);
+  const { readArchiveEntryAsync } = require('./catalog-components.cjs');
+  return readArchiveEntryAsync(descriptor.archivePath, descriptor.innerPath);
 }
 function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } }
 function validWebpFile(file) {
@@ -155,20 +171,24 @@ function validWebpFile(file) {
   } catch { return false; }
   finally { if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch { /* best effort */ } } }
 }
+function validWebpBuffer(bytes) { return Buffer.isBuffer(bytes) && isWebp(bytes); }
 function resolveBaseCatalogAsset({ embeddedPath, catalogDir, relative }) {
   const looseRelative = typeof relative === 'string' && relative.toLowerCase().endsWith('.webp') && !relative.includes('\\') && !relative.split('/').some(segment => segment === '.' || segment === '..');
-  if (!validCardAsset(relative) && !looseRelative) return null;
+  if (!validCatalogAsset(relative) && !looseRelative) return null;
   if (embeddedPath) {
     try {
-      const loose = contained(path.dirname(embeddedPath), relative);
-      if (validWebpFile(loose)) return loose;
+      const loose = containedCatalogAsset(path.dirname(embeddedPath), relative);
+      const requiresWebpValidation = validCardAsset(relative) || looseRelative;
+      if (fs.existsSync(loose) && (!requiresWebpValidation || validWebpFile(loose))) return { kind: 'file', path: loose };
     } catch { /* packaged/component fallback below */ }
   }
   if (!validCardAsset(relative)) return null;
   try {
-    const { resolveComponentAsset } = require('./catalog-components.cjs');
-    const componentAsset = resolveComponentAsset(catalogDir, relative);
-    if (validWebpFile(componentAsset)) return componentAsset;
+    // A verified component record plus a regular, packed ASAR entry is enough
+    // to establish base availability. Do not extract every component image
+    // while merging metadata; payload validation is reserved for the actual
+    // protocol read and loose files retain their WebP signature check above.
+    return componentAssetDescriptor(catalogDir, relative);
   } catch { /* missing or damaged component is not a usable base */ }
   return null;
 }
@@ -357,11 +377,21 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
       if (!discoveredSources.has(String(previous.sourceUrl || ''))) continue;
       if (!validCardAsset(previousImage)) continue;
       let source;
-      try { source = resolveActiveCatalogAsset(catalogDir, previousImage); } catch { continue; }
+      try { source = resolveActiveCatalogAssetDescriptor(catalogDir, previousImage); } catch { continue; }
       const destination = contained(stage, previousImage);
-      if (!validWebpFile(source)) continue;
+      let sourceBytes;
+      if (source.kind === 'file') {
+        if (!validWebpFile(source.path)) continue;
+      } else {
+        try {
+          const { readArchiveEntryAsync } = require('./catalog-components.cjs');
+          sourceBytes = await readArchiveEntryAsync(source.archivePath, source.innerPath);
+        } catch { continue; }
+        if (!validWebpBuffer(sourceBytes)) continue;
+      }
       await fsp.mkdir(path.dirname(destination), { recursive: true });
-      await fsp.copyFile(source, destination);
+      if (source.kind === 'file') await fsp.copyFile(source.path, destination);
+      else await fsp.writeFile(destination, sourceBytes);
       runtimeArtists.set(previous.catalogId || previous.id, { ...previous, runtime: true });
     }
 
@@ -472,4 +502,4 @@ async function runUpdate({ catalogDir, embeddedPath, fetchImpl = fetch, signal, 
   }
 }
 
-module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, GALLERY_PAGE_CONCURRENCY, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAsset, validCardAsset, validCharacterAsset, validGuideAsset, validCatalogAsset };
+module.exports = { GALLERY, GALLERY_URL, CDN_PREFIX, GALLERY_PAGE_CONCURRENCY, parseGalleryPage, isWebp, stableCatalogId, loadCatalog, discoverCards, runUpdate, normalizeImageUrl, catalogAssetFromProtocolUrl, containedCatalogAsset, resolveActiveCatalogAssetDescriptor, readActiveCatalogAsset, resolveActiveCatalogAsset, validCardAsset, validCharacterAsset, validGuideAsset, validCatalogAsset };

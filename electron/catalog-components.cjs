@@ -12,12 +12,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 // Electron patches node:fs so paths below an outer .asar are interpreted as
-// virtual archive entries.  Component and legacy archives are real files in
-// the profile, so use original-fs for those outer-file operations.  Keeping
-// the patched fs alias above is intentional: native ASAR reads such as
-// `archive.asar/inner/path` rely on Electron's integration.
+// virtual archive entries. Component and legacy archives are real files in
+// the profile, so use original-fs for outer-file facts. Runtime entry reads
+// use @electron/asar directly; the historical virtual-path resolver below is
+// retained only for compatibility with older tooling and tests.
 let outerFs = fs;
 try { outerFs = require('original-fs'); } catch { /* plain Node/test runtime */ }
+let asarApi = null;
+try { asarApi = require('@electron/asar'); } catch { /* development fixtures may inject an archive inspector */ }
 
 const COMPONENT_VERSION = '0.6.3';
 const COMPONENTS = Object.freeze({
@@ -31,6 +33,10 @@ const TRUSTED_HOST = 'github.com';
 const TRUSTED_REDIRECT_HOSTS = new Set(['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
 const STATE_VERSION = 1;
 const legacyValidationCache = new Map();
+// @electron/asar keeps a process-global filesystem cache keyed only by the
+// archive path. Track the outer-file facts ourselves so a repaired/replaced
+// component cannot reuse an old header or entry offset.
+const archiveIndexCache = new Map();
 
 function safeRelative(base, relative) {
   if (typeof relative !== 'string' || !relative || relative.includes('\\') || relative.includes('\0')) throw new Error('Invalid catalog component path');
@@ -130,13 +136,126 @@ function normalizeInnerPath(relative) {
   return normalized;
 }
 
-// Electron's native ASAR integration lets fs read `archive.asar/inner/path`
-// without shipping @electron/asar in the packaged application.  The optional
-// inspector is deliberately injectable for build/test tooling that needs to
-// enumerate archive entries.
-function readNativeArchiveFile(file, relative, readFile = fs.readFileSync) {
+function archiveIdentity(file) {
+  if (!asarApi) throw new Error('Direct ASAR reads are unavailable');
+  const resolved = path.resolve(file);
+  const stat = outerFs.lstatSync(resolved);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Catalog component archive must be a regular file');
+  return { path: resolved, key: `${resolved}|${stat.size}|${stat.mtimeMs}`, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function archiveIndex(file) {
+  const identity = archiveIdentity(file);
+  const previous = archiveIndexCache.get(identity.path);
+  if (!previous || previous.key !== identity.key) {
+    if (previous && typeof asarApi.uncache === 'function') {
+      try { asarApi.uncache(identity.path); } catch { /* stale cache eviction is best effort */ }
+    }
+    const rawHeader = asarApi.getRawHeader(identity.path);
+    const headerSize = Number(rawHeader?.headerSize);
+    if (!Number.isSafeInteger(headerSize) || headerSize < 0 || 8 + headerSize > identity.size) throw new Error('Catalog component archive has an invalid ASAR header');
+    const next = { ...identity, headerSize, entries: new Map() };
+    archiveIndexCache.set(identity.path, next);
+    return next;
+  }
+  return previous;
+}
+
+/** Return a verified archive-entry descriptor without creating a virtual path. */
+function describeArchiveEntry(file, relative) {
   const inner = normalizeInnerPath(relative);
-  return readFile(path.join(file, ...inner.split('/')));
+  const index = archiveIndex(file);
+  if (!index.entries.has(inner)) {
+    // The ASAR Filesystem uses platform separators for lookup. Its listing
+    // includes a leading separator, but getNode/statFile expects the relative
+    // form that our descriptor already carries.
+    const archiveName = path.join(...inner.split('/'));
+    const info = asarApi.statFile(index.path, archiveName, false);
+    // Component assets must be self-contained in the verified archive. An
+    // `unpacked` entry points at a sibling .unpacked tree and would bypass
+    // the archive's digest/identity boundary.
+    if (!info || info.files || info.link || info.unpacked) throw new Error(`ASAR entry is not a packed regular file: ${inner}`);
+    const size = Number(info.size);
+    const offsetText = String(info.offset);
+    const entryOffset = Number(offsetText);
+    if (!Number.isSafeInteger(size) || size < 0 || !/^\d+$/.test(offsetText) || !Number.isSafeInteger(entryOffset) || entryOffset < 0) throw new Error(`ASAR entry has invalid range facts: ${inner}`);
+    const dataOffset = 8 + index.headerSize + entryOffset;
+    if (!Number.isSafeInteger(dataOffset) || dataOffset > index.size || size > index.size - dataOffset) throw new Error(`ASAR entry range exceeds archive: ${inner}`);
+    index.entries.set(inner, { archivePath: index.path, innerPath: inner, size, dataOffset, unpacked: false });
+  }
+  return index.entries.get(inner);
+}
+
+function readArchiveRange(descriptor, bytes) {
+  if (bytes.length === 0) return bytes;
+  const fileDescriptor = outerFs.openSync(descriptor.archivePath, 'r');
+  let completed = 0;
+  try {
+    while (completed < bytes.length) {
+      const bytesRead = outerFs.readSync(fileDescriptor, bytes, completed, bytes.length - completed, descriptor.dataOffset + completed);
+      if (!bytesRead) throw new Error(`ASAR entry ended before its declared size: ${descriptor.innerPath}`);
+      completed += bytesRead;
+    }
+  } finally { outerFs.closeSync(fileDescriptor); }
+  return bytes;
+}
+
+/** Read one archive entry directly from the ASAR data region. */
+function readArchiveEntry(file, relative) {
+  const descriptor = describeArchiveEntry(file, relative);
+  return readArchiveRange(descriptor, Buffer.alloc(descriptor.size));
+}
+
+function readArchiveRangeAsync(descriptor, bytes) {
+  if (bytes.length === 0) return Promise.resolve(bytes);
+  const open = outerFs.promises?.open;
+  if (typeof open === 'function') {
+    return open.call(outerFs.promises, descriptor.archivePath, 'r').then(async handle => {
+      let completed = 0;
+      try {
+        while (completed < bytes.length) {
+          const result = await handle.read(bytes, completed, bytes.length - completed, descriptor.dataOffset + completed);
+          if (!result?.bytesRead) throw new Error(`ASAR entry ended before its declared size: ${descriptor.innerPath}`);
+          completed += result.bytesRead;
+        }
+        return bytes;
+      } finally { await handle.close(); }
+    });
+  }
+  return new Promise((resolve, reject) => {
+    outerFs.open(descriptor.archivePath, 'r', (openError, fileDescriptor) => {
+      if (openError) { reject(openError); return; }
+      let completed = 0;
+      const close = error => outerFs.close(fileDescriptor, closeError => {
+        if (error) reject(error);
+        else if (closeError) reject(closeError);
+        else resolve(bytes);
+      });
+      const next = () => {
+        if (completed >= bytes.length) { close(); return; }
+        outerFs.read(fileDescriptor, bytes, completed, bytes.length - completed, descriptor.dataOffset + completed, (readError, bytesRead) => {
+          if (readError) { close(readError); return; }
+          if (!bytesRead) { close(new Error(`ASAR entry ended before its declared size: ${descriptor.innerPath}`)); return; }
+          completed += bytesRead;
+          next();
+        });
+      };
+      next();
+    });
+  });
+}
+
+/** Async range read for protocol handlers that must not block the renderer. */
+async function readArchiveEntryAsync(file, relative) {
+  const descriptor = describeArchiveEntry(file, relative);
+  return readArchiveRangeAsync(descriptor, Buffer.alloc(descriptor.size));
+}
+
+// Kept for legacy validation callers. The default path is now a direct ASAR
+// read; the injected readFile argument remains useful to isolated fixtures.
+function readNativeArchiveFile(file, relative, readFile) {
+  const inner = normalizeInnerPath(relative);
+  return typeof readFile === 'function' ? readFile(path.join(file, ...inner.split('/'))) : readArchiveEntry(file, inner);
 }
 
 function archiveEntries(file, { inspector } = {}) {
@@ -735,10 +854,13 @@ function activateComponent(catalogDir, verified, { signal } = {}) {
   if (outerFs.existsSync(backup)) {
     try { outerFs.rmSync(backup, { force: true }); } catch (error) { throw new Error(`Catalog component backup cleanup failed: ${error instanceof Error ? error.message : String(error)}`); }
   }
+  // Activation can replace an archive while preserving its size and mtime on
+  // some filesystems; invalidate by lifecycle event as well as file facts.
+  archiveIndexCache.delete(path.resolve(target));
   return { ...item, path: target, status: 'Installed' };
 }
 
-function resolveComponentAsset(catalogDir, relative, { allowLegacy = true } = {}) {
+function resolveComponentAssetDescriptor(catalogDir, relative, { allowLegacy = true } = {}) {
   let normalized;
   try { normalized = normalizeInnerPath(relative); } catch { throw new Error('Invalid runtime catalog asset'); }
   const match = normalized.startsWith('cards/artist/') ? COMPONENTS.artists
@@ -754,15 +876,37 @@ function resolveComponentAsset(catalogDir, relative, { allowLegacy = true } = {}
     const record = loadState(catalogDir).components[match.id];
     if (!installedStat.isFile() || installedStat.isSymbolicLink()) installedError = `Catalog component ${match.id} must be a regular file`;
     else if (!componentRecordMatchesFacts(record, installedStat, match)) installedError = `Catalog component ${match.id} is not verified`;
-    else return `${installed}${path.sep}${normalized}`;
+    else {
+      try {
+        return { kind: 'component', archivePath: installed, innerPath: normalized, entry: describeArchiveEntry(installed, normalized) };
+      } catch (error) {
+        installedError = error instanceof Error ? error.message : String(error);
+      }
+    }
   }
   if (allowLegacy && outerFs.existsSync(paths.legacyPack)) {
     try {
       validateLegacyArchive(paths.legacyPack);
-      return `${paths.legacyPack}${path.sep}dist${path.sep}catalog${path.sep}${normalized}`;
+      const innerPath = `dist/catalog/${normalized}`;
+      return { kind: 'legacy', archivePath: paths.legacyPack, innerPath, entry: describeArchiveEntry(paths.legacyPack, innerPath) };
     } catch { /* invalid legacy is not a usable fallback */ }
   }
   throw new Error(installedError || `Catalog component ${match.id} is not installed`);
+}
+
+/**
+ * Compatibility resolver for callers that still need the historical
+ * archive.asar/inner/path spelling. Runtime reads must use the descriptor API
+ * above so Electron never opens an ASAR entry through a virtual filesystem.
+ */
+function resolveComponentAsset(catalogDir, relative, options = {}) {
+  const descriptor = resolveComponentAssetDescriptor(catalogDir, relative, options);
+  return `${descriptor.archivePath}${path.sep}${descriptor.innerPath}`;
+}
+
+function readComponentAsset(catalogDir, relative, options = {}) {
+  const descriptor = resolveComponentAssetDescriptor(catalogDir, relative, options);
+  return readArchiveEntry(descriptor.archivePath, descriptor.innerPath);
 }
 
 function validateLegacyArchive(file, { expectedRoots = ['dist/catalog/catalog.json', 'dist/catalog/cards/artist', 'dist/catalog/cards/character', 'dist/catalog/guide'], inspector } = {}) {
@@ -802,8 +946,8 @@ function validateLegacyArchive(file, { expectedRoots = ['dist/catalog/catalog.js
 module.exports = {
   COMPONENT_VERSION, COMPONENTS, COMPONENT_IDS, STATE_VERSION, TRUSTED_REDIRECT_HOSTS,
   safeRelative, componentPaths, normalizeDescriptor, normalizeDescriptors,
-  hashFile, normalizeInnerPath, readNativeArchiveFile, archiveEntries, validateArchiveShape, verifyComponent,
+  hashFile, normalizeInnerPath, readNativeArchiveFile, archiveEntries, describeArchiveEntry, readArchiveEntry, readArchiveEntryAsync, validateArchiveShape, verifyComponent,
   loadState, saveState, componentFile, partialFile, statusForComponent, statuses, inspectComponent,
   downloadComponent, ensureComponent, readInstallerSelections, ensureSelectedComponents,
-  activateComponent, resolveComponentAsset, validateLegacyArchive
+  activateComponent, resolveComponentAssetDescriptor, readComponentAsset, resolveComponentAsset, validateLegacyArchive
 };

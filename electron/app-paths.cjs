@@ -47,6 +47,14 @@ function ensureWritable(paths) {
     fs.mkdirSync(paths.tempDir, { recursive: true });
     fs.mkdirSync(paths.cacheDir, { recursive: true });
     fs.mkdirSync(paths.updatesDir, { recursive: true });
+    const canonical = value => process.platform === 'win32' ? value.toLocaleLowerCase() : value;
+    const profileRoot = path.resolve(fs.realpathSync.native(paths.dataDir));
+    for (const [name, target] of [['temporary', paths.tempDir], ['cache', paths.cacheDir]]) {
+      const stat = fs.lstatSync(target);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Profile ${name} directory must be a real directory`);
+      const real = path.resolve(fs.realpathSync.native(target));
+      if (canonical(real) !== canonical(profileRoot) && !canonical(real).startsWith(`${canonical(profileRoot)}${path.sep}`)) throw new Error(`Profile ${name} directory redirects outside the profile`);
+    }
     const probe = path.join(paths.dataDir, `.write-test-${process.pid}`);
     fs.writeFileSync(probe, 'ok', 'utf8');
     fs.unlinkSync(probe);

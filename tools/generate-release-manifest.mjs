@@ -4,6 +4,14 @@ import { join } from 'node:path';
 import { projectRoot } from './local-env.mjs';
 import { normalizeDescriptors } from '../electron/catalog-components.cjs';
 const pkg = JSON.parse(await fs.readFile(join(projectRoot, 'package.json'), 'utf8'));
+const releaseNotesPath = join(projectRoot, 'src', 'release-notes.json');
+const releaseNotes = JSON.parse(await fs.readFile(releaseNotesPath, 'utf8'));
+const forbiddenReleasePunctuation = /[\u2014\u2013]/;
+const validReleaseCopy = value => typeof value === 'string' && Boolean(value.trim()) && !forbiddenReleasePunctuation.test(value);
+const cleanupNotice = releaseNotes?.cleanupNotice;
+if (!releaseNotes || typeof releaseNotes !== 'object' || releaseNotes.version !== pkg.version || !validReleaseCopy(releaseNotes.summary) || !Array.isArray(releaseNotes.whatsNew) || releaseNotes.whatsNew.length < 1 || releaseNotes.whatsNew.some(item => !item || !validReleaseCopy(item.title) || !validReleaseCopy(item.copy)) || !cleanupNotice || !validReleaseCopy(cleanupNotice.title) || !validReleaseCopy(cleanupNotice.copy) || !Array.isArray(cleanupNotice.steps) || cleanupNotice.steps.length < 3 || cleanupNotice.steps.some(step => !validReleaseCopy(step))) {
+  throw new Error(`Release notes must be a valid ${pkg.version} record: ${releaseNotesPath}`);
+}
 const asset = `NAI-Prompt-Studio-V5-Setup-${pkg.version}.exe`;
 const file = join(projectRoot, 'release-v5', asset);
 if (!existsSync(file)) throw new Error(`Build the single-file setup first: ${file}`);
@@ -24,7 +32,7 @@ const manifest = {
   url: `https://github.com/shiza2xx/nai-prompt-studio/releases/download/v${pkg.version}/${asset}`,
   size: stat.size,
   sha512: sha.digest('hex'),
-  releaseNotes: 'v0.6.8 makes Custom Tags easier to organize, with reliable card ordering and safer Image Metadata tag saves. Card interactions are steadier and faster during everyday prompt work.',
+  releaseNotes: releaseNotes.summary,
   // Additive field: schema-1 clients ignore catalogs while v0.6.4 reuses the
   // v0.6.3 descriptors to verify and hydrate selected ASAR components.
   catalogs

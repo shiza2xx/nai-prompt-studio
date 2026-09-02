@@ -1,4 +1,19 @@
 import assert from 'node:assert/strict'; import { createRequire } from 'node:module'; import {decodePreviews} from '../../src/preview-loader.ts'; import {BUILTIN_CONSTRUCTOR_FOLDER_ID,canonicalCustomTagIdentity,canonicalGroupIdentity,classifyGuideEntries,constructorCardTags,groupConstructorCards,guideVisualCount,hasPromptTag,hasPromptTagGroup,mergeConstructorCards,qualityPresetTags,searchConstructorFolders,splitTagGroup,togglePromptTag,togglePromptTagGroup} from '../../src/prompt-constructor.ts'; import {buildArtistsPrompt,buildBasePrompt,serializeTag} from '../../src/prompt.ts'; import {MAX_PROMPT_RANDOM_ARTISTS,normalizeArtistWeight,pickUniqueCards,promptArtistPoolSize,randomArtistSelection,randomCount,randomWeight,reconcileSelectedArtists,rerollArtistWeight,rerollArtistWeights,resolveRandomPoolRange} from '../../src/random.ts'; import {normalizeAnimationMode,normalizeArtistMix,normalizeCustomTag,normalizeCustomTagPresetId,normalizeCustomTagPresets,normalizeDraft,normalizeRandomRange,normalizeTheme,normalizeSettings,normalizePreviewCachePreset} from '../../src/storage.ts'; const require=createRequire(import.meta.url); const {containedAsset,hasValidMagic,validateImagePayload}=require('../../electron/custom-tag-assets.cjs'); import { DEFAULT_CUSTOM_TAG_PRESET_ID,DEFAULT_CUSTOM_TAG_PRESET_NAME } from '../../src/custom-tag-presets.ts'; import { artistDisplayName,canonicalArtistIdentity,customArtistCatalogId,mergeArtistCatalog,migrateArtistAliases,migrateArtistMixAliases,migrateFavoriteAliases } from '../../src/artist-catalog.ts'; import {mixCompanionCapacity,mixCompanionScale,mixOrbitLayout} from '../../src/artist-mix-layout.ts';
+import { compareReleaseVersions, shouldShowWhatsNew, startupExperience } from '../../src/release-state.ts';
+
+assert.equal(compareReleaseVersions('0.6.8', '0.6.9'), -1);
+assert.equal(compareReleaseVersions('0.6.9', '0.6.9'), 0);
+assert.equal(compareReleaseVersions('0.7.0', '0.6.9'), 1);
+assert.equal(compareReleaseVersions('legacy', '0.6.9'), null);
+assert.equal(shouldShowWhatsNew(false, '', '0.6.9'), false, 'fresh profiles use the Studio Guide');
+assert.equal(shouldShowWhatsNew(true, '0.6.8', '0.6.9'), true, 'older profiles see the current release');
+assert.equal(shouldShowWhatsNew(true, '', '0.6.9'), true, 'missing release markers are legacy');
+assert.equal(shouldShowWhatsNew(true, 'not-a-version', '0.6.9'), true, 'malformed release markers are legacy');
+assert.equal(shouldShowWhatsNew(true, '0.6.9', '0.6.9'), false, 'current release is already acknowledged');
+assert.equal(shouldShowWhatsNew(true, '0.7.0', '0.6.9'), false, 'newer release markers do not downgrade');
+assert.equal(startupExperience(false, '', '0.6.9'), 'guide');
+assert.equal(startupExperience(true, '0.6.8', '0.6.9'), 'whats-new');
+assert.equal(startupExperience(true, '0.6.9', '0.6.9'), 'none');
 let loaderActive = 0; let loaderPeak = 0; const loaderProgress = [];
 const loaderResult = await decodePreviews([1, 2, 3, 4, 5], async item => {
   loaderActive += 1;

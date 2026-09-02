@@ -10,6 +10,7 @@ assert.equal(normalizeSavedLibraryItem({ version: 4, id: 'bad-character', kind: 
 for (const length of [180, 181, CUSTOM_TAG_MAX_LENGTH]) assert.equal(normalizeCustomTag({ id: `tag-${length}`, kind: 'artist', zone: 'frame', tag: 'x'.repeat(length) })?.tag.length, length);
 assert.equal(normalizeCustomTag({ id: 'tag-over-limit', kind: 'artist', zone: 'frame', tag: 'x'.repeat(CUSTOM_TAG_MAX_LENGTH + 1) }), null);
 
+const nativeFs = require('node:fs');
 const testTempRoot = join(process.cwd(), '.test-tmp-v063', String(process.pid));
 mkdirSync(testTempRoot, { recursive: true });
 const localTemp = prefix => mkdtempSync(join(testTempRoot, `${prefix}-`));
@@ -69,7 +70,7 @@ writeFileSync(join(customLibraryAssets, 'legacy.png'), exactPng);
 writeFileSync(join(customLibraryAssets, 'legacy.jpg'), exactJpeg);
 writeFileSync(join(customLibraryAssets, 'legacy.webp'), exactWebp);
 writeFileSync(customLibraryWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }, { id: 'portrait', name: 'Portrait', createdAt: '2026-01-02T00:00:00Z', updatedAt: '2026-01-02T00:00:00Z' }], customTags: [{ id: 'comma-tag', kind: 'tag', tag: 'one, two', zone: 'scene', presetId: 'portrait', description: 'keeps, commas', imageAsset: 'legacy.png', mime: 'image/png', originalName: 'source.png', createdAt: '2026-01-03T00:00:00Z', updatedAt: '2026-01-03T00:00:00Z' }, { id: 'jpeg-tag', kind: 'tag', tag: 'jpeg', zone: 'frame', presetId: 'portrait', imageAsset: 'legacy.jpg', mime: 'image/jpeg', createdAt: '2026-01-03T00:00:00Z', updatedAt: '2026-01-03T00:00:00Z' }, { id: 'preview-artist', kind: 'artist', tag: 'artist: Preview', presetId: 'portrait', imageAsset: 'legacy.webp', mime: 'image/webp', createdAt: '2026-01-03T00:00:00Z', updatedAt: '2026-01-03T00:00:00Z' }, { id: 'text-artist', kind: 'artist', tag: 'artist: Test', zone: 'frame', presetId: 'missing', createdAt: '2026-01-04T00:00:00Z', updatedAt: '2026-01-04T00:00:00Z' }] }));
-const customLibrary = createCustomTagLibrary({ customTagsDir: customLibraryAssets, workspaceFile: customLibraryWorkspace, now: () => '2026-08-29T00:00:00.000Z' });
+const customLibrary = createCustomTagLibrary({ customTagsDir: customLibraryAssets, workspaceFile: customLibraryWorkspace, now: () => '2026-08-29T05:00:00.000Z' });
 const migratedCustomLibrary = customLibrary.load();
 assert.deepEqual(migratedCustomLibrary.presets.map(item => item.id), ['default', 'portrait']);
 const indexedPreview = migratedCustomLibrary.tags.find(item => item.id === 'comma-tag');
@@ -78,7 +79,7 @@ customLibrary.readCanonical = (...args) => { canonicalPreviewReads += 1; return 
 const indexedRelativePreview = `previews/${basename(indexedPreview.imageAsset)}`;
 assert.equal(customLibrary.resolvePreview(indexedPreview.presetId, indexedRelativePreview).endsWith(basename(indexedPreview.imageAsset)), true);
 assert.equal(customLibrary.resolvePreview(indexedPreview.presetId, indexedRelativePreview).endsWith(basename(indexedPreview.imageAsset)), true);
-assert.equal(canonicalPreviewReads, 1, 'repeated preview authorization must reuse the verified reference index');
+assert.equal(canonicalPreviewReads, 0, 'a successful retained load seeds preview authorization without rereading canonical manifests');
 customLibrary.readCanonical = originalReadCanonical;
 assert.equal(migratedCustomLibrary.tags.find(item => item.id === 'comma-tag')?.tag, 'one, two');
 assert.equal(migratedCustomLibrary.tags.find(item => item.id === 'text-artist')?.presetId, 'default');
@@ -126,6 +127,76 @@ const movedPreviewPath = movedWithPreview.tags.find(item => item.id === 'comma-t
 assert.ok(existsSync(join(customLibraryAssets, 'library-v1', 'presets', 'order-preset', movedPreviewPath.split('/').at(-2), movedPreviewPath.split('/').at(-1))));
 const movedBack = customLibrary.transact('card:move', { id: 'comma-tag', destinationPresetId: 'default' });
 assert.equal(movedBack.tags.find(item => item.id === 'comma-tag')?.presetId, 'default');
+
+// Moves retain journal recovery and immutable previews. An asset-copy failure
+// leaves the source canonical state untouched; an EXDEV hard-link failure
+// falls back to a byte-checked copy, and the first preview request after the
+// commit uses the freshly retained authorization index.
+const moveFailureTemp = localTemp('custom-library-move-failure'); const moveFailureAssets = join(moveFailureTemp, 'custom-tags'); const moveFailureWorkspace = join(moveFailureTemp, 'workspace.json'); mkdirSync(moveFailureAssets);
+const moveTime = '2026-01-01T00:00:00.000Z'; writeFileSync(moveFailureWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: moveTime, updatedAt: moveTime }, { id: 'move-target', name: 'Move target', createdAt: moveTime, updatedAt: moveTime }], customTags: [] }));
+let moveFailpoint = 'transaction:asset-copy-staged'; const moveFailureLibrary = createCustomTagLibrary({ customTagsDir: moveFailureAssets, workspaceFile: moveFailureWorkspace, now: () => moveTime, failpoint: phase => { if (phase === moveFailpoint) throw new Error(`injected ${phase}`); } });
+moveFailureLibrary.load(); moveFailureLibrary.transact('card:upsert', { id: 'move-preview', kind: 'tag', tag: 'move preview', zone: 'frame', presetId: 'default', mime: 'image/png', originalName: 'move.png', createdAt: moveTime, updatedAt: moveTime }, exactPng);
+assert.throws(() => moveFailureLibrary.transact('card:move', { id: 'move-preview', destinationPresetId: 'move-target' }), /injected transaction:asset-copy-staged/);
+assert.equal(moveFailureLibrary.load().tags.find(item => item.id === 'move-preview')?.presetId, 'default', 'a preview copy failure leaves the move source canonical');
+moveFailpoint = '';
+const originalLinkSync = nativeFs.linkSync; let forcedCrossVolumeFallback = false;
+nativeFs.linkSync = (...args) => { forcedCrossVolumeFallback = true; const error = new Error('cross-volume test fallback'); error.code = 'EXDEV'; throw error; };
+let movedAfterFallback;
+try { movedAfterFallback = moveFailureLibrary.transact('card:move', { id: 'move-preview', destinationPresetId: 'move-target' }); }
+finally { nativeFs.linkSync = originalLinkSync; }
+assert.equal(forcedCrossVolumeFallback, true, 'move attempts a hard link before its fallback copy');
+assert.equal(movedAfterFallback.tags.find(item => item.id === 'move-preview')?.presetId, 'move-target');
+const movedFallbackCard = movedAfterFallback.tags.find(item => item.id === 'move-preview');
+assert.deepEqual(readFileSync(join(moveFailureAssets, 'library-v1', 'presets', 'move-target', movedFallbackCard.imageAsset.split('/').at(-2), movedFallbackCard.imageAsset.split('/').at(-1))), exactPng, 'cross-volume fallback preserves preview bytes');
+let moveReadCanonicalCalls = 0; const originalMoveReadCanonical = moveFailureLibrary.readCanonical.bind(moveFailureLibrary); moveFailureLibrary.readCanonical = (...args) => { moveReadCanonicalCalls += 1; return originalMoveReadCanonical(...args); };
+assert.ok(moveFailureLibrary.resolvePreview('move-target', movedFallbackCard.imageAsset.split('/').slice(1).join('/')));
+assert.equal(moveReadCanonicalCalls, 0, 'first post-move preview authorization uses retained canonical references');
+const movedCardFilename = basename(movedFallbackCard.imageAsset);
+assert.ok(moveFailureLibrary.resolveCardPreview('move-preview', movedCardFilename), 'card/digest protocol resolution accepts the current canonical card');
+assert.throws(() => moveFailureLibrary.resolveCardPreview('unknown-card', movedCardFilename), /preview|card/i, 'card/digest protocol rejects unknown cards');
+assert.throws(() => moveFailureLibrary.resolveCardPreview('move-preview', `f${movedCardFilename.slice(1)}`), /preview|card/i, 'card/digest protocol rejects stale replacement digests');
+assert.throws(() => moveFailureLibrary.resolveCardPreview('move-preview', '../outside.png'), /invalid/i, 'card/digest protocol rejects path traversal');
+
+// A hard-link metadata move must not read any canonical preview bytes. Keep
+// untouched previews in both source and target folders so the probe catches
+// accidental whole-folder normalizeManifest/validatePreview calls.
+moveFailureLibrary.transact('card:upsert', { id: 'source-untouched-preview', kind: 'tag', tag: 'source untouched preview', zone: 'scene', presetId: 'default', mime: 'image/webp', originalName: 'source.webp', createdAt: moveTime, updatedAt: moveTime }, exactWebp);
+moveFailureLibrary.transact('card:upsert', { id: 'zero-read-move-preview', kind: 'tag', tag: 'zero read move preview', zone: 'character', presetId: 'default', mime: 'image/jpeg', originalName: 'moved.jpg', createdAt: moveTime, updatedAt: moveTime }, exactJpeg);
+const canonicalPreviewReadsDuringMove = []; const originalReadFileSync = nativeFs.readFileSync;
+nativeFs.readFileSync = (...args) => { const source = typeof args[0] === 'string' ? args[0].replace(/\\/g, '/') : ''; if (source.includes('/library-v1/presets/') && source.includes('/previews/')) canonicalPreviewReadsDuringMove.push(source); return originalReadFileSync(...args); };
+try { moveFailureLibrary.transact('card:move', { id: 'zero-read-move-preview', destinationPresetId: 'move-target' }); }
+finally { nativeFs.readFileSync = originalReadFileSync; }
+assert.deepEqual(canonicalPreviewReadsDuringMove, [], 'hard-link card moves read zero canonical preview bytes, including untouched source and destination previews');
+
+// A touched source preview is the exception: validate its current digest
+// before copying, and leave both manifests untouched when validation fails.
+const touchedTamperTemp = localTemp('custom-library-touched-source-tamper'); const touchedTamperAssets = join(touchedTamperTemp, 'custom-tags'); const touchedTamperWorkspace = join(touchedTamperTemp, 'workspace.json'); mkdirSync(touchedTamperAssets);
+writeFileSync(touchedTamperWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: moveTime, updatedAt: moveTime }, { id: 'tamper-target', name: 'Tamper target', createdAt: moveTime, updatedAt: moveTime }], customTags: [] }));
+const touchedTamperLibrary = createCustomTagLibrary({ customTagsDir: touchedTamperAssets, workspaceFile: touchedTamperWorkspace, now: () => moveTime }); touchedTamperLibrary.load(); const touchedTamperSnapshot = touchedTamperLibrary.transact('card:upsert', { id: 'touched-source-preview', kind: 'tag', tag: 'touched source preview', zone: 'frame', presetId: 'default', mime: 'image/png', createdAt: moveTime, updatedAt: moveTime }, exactPng); const touchedTamperCard = touchedTamperSnapshot.tags.find(item => item.id === 'touched-source-preview'); const touchedTamperFile = join(touchedTamperAssets, 'library-v1', 'presets', 'default', touchedTamperCard.imageAsset.split('/').slice(1).join('/')); writeFileSync(touchedTamperFile, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 9, 2, 3, 4]));
+assert.throws(() => touchedTamperLibrary.transact('card:move', { id: 'touched-source-preview', destinationPresetId: 'tamper-target' }), /digest|preview/i, 'card moves reject a tampered touched source before copying');
+assert.equal(existsSync(join(touchedTamperAssets, 'library-v1', 'journal.json')), false, 'touched-source validation failure does not leave a move journal');
+const touchedSourceManifest = JSON.parse(readFileSync(join(touchedTamperAssets, 'library-v1', 'presets', 'default', 'manifest.json'), 'utf8')); const touchedTargetManifest = JSON.parse(readFileSync(join(touchedTamperAssets, 'library-v1', 'presets', 'tamper-target', 'manifest.json'), 'utf8')); assert.equal(touchedSourceManifest.cards.find(item => item.id === 'touched-source-preview')?.presetId, 'default'); assert.equal(touchedTargetManifest.cards.some(item => item.id === 'touched-source-preview'), false, 'tampered move does not mutate destination metadata');
+
+// A content-addressed preview must remain bound to its digest after the
+// canonical tree has been loaded. Replacing bytes under the old filename is a
+// malformed/stale asset and must not remain authorized by a retained index.
+const staleDigestTemp = localTemp('custom-library-stale-digest'); const staleDigestAssets = join(staleDigestTemp, 'custom-tags'); const staleDigestWorkspace = join(staleDigestTemp, 'workspace.json'); mkdirSync(staleDigestAssets);
+writeFileSync(staleDigestWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: moveTime, updatedAt: moveTime }], customTags: [] }));
+const staleDigestLibrary = createCustomTagLibrary({ customTagsDir: staleDigestAssets, workspaceFile: staleDigestWorkspace, now: () => moveTime }); staleDigestLibrary.load();
+const staleDigestSnapshot = staleDigestLibrary.transact('card:upsert', { id: 'stale-digest-card', kind: 'tag', tag: 'stale digest', zone: 'frame', presetId: 'default', mime: 'image/png', createdAt: moveTime, updatedAt: moveTime }, exactPng);
+const staleDigestCard = staleDigestSnapshot.tags.find(item => item.id === 'stale-digest-card'); const staleDigestFile = join(staleDigestAssets, 'library-v1', 'presets', 'default', staleDigestCard.imageAsset.split('/').slice(1).join('/'));
+writeFileSync(staleDigestFile, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 9, 2, 3, 4]));
+let staleDigestReads = 0; const staleReadFileSync = nativeFs.readFileSync;
+nativeFs.readFileSync = (...args) => { if (args[0] === staleDigestFile) staleDigestReads += 1; return staleReadFileSync(...args); };
+try { assert.throws(() => staleDigestLibrary.resolveCardPreview(staleDigestCard.id, basename(staleDigestCard.imageAsset)), /preview|digest|invalid/i, 'card/digest protocol rejects bytes that no longer match the referenced digest'); }
+finally { nativeFs.readFileSync = staleReadFileSync; }
+assert.equal(staleDigestReads, 1, 'a changed requested preview is hashed once for digest validation');
+
+const moveJournalTemp = localTemp('custom-library-move-journal'); const moveJournalAssets = join(moveJournalTemp, 'custom-tags'); const moveJournalWorkspace = join(moveJournalTemp, 'workspace.json'); mkdirSync(moveJournalAssets);
+writeFileSync(moveJournalWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: moveTime, updatedAt: moveTime }, { id: 'journal-target', name: 'Journal target', createdAt: moveTime, updatedAt: moveTime }], customTags: [] }));
+let journalFail = false; const moveJournalLibrary = createCustomTagLibrary({ customTagsDir: moveJournalAssets, workspaceFile: moveJournalWorkspace, now: () => moveTime, failpoint: phase => { if (phase === 'transaction:journal' && journalFail) throw new Error('injected move journal'); } }); moveJournalLibrary.load(); moveJournalLibrary.transact('card:upsert', { id: 'journal-preview', kind: 'tag', tag: 'journal preview', zone: 'scene', presetId: 'default', mime: 'image/png', originalName: 'journal.png', createdAt: moveTime, updatedAt: moveTime }, exactPng); journalFail = true;
+assert.throws(() => moveJournalLibrary.transact('card:move', { id: 'journal-preview', destinationPresetId: 'journal-target' }), /injected move journal/);
+journalFail = false; assert.equal(moveJournalLibrary.load().tags.find(item => item.id === 'journal-preview')?.presetId, 'journal-target', 'journal replay completes a move after the writer fails');
 const deleteFixtureTemp = localTemp('custom-library-delete-modes'); const deleteAssets = join(deleteFixtureTemp, 'custom-tags'); const deleteWorkspace = join(deleteFixtureTemp, 'workspace.json'); mkdirSync(deleteAssets);
 const deleteTimestamp = '2026-01-01T00:00:00.000Z'; writeFileSync(deleteWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }, { id: 'delete-folder', name: 'Delete folder', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }, { id: 'shared-folder', name: 'Shared folder', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }], customTags: [{ id: 'shared-preview', kind: 'tag', tag: 'shared preview', zone: 'frame', presetId: 'delete-folder', imageAsset: 'shared.png', mime: 'image/png', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }, { id: 'unique-preview', kind: 'tag', tag: 'unique preview', zone: 'scene', presetId: 'delete-folder', imageAsset: 'unique.jpg', mime: 'image/jpeg', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }, { id: 'retained-shared-preview', kind: 'tag', tag: 'retained shared preview', zone: 'render', presetId: 'shared-folder', imageAsset: 'shared.png', mime: 'image/png', createdAt: deleteTimestamp, updatedAt: deleteTimestamp }] })); writeFileSync(join(deleteAssets, 'shared.png'), exactPng); writeFileSync(join(deleteAssets, 'unique.jpg'), exactJpeg);
 const deleteLibrary = createCustomTagLibrary({ customTagsDir: deleteAssets, workspaceFile: deleteWorkspace, now: () => '2026-08-29T05:00:00.000Z' }); const deleteInitial = deleteLibrary.load(); const sharedPreviewName = basename(deleteInitial.tags.find(item => item.id === 'shared-preview').imageAsset).split('/').at(-1); const uniquePreviewName = basename(deleteInitial.tags.find(item => item.id === 'unique-preview').imageAsset).split('/').at(-1); const deleteResult = deleteLibrary.transact('preset:delete', { id: 'delete-folder', mode: 'delete' });
@@ -134,7 +205,7 @@ const replayDeleteTemp = localTemp('custom-library-delete-replay'); const replay
 assert.equal(classifyCustomTagDrop({ phase: 'drag', targetInsideImageDrop: false, types: ['Files'], itemCount: 1 }), 'candidate', 'Windows external drags may hide File names until drop'); assert.equal(classifyCustomTagDrop({ phase: 'drop', targetInsideImageDrop: false, types: ['Files'], files: [{ name: 'shared.naipack', type: '' }] }), 'pack'); assert.equal(classifyCustomTagDrop({ phase: 'drop', targetInsideImageDrop: false, types: ['Files'], files: [{ name: 'one.png', type: 'image/png' }, { name: 'two.naipack', type: '' }] }), 'invalid'); assert.equal(classifyCustomTagDrop({ phase: 'drag', targetInsideImageDrop: true, types: ['Files'], itemCount: 1 }), 'ignore', 'undisclosed image drops remain with the image handler');
 const replacementPng = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 9, 9, 9]);
 const olderWriterMirror = JSON.parse(readFileSync(customLibraryWorkspace, 'utf8')); const olderWriterCard = olderWriterMirror.customTags.find(item => item.id === 'comma-tag');
-writeFileSync(join(customLibraryAssets, olderWriterCard.imageAsset), replacementPng); olderWriterCard.updatedAt = '2026-08-29T01:30:00.000Z'; writeFileSync(customLibraryWorkspace, JSON.stringify(olderWriterMirror));
+writeFileSync(join(customLibraryAssets, olderWriterCard.imageAsset), replacementPng); olderWriterCard.updatedAt = '2026-08-29T06:30:00.000Z'; writeFileSync(customLibraryWorkspace, JSON.stringify(olderWriterMirror));
 const replacementMerge = customLibrary.load(); const replacementCard = replacementMerge.tags.find(item => item.id === 'comma-tag');
 assert.deepEqual(readFileSync(join(customLibraryAssets, 'library-v1', 'presets', replacementCard.imageAsset)), replacementPng, 'newer resolvable mirror image must replace stale canonical preview');
 
@@ -177,6 +248,7 @@ const journalLibrary = createCustomTagLibrary({ customTagsDir: journalAssets, wo
 const duplicateJournalManifests = [{ preset: journalCanonical.manifests[0].preset, cards: [duplicateJournalCard] }, { preset: duplicateJournalPreset, cards: [{ ...duplicateJournalCard, presetId: 'journal-second' }] }];
 assert.throws(() => journalLibrary.commitJournal({ format: 'nai-custom-tag-library', schemaVersion: 1, operationId: '00000000-0000-4000-8000-000000000000', manifests: duplicateJournalManifests, index: { format: 'nai-custom-tag-library', schemaVersion: 1, presetOrder: ['default', 'journal-second'], mirrorDigest: 'f'.repeat(64), updatedAt: '2026-01-01T00:00:00.000Z' } }), /Duplicate custom card id across preset manifests/, 'journals must reject duplicate ids before committing');
 assert.throws(() => journalLibrary.commitJournal({ format: 'nai-custom-tag-library', schemaVersion: 1, operationId: '00000000-0000-4000-8000-000000000000', manifests: [{ preset: journalCanonical.manifests[0].preset, cards: [{ ...duplicateJournalCard, id: ' journal-whitespace ' }] }], index: { format: 'nai-custom-tag-library', schemaVersion: 1, presetOrder: ['default'], mirrorDigest: 'f'.repeat(64), updatedAt: '2026-01-01T00:00:00.000Z' } }), /Invalid canonical custom card/, 'journals must reject whitespace-padded card ids without normalizing them');
+assert.throws(() => journalLibrary.commitJournal({ format: 'nai-custom-tag-library', schemaVersion: 1, operationId: '00000000-0000-4000-8000-000000000001', manifests: [{ preset: journalCanonical.manifests[0].preset, cards: [{ id: 'journal-invalid-preview', kind: 'tag', tag: 'invalid preview', zone: 'frame', presetId: 'default', description: '', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', preview: { file: `previews/${'a'.repeat(64)}.png`, mime: 'image/png', bytes: exactPng.length, sha256: 'a'.repeat(64), originalName: 'invalid.png' } }] }], index: { format: 'nai-custom-tag-library', schemaVersion: 1, presetOrder: ['default'], mirrorDigest: 'f'.repeat(64), updatedAt: '2026-01-01T00:00:00.000Z' } }), /preview/i, 'untrusted journals must fully validate referenced preview files');
 
 const failureTemp = localTemp('custom-library-failure'); const failureAssets = join(failureTemp, 'custom-tags'); const failureWorkspace = join(failureTemp, 'workspace.json'); mkdirSync(failureAssets); writeFileSync(failureWorkspace, JSON.stringify({ version: 3, customTags: [], customTagPresets: [] }));
 let injectedPhase = ''; let injected = false;

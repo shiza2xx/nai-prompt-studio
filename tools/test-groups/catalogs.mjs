@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { COMPONENT_VERSION as catalogPackComponentVersion, resolveCatalogComponentVersion } from '../catalog-packs-version.mjs';
 await import('../test-suites/catalog-components.mjs');
 await import('../test-suites/catalog-runtime.mjs');
+await import('../test-suites/catalog-performance.mjs');
 const require = createRequire(import.meta.url);
 const { COMPONENT_VERSION: runtimeComponentVersion } = require('../../electron/catalog-components.cjs');
 assert.equal(catalogPackComponentVersion, runtimeComponentVersion, 'catalog pack tooling consumes the runtime component authority');

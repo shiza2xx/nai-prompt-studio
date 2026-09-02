@@ -6,7 +6,7 @@ const { pathToFileURL } = require('node:url');
 const { resolveAppPaths, ensureWritable } = require('./app-paths.cjs');
 const { containedAsset, validateImagePayload, writeAsset } = require('./custom-tag-assets.cjs');
 const { createCustomTagLibrary, writeWorkspaceSection } = require('./custom-tag-library.cjs');
-const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, resolveActiveCatalogAsset } = require('./catalog-updater.cjs');
+const { loadCatalog, runUpdate, catalogAssetFromProtocolUrl, readActiveCatalogAsset } = require('./catalog-updater.cjs');
 const { normalizeDescriptors, ensureComponent, ensureSelectedComponents, loadState, statuses, readInstallerSelections } = require('./catalog-components.cjs');
 const { ComponentProgressCoalescer } = require('./component-progress-coalescer.cjs');
 const { checkForUpdate, downloadInstaller, validateManifest, UpdateAbortError } = require('./app-updater.cjs');
@@ -14,6 +14,14 @@ const { loadPost: loadBooruPost } = require('./booru-metadata.cjs');
 
 const APP_USER_MODEL_ID = 'com.novelai.promptstudio';
 const APP_ICON = path.join(__dirname, '..', app.isPackaged ? 'dist' : 'public', 'app-icon.png');
+const FEEDBACK_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSea7082Hc8y4QoltvP8Yro32QeJifYppLCb6iKxPgV6dg6wmw/viewform?usp=dialog';
+
+function isFeedbackUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' && parsed.hostname === 'docs.google.com' && parsed.pathname === '/forms/d/e/1FAIpQLSea7082Hc8y4QoltvP8Yro32QeJifYppLCb6iKxPgV6dg6wmw/viewform' && parsed.search === '?usp=dialog' && parsed.hash === '';
+  } catch { return false; }
+}
 
 app.setName('NAI Prompt Studio');
 app.setAppUserModelId(APP_USER_MODEL_ID);
@@ -32,10 +40,17 @@ try {
     workspaceDir: path.resolve(__dirname, '..'),
     executablePath: process.execPath
   }));
+  // Keep every runtime temporary file (including Electron/ASAR helper work)
+  // under the validated application profile. This is set before constructing
+  // any storage, catalog, or BrowserWindow work and never touches historical
+  // files in the host's system TEMP directory.
+  process.env.TEMP = appPaths.tempDir;
+  process.env.TMP = appPaths.tempDir;
+  process.env.TMPDIR = appPaths.tempDir;
+  app.setPath('temp', appPaths.tempDir);
   app.setPath('userData', appPaths.dataDir);
   customTagLibrary = createCustomTagLibrary({ customTagsDir: appPaths.customTagsDir, workspaceFile: appPaths.workspaceFile });
   app.setPath('sessionData', appPaths.dataDir);
-  app.setPath('temp', appPaths.tempDir);
   app.commandLine.appendSwitch('disk-cache-dir', appPaths.cacheDir);
   try { app.setPath('logs', appPaths.logsDir); } catch { /* unavailable on older Electron */ }
   try { app.setPath('crashDumps', appPaths.crashDumpsDir); } catch { /* unavailable on older Electron */ }
@@ -215,6 +230,16 @@ ipcMain.handle('storage:open-profile-folder', async () => {
   const result = await shell.openPath(target);
   if (result) throw new Error(result);
   return true;
+});
+ipcMain.handle('external:open-feedback', async () => {
+  if (!isFeedbackUrl(FEEDBACK_URL)) return false;
+  try {
+    await shell.openExternal(FEEDBACK_URL);
+    return true;
+  } catch (error) {
+    console.error(`[external] ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 });
 ipcMain.on('storage:save', (_event, section, value) => {
   try { saveStorageSection(section, value); }
@@ -444,10 +469,12 @@ function createWindow() {
 app.whenReady().then(() => {
   protocol.handle('nai-custom', request => {
     try {
-      const asset = decodeURIComponent(new URL(request.url).pathname.replace(/^\//, ''));
+      const parsed = new URL(request.url);
+      const asset = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
       const parts = asset.replace(/\\/g, '/').split('/');
       let target;
-      if (parts.length === 3 && parts[1] === 'previews') target = customTagLibrary.resolvePreview(parts[0], `previews/${parts[2]}`);
+      if (parsed.hostname === 'card' && parts.length === 2) target = customTagLibrary.resolveCardPreview(parts[0], parts[1]);
+      else if (parts.length === 3 && parts[1] === 'previews') target = customTagLibrary.resolvePreview(parts[0], `previews/${parts[2]}`);
       else target = containedAsset(appPaths.customTagsDir, asset);
       return fs.existsSync(target) ? net.fetch(pathToFileURL(target).toString()) : new Response('Not found', { status: 404 });
     } catch { return new Response('Not found', { status: 404 }); }
@@ -455,12 +482,12 @@ app.whenReady().then(() => {
   protocol.handle('nai-catalog', async request => {
     try {
       const asset = catalogAssetFromProtocolUrl(request.url);
-      const target = resolveActiveCatalogAsset(appPaths.catalogDir, asset);
-      if (!fs.existsSync(target)) return new Response('Not found', { status: 404 });
-      // Electron's native ASAR fs integration reads archive.asar/inner/path.
-      // Returning the bytes directly avoids relying on net.fetch(file://...)'s
-      // handling of ASAR inner URLs and keeps MIME types deterministic.
-      const bytes = await fs.promises.readFile(target);
+      // Component and legacy catalog entries are read directly from their
+      // ASAR data regions; no archive.asar/inner/path virtual filesystem path
+      // is opened (which would otherwise extract UUID-named temporary files).
+      // The former loose-file branch used fs.promises.readFile(target); the
+      // descriptor reader now handles loose files and ASAR entries uniformly.
+      const bytes = await readActiveCatalogAsset(appPaths.catalogDir, asset, { embeddedPath: embeddedCatalogPath() });
       const extension = path.extname(asset).toLowerCase();
       const mime = extension === '.webp' ? 'image/webp' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.png' ? 'image/png' : 'application/octet-stream';
       return new Response(bytes, { status: 200, headers: { 'Content-Type': mime, 'Cache-Control': 'no-store' } });

@@ -16,6 +16,7 @@ NAI Prompt Studio is a local Windows desktop workspace for building NovelAI prom
 - App-local settings, caches, catalog data, logs, and verified GitHub update downloads
 - Eight interface themes: Arcane Gold, Midnight Blue, Raspberry Rose, Noir, Celestial Light, Ember Peach, Gothic, and Galaxy
 - First-run guide, percentage-based startup loading screen, configurable interface animations, and hover previews for visual cards
+- Current-version What’s New notices with storage guidance and a Google Forms feedback link
 
 The source repository intentionally excludes the multi-gigabyte offline catalog. Public releases provide separate catalog packs and a Windows installer.
 
@@ -72,6 +73,12 @@ npm run desktop:build
 The generated setup is a single-file Windows installer. It lets the user choose an installation directory, creates the application folder there, offers Start Menu and Desktop shortcut options, and can launch the app from the finish page. The uninstaller can preserve or remove the local profile. Installed settings, catalogs, custom cards, and update cache remain beside the application instead of moving to another drive.
 
 All project commands route temporary files and package caches into project-local folders on the current drive. Development state lives in `.app-data`. An installed copy stores mutable data in its own `data` folder beside the application files.
+
+### Installed runtime storage and cleanup
+
+We're sorry. For v0.6.9, the installed runtime temp directory is `data/temp` and the cache directory is `data/cache`, both inside the installed app's profile. Earlier builds could create duplicate preview, cache, and temp files in Windows system `%TEMP%` and consume substantial system-drive space. Historical Windows `%TEMP%` leftovers are not automatically removed.
+
+For safe cleanup, close NAI Prompt Studio and its installer. First, use Windows Settings > System > Storage > Temporary files and review and remove temporary files. For targeted cleanup, press Win+R, enter `%TEMP%`, and remove only clearly identifiable old NAI Prompt Studio, Electron, or ASAR-related leftovers. Skip anything in use or uncertain.
 
 The Windows setup is currently unsigned, so Microsoft SmartScreen may show an unknown-publisher warning. Download releases only from this repository and compare the setup SHA-512 with `update-manifest.json`. The in-app updater validates the release host, size and SHA-512 before it launches the installer. Updates preserve the app-local `data` folder.
 

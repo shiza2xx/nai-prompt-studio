@@ -9,6 +9,7 @@ Object.assign(globalThis, { window, document: window.document, Element: window.E
 const { WorkspaceController } = await import('../../src/workspace-controller.ts');
 const { SavedLibraryWorkspaceModule } = await import('../../src/workspaces/saved-library-workspace.ts');
 const { CustomTagsWorkspaceModule, swapCardOrderSlots } = await import('../../src/workspaces/custom-tags-workspace.ts');
+const { PreviewCache } = await import('../../src/preview-cache.ts');
 const { bindArtistCardPreview, beginArtistCardPreviewDrag, endArtistCardPreviewDrag } = await import('../../src/artist-card-preview.ts');
 const root = document.createElement('div'); document.body.append(root);
 let delegated = 0; let workspaceRouter = null;
@@ -47,6 +48,91 @@ const customInput = document.querySelector('#custom-tag-search'); customInput.fo
 assert.equal(customSearchCalls, 1, 'Custom Tags delegated input fires exactly once');
 custom.refresh(controller); assert.equal(document.activeElement, customInput, 'Custom Tags scoped refresh retains focus'); assert.match(controller.workspaceHost.textContent, /blue eyes/);
 
+// Custom Tags patches preserve card and image identities while only changing
+// the DOM slots. A changed card is replaced and clears a live shared hover;
+// a newly added card is hydrated and receives the same preview binding.
+const identityNow = '2026-08-31T00:00:00.000Z';
+const identityTags = [
+  { id: 'identity-a', kind: 'artist', tag: 'artist: Alpha', zone: 'frame', presetId: 'default', imageAsset: 'a.png', description: 'A', createdAt: identityNow, updatedAt: identityNow },
+  { id: 'identity-b', kind: 'tag', tag: 'Blue eyes', zone: 'scene', presetId: 'default', imageAsset: 'b.png', description: 'B', createdAt: identityNow, updatedAt: identityNow },
+  { id: 'identity-c', kind: 'tag', tag: 'Crimson light', zone: 'render', presetId: 'second', imageAsset: 'c.png', description: 'C', createdAt: identityNow, updatedAt: identityNow }
+];
+const escapeFixtureHtml = value => String(value).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const identityState = {
+  tags: identityTags, presets: [{ id: 'default', name: 'My Tags', createdAt: identityNow, updatedAt: identityNow }, { id: 'second', name: 'Second', createdAt: identityNow, updatedAt: identityNow }], selectedPresetId: 'default', editingId: null, formKind: 'tag', search: '', filter: 'all', creatingPreset: false, sort: 'default', renamingPresetId: null, deletingPresetId: null, deleteError: '', warning: '', packStatus: '', packStatusKind: '', packAvailable: false, draftImageUrl: '', shadowedArtistIds: new Set(), defaultPresetId: 'default', movePendingId: null, moveError: '', imageUrl: tag => `nai-custom://asset/${tag.imageAsset}`, escape: escapeFixtureHtml
+};
+const identityMoveCalls = [];
+const identityActions = { search: value => { identityState.search = value; }, filter: value => { identityState.filter = value; }, selectPreset: value => { identityState.selectedPresetId = value; }, sort: value => { identityState.sort = value; }, moveTag: (id, presetId) => identityMoveCalls.push([id, presetId]), reorder: () => {}, beginCreatePreset: () => {}, cancelCreatePreset: () => {}, createPreset: () => {}, beginRenamePreset: () => {}, cancelRenamePreset: () => {}, renamePreset: () => {}, beginDeletePreset: () => {}, cancelDeletePreset: () => {}, confirmDeletePreset: () => {}, editTag: () => {}, deleteTag: () => {}, cancelEdit: () => {}, setKind: () => {}, readImage: () => {}, saveTag: () => {}, importPack: () => {}, exportPreset: () => {} };
+const identityModule = new CustomTagsWorkspaceModule(() => identityState, identityActions);
+controller.mount('custom-tags', identityModule.markup('workspace-panel'));
+workspaceRouter = event => identityModule.route(event);
+const identityGrid = document.querySelector('#custom-tag-grid');
+const identityBefore = new Map([...identityGrid.querySelectorAll('[data-custom-card-id]')].map(node => [node.dataset.customCardId, { node, image: node.querySelector('img') }]));
+identityGrid.scrollTop = 37;
+const previewFetches = [];
+const previewCache = new PreviewCache({
+  fetch: async source => { previewFetches.push(source); return { ok: true, blob: async () => Buffer.from('preview') }; },
+  createObjectURL: () => 'blob:custom-preview', revokeObjectURL: () => {},
+  createImage: () => ({ dataset: {}, complete: true, naturalWidth: 2, naturalHeight: 2, classList: { add: () => {}, remove: () => {} }, decode: async () => {} }),
+  schedule: callback => { callback(); return 0; }, setTimeout: () => 0, clearTimeout: () => {}
+});
+const hydrateAndBind = scope => { previewCache.hydrate(scope); bindArtistCardPreview(scope); };
+identityState.tags = [identityTags[1], identityTags[0], identityTags[2]];
+identityModule.refresh(controller, hydrateAndBind);
+assert.deepEqual([...identityGrid.querySelectorAll('[data-custom-card-id]')].map(node => node.dataset.customCardId), ['identity-b', 'identity-a'], 'default folder retains its filtered order');
+for (const id of ['identity-a', 'identity-b']) {
+  const current = identityGrid.querySelector(`[data-custom-card-id="${id}"]`);
+  assert.equal(current, identityBefore.get(id).node, `${id} card node is reused during reorder`);
+  assert.equal(current.querySelector('img'), identityBefore.get(id).image, `${id} image node is reused during reorder`);
+}
+assert.equal(identityGrid.scrollTop, 37, 'Custom Tags patches retain grid scroll position');
+const alpha = identityGrid.querySelector('[data-custom-card-id="identity-a"]'); alpha.dispatchEvent(new window.Event('pointerenter'));
+const sharedPreview = document.querySelector('#artist-card-preview'); assert.equal(sharedPreview.classList.contains('is-visible'), true, 'custom artist cards bind the shared hover preview');
+const beforeSourceChange = identityGrid.querySelector('[data-custom-card-id="identity-b"]'); beforeSourceChange.dispatchEvent(new window.Event('pointerenter'));
+identityState.tags = identityState.tags.map(tag => tag.id === 'identity-b' ? { ...tag, imageAsset: 'b-replaced.png' } : tag);
+identityModule.refresh(controller, hydrateAndBind);
+const afterSourceChange = identityGrid.querySelector('[data-custom-card-id="identity-b"]');
+assert.notEqual(afterSourceChange, beforeSourceChange, 'changed card content is replaced');
+assert.notEqual(afterSourceChange.querySelector('img'), identityBefore.get('identity-b').image, 'changed card image is replaced with its new source');
+assert.equal(sharedPreview.classList.contains('is-visible'), false, 'replacing an active card clears its shared hover preview');
+const beforeRemoval = identityGrid.querySelector('[data-custom-card-id="identity-a"]'); beforeRemoval.dispatchEvent(new window.Event('pointerenter'));
+identityState.tags = identityState.tags.filter(tag => tag.id !== 'identity-a');
+identityModule.refresh(controller, hydrateAndBind);
+assert.equal(identityGrid.querySelector('[data-custom-card-id="identity-a"]'), null, 'removed cards leave the grid');
+assert.equal(sharedPreview.classList.contains('is-visible'), false, 'removing an active card clears its shared hover preview');
+identityState.tags = [...identityState.tags, { id: 'identity-new', kind: 'artist', tag: 'artist: New', zone: 'frame', presetId: 'default', imageAsset: 'new.png', description: '', createdAt: identityNow, updatedAt: identityNow }];
+identityModule.refresh(controller, hydrateAndBind);
+const added = identityGrid.querySelector('[data-custom-card-id="identity-new"]');
+assert.ok(added, 'new cards are mounted by the local patch');
+assert.ok(previewFetches.includes('nai-custom://asset/new.png'), 'new cards are hydrated through the content preview cache');
+added.dispatchEvent(new window.Event('pointerenter'));
+assert.equal(sharedPreview.classList.contains('is-visible'), true, 'new artist cards receive the shared preview binding');
+
+// Move controls expose pending/disabled state, update folder counts from a
+// snapshot, preserve the workspace host, and recover after an error.
+identityState.selectedPresetId = 'all'; identityState.movePendingId = 'identity-new';
+identityModule.refresh(controller, hydrateAndBind);
+const pendingCard = identityGrid.querySelector('[data-custom-card-id="identity-new"]');
+assert.equal(pendingCard.getAttribute('aria-busy'), 'true');
+assert.equal(pendingCard.querySelector('summary').getAttribute('aria-disabled'), 'true');
+assert.equal(pendingCard.querySelector('[data-move-custom-tag]')?.hasAttribute('disabled'), true, 'pending move disables destination actions');
+identityState.movePendingId = null; identityState.moveError = '';
+identityState.tags = identityState.tags.map(tag => tag.id === 'identity-new' ? { ...tag, presetId: 'second' } : tag);
+identityModule.refresh(controller, hydrateAndBind);
+assert.equal(controller.workspaceHost, hostIdentity, 'move snapshot patch retains WorkspaceController host identity');
+assert.match(document.querySelector('.preset-row[data-preset-id="second"] small').textContent, /2 cards/);
+assert.match(document.querySelector('#custom-tag-move-status').textContent, /^$/);
+identityState.moveError = 'simulated move failure';
+identityState.tags = identityState.tags.map(tag => tag.id === 'identity-new' ? { ...tag, presetId: 'default' } : tag);
+identityModule.refresh(controller, hydrateAndBind);
+assert.equal(identityGrid.querySelector('[data-custom-card-id="identity-new"] small').textContent.includes('My Tags'), true, 'failed move snapshot keeps the source folder');
+assert.equal(document.querySelector('#custom-tag-move-status').textContent, 'simulated move failure');
+identityState.moveError = '';
+const repeatMove = identityGrid.querySelector('[data-move-custom-tag="identity-new"][data-move-destination="second"]');
+repeatMove.dispatchEvent(new window.Event('click', { bubbles: true }));
+assert.deepEqual(identityMoveCalls.at(-1), ['identity-new', 'second'], 'a later move remains actionable after rollback');
+previewCache.dispose();
+
 const dragNow = '2026-08-31T00:00:00.000Z';
 assert.deepEqual(swapCardOrderSlots(['a', 'b', 'c', 'd'], 'a', 'c'), ['c', 'b', 'a', 'd'], 'left-to-right swap preserves exact slots');
 assert.deepEqual(swapCardOrderSlots(['a', 'b', 'c', 'd'], 'd', 'b'), ['a', 'd', 'c', 'b'], 'right-to-left swap preserves exact slots');
@@ -80,6 +166,21 @@ assert.deepEqual(reorderCalls.at(-1), ['c', 'b', 'a', 'd'], 'card controls never
 dragCards[2].dispatchEvent(new window.Event('dragend', { bubbles: true }));
 assert.equal(document.querySelector('[data-custom-card-id="a"]').querySelector('img').getAttribute('draggable'), 'false', 'card images opt out of native image dragging');
 assert.deepEqual(reorderCalls.at(-1), ['c', 'b', 'a', 'd'], 'control drag does not reorder');
+const reorderCountBeforeArrow = reorderCalls.length;
+const arrowDown = document.querySelector('[data-custom-card-id="a"] [data-reorder-custom-tag="down"]');
+arrowDown.dispatchEvent(new window.Event('click', { bubbles: true }));
+assert.deepEqual(reorderCalls.at(-1), ['b', 'a', 'c', 'd'], 'default-folder arrow reorder swaps exact adjacent slots');
+dragState.filter = 'frame';
+arrowDown.dispatchEvent(new window.Event('click', { bubbles: true }));
+assert.equal(reorderCalls.length, reorderCountBeforeArrow + 1, 'filtered views are view-only for arrow reorder');
+dragState.filter = 'all'; dragState.sort = 'a-z';
+arrowDown.dispatchEvent(new window.Event('click', { bubbles: true }));
+assert.equal(reorderCalls.length, reorderCountBeforeArrow + 1, 'A-Z views are view-only for arrow reorder');
+dragState.sort = 'default'; dragState.selectedPresetId = 'all';
+const blockedAllDrag = new window.Event('dragstart', { bubbles: true, cancelable: true });
+document.querySelector('[data-custom-card-id="a"]').dispatchEvent(blockedAllDrag);
+assert.equal(blockedAllDrag.defaultPrevented, true, 'All Tags view disables drag reorder');
+assert.equal(reorderCalls.length, reorderCountBeforeArrow + 1, 'All Tags drag does not reorder');
 
 const previewTarget = document.createElement('article'); previewTarget.dataset.artistPreviewImage = ''; previewTarget.dataset.artistPreviewTag = 'Preview card'; document.body.append(previewTarget); bindArtistCardPreview(document);
 previewTarget.dispatchEvent(new window.Event('pointerenter'));

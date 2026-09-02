@@ -22,6 +22,10 @@ contextBridge.exposeInMainWorld('naiMetadata', {
   cancelPost: () => ipcRenderer.invoke('metadata:cancel-post')
 });
 
+contextBridge.exposeInMainWorld('naiExternal', {
+  openFeedback: () => ipcRenderer.invoke('external:open-feedback')
+});
+
 contextBridge.exposeInMainWorld('naiCatalog', {
   load: () => ipcRenderer.invoke('catalog:load'),
   mode: () => ipcRenderer.invoke('catalog:mode'),
