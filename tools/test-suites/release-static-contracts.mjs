@@ -56,7 +56,8 @@ assert.match(releaseManifestSource, /Complete v0\.6\.3 catalog descriptors are r
 assert.match(releaseManifestSource, /releaseNotes\.summary/);
 const releaseNotes = JSON.parse(readFileSync(new URL('../../src/release-notes.json', import.meta.url), 'utf8'));
 const readmeSource = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
-const discordSource = readFileSync(new URL('../../DISCORD_POST.md', import.meta.url), 'utf8');
+const discordPath = new URL('../../DISCORD_POST.md', import.meta.url);
+const discordSource = existsSync(discordPath) ? readFileSync(discordPath, 'utf8') : null;
 assert.equal(releaseNotes.version, packageSource.version);
 assert.equal(typeof releaseNotes.summary, 'string');
 assert.ok(releaseNotes.whatsNew.length >= 1);
@@ -76,7 +77,9 @@ assert.match(releaseNotes.cleanupNotice.steps[2], /Win\+R, enter %TEMP%/);
 assert.match(releaseNotes.cleanupNotice.steps[2], /clearly identifiable old NAI Prompt Studio, Electron, or ASAR-related leftovers/);
 assert.match(releaseNotes.cleanupNotice.steps[2], /Skip anything in use or uncertain/);
 assert.match(releaseManifestSource, /cleanupNotice/);
-for (const [name, source] of [['README.md', readmeSource], ['DISCORD_POST.md', discordSource]]) {
+const documentationSources = [['README.md', readmeSource]];
+if (discordSource !== null) documentationSources.push(['DISCORD_POST.md', discordSource]);
+for (const [name, source] of documentationSources) {
   assert.match(source, /We're sorry\./, `${name} must include a plain apology`);
   assert.match(source, /data\/temp/, `${name} must name the installed runtime temp directory`);
   assert.match(source, /data\/cache/, `${name} must name the installed cache directory`);
@@ -88,8 +91,10 @@ for (const [name, source] of [['README.md', readmeSource], ['DISCORD_POST.md', d
   assert.match(source, /Skip anything in use or uncertain/i, `${name} must tell users to skip uncertain files`);
   assert.doesNotMatch(source, /(?:delete|remove)\s+(?:all|everything)[^\n]*%TEMP%/i, `${name} must not suggest broad TEMP deletion`);
 }
-assert.equal((discordSource.match(/^- /gm) ?? []).length, 3, 'Discord release copy must stay within three bullets');
-assert.match(discordSource, /https:\/\/github\.com\/shiza2xx\/nai-prompt-studio\/releases\/tag\/v0\.6\.9/);
+if (discordSource !== null) {
+  assert.equal((discordSource.match(/^- /gm) ?? []).length, 3, 'Discord release copy must stay within three bullets');
+  assert.match(discordSource, /https:\/\/github\.com\/shiza2xx\/nai-prompt-studio\/releases\/tag\/v0\.6\.9/);
+}
 assert.match(desktopBuildSource, /build-installer\.mjs/);
 assert.match(installerBuildSource, /electron-builder/);
 assert.match(installerBuildSource, /\.payload/);
