@@ -127,6 +127,25 @@ const movedPreviewPath = movedWithPreview.tags.find(item => item.id === 'comma-t
 assert.ok(existsSync(join(customLibraryAssets, 'library-v1', 'presets', 'order-preset', movedPreviewPath.split('/').at(-2), movedPreviewPath.split('/').at(-1))));
 const movedBack = customLibrary.transact('card:move', { id: 'comma-tag', destinationPresetId: 'default' });
 assert.equal(movedBack.tags.find(item => item.id === 'comma-tag')?.presetId, 'default');
+assert.throws(() => customLibrary.transact('card:bulk-move', { ids: ['order-one', 'missing-card'], destinationPresetId: 'default' }), /Unknown custom card/, 'bulk moves validate every id before mutation');
+assert.deepEqual(customLibrary.load().tags.filter(item => item.presetId === 'order-preset').map(item => item.id), ['order-three', 'order-one', 'order-two']);
+const bulkMoved = customLibrary.transact('card:bulk-move', { ids: ['order-one', 'order-three'], destinationPresetId: 'default' });
+assert.deepEqual(bulkMoved.tags.filter(item => item.presetId === 'default').slice(-2).map(item => item.id), ['order-one', 'order-three'], 'bulk moves preserve requested relative order');
+const bulkDeleted = customLibrary.transact('card:bulk-delete', { ids: ['order-one', 'order-three'] });
+assert.equal(bulkDeleted.tags.some(item => item.id === 'order-one' || item.id === 'order-three'), false);
+assert.throws(() => customLibrary.transact('card:bulk-delete', { ids: ['order-two', 'order-two'] }), /Invalid custom card batch delete/);
+
+// A multi-card preview copy must be all-or-nothing. If a later immutable
+// copy fails, an earlier destination file is an orphan and must be removed so
+// a retry cannot inherit unjournaled bytes.
+const bulkFailureTemp = localTemp('custom-library-bulk-failure'); const bulkFailureAssets = join(bulkFailureTemp, 'custom-tags'); const bulkFailureWorkspace = join(bulkFailureTemp, 'workspace.json'); mkdirSync(bulkFailureAssets);
+const bulkFailureTime = '2026-01-01T00:00:00.000Z'; writeFileSync(bulkFailureWorkspace, JSON.stringify({ version: 3, customTagPresets: [{ id: 'default', name: 'My Tags', createdAt: bulkFailureTime, updatedAt: bulkFailureTime }, { id: 'bulk-source', name: 'Bulk source', createdAt: bulkFailureTime, updatedAt: bulkFailureTime }, { id: 'bulk-target', name: 'Bulk target', createdAt: bulkFailureTime, updatedAt: bulkFailureTime }], customTags: [] }));
+let bulkCopyCount = 0; const bulkFailureLibrary = createCustomTagLibrary({ customTagsDir: bulkFailureAssets, workspaceFile: bulkFailureWorkspace, now: () => bulkFailureTime, failpoint: phase => { if (phase === 'transaction:asset-copy-staged' && ++bulkCopyCount === 2) throw new Error('injected second bulk copy'); } }); bulkFailureLibrary.load();
+bulkFailureLibrary.transact('card:upsert', { id: 'bulk-one', kind: 'tag', tag: 'bulk one', zone: 'frame', presetId: 'bulk-source', mime: 'image/png', originalName: 'one.png' }, exactPng);
+bulkFailureLibrary.transact('card:upsert', { id: 'bulk-two', kind: 'tag', tag: 'bulk two', zone: 'frame', presetId: 'bulk-source', mime: 'image/jpeg', originalName: 'two.jpg' }, exactJpeg);
+bulkCopyCount = 0; assert.throws(() => bulkFailureLibrary.transact('card:bulk-move', { ids: ['bulk-one', 'bulk-two'], destinationPresetId: 'bulk-target' }), /injected second bulk copy/);
+const bulkFailureSnapshot = bulkFailureLibrary.load(); assert.deepEqual(bulkFailureSnapshot.tags.filter(item => item.presetId === 'bulk-source').map(item => item.id), ['bulk-one', 'bulk-two']); assert.equal(bulkFailureSnapshot.tags.some(item => item.presetId === 'bulk-target'), false);
+const bulkTargetPreviewDir = join(bulkFailureAssets, 'library-v1', 'presets', 'bulk-target', 'previews'); const bulkOrphans = existsSync(bulkTargetPreviewDir) ? readdirSync(bulkTargetPreviewDir).filter(name => /\.(?:png|jpg|webp)$/.test(name)) : []; assert.deepEqual(bulkOrphans, [], 'failed bulk move removes unjournaled destination preview copies'); assert.equal(existsSync(join(bulkFailureAssets, 'library-v1', 'journal.json')), false, 'failed bulk move leaves no journal');
 
 // Moves retain journal recovery and immutable previews. An asset-copy failure
 // leaves the source canonical state untouched; an EXDEV hard-link failure

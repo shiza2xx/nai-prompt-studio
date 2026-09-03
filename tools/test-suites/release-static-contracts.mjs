@@ -67,6 +67,27 @@ assert.equal(typeof releaseNotes.cleanupNotice.copy, 'string');
 assert.equal(releaseNotes.cleanupNotice.steps.length, 3);
 const releaseCopy = `${releaseNotes.summary} ${releaseNotes.whatsNew.map(item => `${item.title} ${item.copy}`).join(' ')} ${releaseNotes.cleanupNotice.title} ${releaseNotes.cleanupNotice.copy} ${releaseNotes.cleanupNotice.steps.join(' ')}`;
 assert.doesNotMatch(releaseCopy, /[—–]/);
+assert.equal(releaseNotes.summary, 'v0.7.0 connects Artist Mix and Prompt Builder, makes saved work easier to reuse, and brings clearer controls, previews, and card management across the studio.');
+assert.equal(releaseNotes.whatsNew.length, 6, 'v0.7.0 What\'s New has one item for each release highlight');
+assert.deepEqual(releaseNotes.whatsNew.map(item => item.title), [
+  'Use Artist Mix in Prompt Builder',
+  'Save and reuse complete work',
+  'Manage several Custom Tags at once',
+  'Previews stay ready while browsing',
+  'Set a comfortable interface scale',
+  'A calmer studio to work in'
+]);
+const releaseFeatureSignals = [
+  [/12 artists/i, /multiple anchors/i, /range/i, /clear/i, /weights/i, /wheel/i],
+  [/universal New tile/i, /prompts/i, /Artist Mixes/i, /characters/i, /Use in Builder/i, /replaces/i, /Base Prompt/i, /Undesired content/i, /Characters/i, /Frame/i, /Scene/i, /Render/i, /Artist Mix/i, /random range/i, /unchanged/i],
+  [/Select Mode/i, /multiple cards/i, /move/i, /delete/i],
+  [/Image-only hover previews/i, /grid previews/i, /browse/i, /filter/i, /folders/i, /Original files stay unchanged/i],
+  [/100%/, /110%/, /125%/, /between sessions/i, /controls/i, /focus/i, /readable/i],
+  [/glass header/i, /Base Prompt/i, /quick clear/i, /hover focus/i, /quiet success/i, /warnings/i]
+];
+for (const [index, signals] of releaseFeatureSignals.entries()) {
+  for (const signal of signals) assert.match(releaseNotes.whatsNew[index].copy, signal, `What's New item ${index + 1} covers its supported feature signals`);
+}
 assert.match(releaseNotes.cleanupNotice.copy, /We're sorry\./);
 assert.match(releaseNotes.cleanupNotice.copy, /installed app's own profile directory at data\/temp/);
 assert.match(releaseNotes.cleanupNotice.copy, /Windows system %TEMP%/);
@@ -214,13 +235,13 @@ assert.match(savedLibraryWorkspaceSource, /private card\([\s\S]*?data-preview-ca
 assert.match(uiSource, /const visual = hasImage \? `<img data-preview-cache="content"/);
 assert.match(uiSource, /const cache = job\.card \? contentOrGridPreviewCache\(job\.card\) : contentPreviewCache/);
 assert.match(uiSource, /function clearHoverPreviewCache\(\): void \{[\s\S]*?hoverPreviewCache\.clear\(\)/);
-for (const boundary of ['switchWorkspace', 'closeArtistPicker', 'closeCharacterPicker', 'closeMixPicker', 'refreshArtistGrid', 'refreshCharacterPicker', 'refreshMixPicker']) {
+for (const boundary of ['switchWorkspace', 'closeCharacterPicker', 'closeMixPicker', 'refreshCharacterPicker', 'refreshMixPicker']) {
   const boundarySource = uiSource.match(new RegExp(`function ${boundary}\\([\\s\\S]*?\\n\\}`))?.[0] ?? '';
   assert.match(boundarySource, /clearHoverPreviewCache\(\)/, `${boundary} must cancel hover originals`);
 }
 assert.match(uiSource, /const requestToken = \+\+previewPageToken/);
 assert.match(uiSource, /pageStatus\.textContent = 'Preparing page…'/);
-assert.match(previewSource, /if \(source && officialArtist && previewImageLoader\)/);
+assert.match(previewSource, /const sourcePromise = source && officialArtist && previewImageLoader \? previewImageLoader\(source\) : Promise\.resolve/);
 assert.match(previewSource, /requestToken !== previewRequestToken/);
 assert.match(previewCacheSource, /setMaxBytes\(value: number\)/);
 assert.match(previewCacheSource, /acquireLease\(scope: string/);

@@ -27,9 +27,10 @@ const extractionPrompt = 'artist: missing artist, 1.3::artist: aki99::, artist: 
 assert.deepEqual(highlighter.extract(extractionPrompt), extractMetadataArtists(extractionPrompt, highlightFixture), 'indexed extraction preserves the public helper contract');
 const highlighted = highlighter.render("artist: aogisa88, AOGISA, aki99, 13 (spice!!), gin'ichi, <unsafe>, <script>");
 assert.match(highlighted, /data-artist-preview-image="\.\/catalog\/aki99\.webp"/);
-assert.match(highlighted, /data-artist-preview-tag="aki99" data-artist-preview-prompt="artist: aki99"/);
+assert.match(highlighted, /data-artist-preview-tag="aki99"/);
+assert.doesNotMatch(highlighted, /data-artist-preview-prompt/);
 assert.match(highlighted, /tabindex="0"/);
-assert.match(highlighted, /artist: aogisa88/);
+assert.match(highlighted, /artist:\s*<span[^>]+>aogisa88<\/span>/);
 assert.match(highlighted, /13 \(spice!!\)/);
 assert.match(highlighted, /gin&#039;ichi/);
 assert.match(highlighted, /&lt;script&gt;/);

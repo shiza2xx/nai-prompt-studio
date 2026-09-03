@@ -71,17 +71,22 @@ interface NAIExternalBridge {
   openFeedback(): Promise<boolean>;
 }
 
-type CustomTagLibraryOperation = 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder';
+type CustomTagLibraryOperation = 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder' | 'card:bulk-move' | 'card:bulk-delete';
 interface CustomTagLibrarySnapshot { version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string; }
 
 declare global {
-  interface Window {
+interface Window {
     naiStorage?: NAIStorageBridge;
     naiMetadata?: NAIMetadataBridge;
     naiCatalog?: NAICatalogBridge;
     naiUpdater?: NAIUpdaterBridge;
     naiExternal?: NAIExternalBridge;
+    naiDisplay?: NAIDisplayBridge;
   }
+}
+
+interface NAIDisplayBridge {
+  setScale(scale: 100 | 110 | 125): boolean;
 }
 
 export interface UpdateManifest { available: boolean; schemaVersion?: 1; version: string; asset?: string; url?: string; size?: number; sha512?: string; releaseNotes?: string; }

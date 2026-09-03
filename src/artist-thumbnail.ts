@@ -3,6 +3,8 @@
 export const OFFICIAL_ARTIST_THUMBNAIL_WIDTH = 320;
 export const OFFICIAL_ARTIST_THUMBNAIL_HEIGHT = 468;
 export const OFFICIAL_ARTIST_THUMBNAIL_QUALITY = 0.9;
+export const CONTENT_GRID_THUMBNAIL_WIDTH = 384;
+export const CONTENT_GRID_THUMBNAIL_HEIGHT = 512;
 
 export interface ThumbnailTransformRuntime {
   createImageBitmap?: (image: unknown, options?: { resizeWidth?: number; resizeHeight?: number; resizeQuality?: string }) => Promise<{ width: number; height: number; close?: () => void; } & Record<string, unknown>>;
@@ -71,4 +73,28 @@ export async function createOfficialArtistThumbnail(blob: Blob, signal?: AbortSi
     // This URL is only a transient source for the fallback canvas.
     URLRef.revokeObjectURL(sourceUrl);
   }
+}
+
+/** Renderer-only derived thumbnail for user content. Source bytes are never written or replaced. */
+export async function createContentGridThumbnail(blob: Blob, signal?: AbortSignal, env: ThumbnailTransformRuntime = runtime()): Promise<Blob> {
+  throwIfAborted(signal);
+  const bitmapFactory = env.createImageBitmap;
+  const Canvas = env.OffscreenCanvas;
+  if (!bitmapFactory || !Canvas) return blob;
+  let bitmap: ({ width: number; height: number; close?: () => void } & Record<string, unknown>) | undefined;
+  try {
+    bitmap = await bitmapFactory(blob);
+    throwIfAborted(signal);
+    const scale = Math.min(1, CONTENT_GRID_THUMBNAIL_WIDTH / Math.max(1, bitmap.width), CONTENT_GRID_THUMBNAIL_HEIGHT / Math.max(1, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = new Canvas(width, height);
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Thumbnail canvas is unavailable.');
+    context.drawImage(bitmap, 0, 0, width, height);
+    const type = blob.type === 'image/png' ? 'image/png' : 'image/webp';
+    const result = await canvas.convertToBlob({ type, quality: OFFICIAL_ARTIST_THUMBNAIL_QUALITY });
+    throwIfAborted(signal);
+    return result;
+  } finally { bitmap?.close?.(); }
 }

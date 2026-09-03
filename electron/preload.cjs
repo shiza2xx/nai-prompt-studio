@@ -1,4 +1,6 @@
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
+const { contextBridge, ipcRenderer, webUtils, webFrame } = require('electron');
+
+const DISPLAY_SCALES = new Set([100, 110, 125]);
 
 contextBridge.exposeInMainWorld('naiStorage', {
   load: () => ipcRenderer.sendSync('storage:load'),
@@ -24,6 +26,15 @@ contextBridge.exposeInMainWorld('naiMetadata', {
 
 contextBridge.exposeInMainWorld('naiExternal', {
   openFeedback: () => ipcRenderer.invoke('external:open-feedback')
+});
+
+contextBridge.exposeInMainWorld('naiDisplay', {
+  setScale: value => {
+    const scale = Number(value);
+    if (!DISPLAY_SCALES.has(scale)) return false;
+    webFrame.setZoomFactor(scale / 100);
+    return true;
+  }
 });
 
 contextBridge.exposeInMainWorld('naiCatalog', {

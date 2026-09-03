@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "version": "0.6.9",
-  "asset": "NAI-Prompt-Studio-V5-Setup-0.6.9.exe",
-  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.6.9/NAI-Prompt-Studio-V5-Setup-0.6.9.exe",
-  "size": 96292547,
-  "sha512": "051c854754295002f4315583be7e366a71dda31805a5df6ce2421c919cf1bc20f934bae7adf0d522daca422eb238f84b5228313b993d1895a31af16e55c2778a",
-  "releaseNotes": "v0.6.9 brings faster, more stable Custom Tags previews, immediate card moves without a full-grid reload, and profile-local runtime temp, cache, and catalog work data.",
+  "version": "0.7.0",
+  "asset": "NAI-Prompt-Studio-V5-Setup-0.7.0.exe",
+  "url": "https://github.com/shiza2xx/nai-prompt-studio/releases/download/v0.7.0/NAI-Prompt-Studio-V5-Setup-0.7.0.exe",
+  "size": 96297545,
+  "sha512": "4238c6fae7734c665a6579bfb1f93776b8b4a1410ec106c719b0831fc6674ff65e75eeb4b52dc4b3ef80442d8e1c4a62f9976d94fee918ae2b35ddfc8ba71600",
+  "releaseNotes": "v0.7.0 connects Artist Mix and Prompt Builder, makes saved work easier to reuse, and brings clearer controls, previews, and card management across the studio.",
   "catalogs": [
     {
       "id": "artists",

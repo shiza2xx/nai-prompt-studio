@@ -624,6 +624,49 @@ class CustomTagLibrary {
       return this.commit(manifests, { presetId: item.preset.id, previews: deletedPreviews }, { changedPresetIds });
     }
     else if (operation === 'card:delete') { const indexed = canonical.cardIndex?.get(payload.id); const current = indexed ? byPreset.get(indexed.presetId) : null; const currentIndex = current?.cards.findIndex(card => card.id === payload.id) ?? -1; if (!current || currentIndex < 0) throw new Error('Unknown custom card'); const item = mutablePreset(indexed.presetId); item.cards.splice(currentIndex, 1); }
+    else if (operation === 'card:bulk-delete') {
+      if (bytes != null || !Array.isArray(payload.ids) || !payload.ids.length || new Set(payload.ids).size !== payload.ids.length || payload.ids.some(id => !strictId(id))) throw new Error('Invalid custom card batch delete');
+      // Validate the complete batch before cloning or mutating a single card.
+      const indexed = payload.ids.map(id => canonical.cardIndex?.get(id));
+      if (indexed.some(item => !item?.card)) throw new Error('Unknown custom card in batch delete');
+      const deleted = indexed.map(item => ({ presetId: item.presetId, preview: item.card.preview })).filter(item => item.preview);
+      const ids = new Set(payload.ids);
+      for (const [presetId, item] of byPreset) if (item.cards.some(card => ids.has(card.id))) mutablePreset(presetId).cards = item.cards.filter(card => !ids.has(card.id));
+      assertUniqueCardSemantics(manifests);
+      const previousByPreset = new Map(canonical.manifests.map(item => [item.preset.id, item]));
+      const changedPresetIds = manifests.filter(item => stable(item) !== stable(previousByPreset.get(item.preset.id))).map(item => item.preset.id);
+      const result = this.commit(manifests, undefined, { changedPresetIds });
+      this.cleanupDeletedCards(deleted, manifests);
+      return result;
+    }
+    else if (operation === 'card:bulk-move') {
+      if (bytes != null || !Array.isArray(payload.ids) || !payload.ids.length || new Set(payload.ids).size !== payload.ids.length || payload.ids.some(id => !strictId(id))) throw new Error('Invalid custom card batch move');
+      const destinationId = strictId(payload.destinationPresetId); const destination = byPreset.get(destinationId);
+      if (!destination) throw new Error('Unknown custom tag move destination');
+      const indexed = payload.ids.map(id => canonical.cardIndex?.get(id));
+      if (indexed.some(item => !item?.card)) throw new Error('Unknown custom card in batch move');
+      const moving = indexed.filter(item => item.presetId !== destinationId);
+      const identities = new Set(destination.cards.map(card => semanticIdentity(card)));
+      for (const item of moving) { const identity = semanticIdentity(item.card); if (!identity || identities.has(identity)) throw new Error('A custom tag with this name already exists in that category.'); identities.add(identity); }
+      // Copy every immutable source before mutating metadata. A source already
+      // in the target is a deterministic no-op and is never duplicated. If a
+      // later copy fails, remove only the destination files created by this
+      // pre-journal stage. Once commit begins, recovery may require its files.
+      const stagedPreviewCopies = [];
+      try {
+        for (const item of moving) if (item.card.preview) {
+          const copy = this.copyPreview(item.presetId, destinationId, item.card.preview, true);
+          if (copy.created) stagedPreviewCopies.push(copy.destination);
+        }
+      } catch (error) {
+        for (const preview of stagedPreviewCopies) try { fs.rmSync(preview, { force: true }); } catch {}
+        throw error;
+      }
+      const movingIds = new Set(moving.map(item => item.card.id));
+      for (const presetId of new Set(moving.map(item => item.presetId))) { const source = mutablePreset(presetId); source.cards = source.cards.filter(card => !movingIds.has(card.id)); }
+      const target = mutablePreset(destinationId);
+      for (const item of moving) target.cards.push({ ...item.card, presetId: destinationId, updatedAt: now });
+    }
     else if (operation === 'card:upsert') {
       // Modern renderer transactions must name an existing destination. The
       // legacy normalizer still deliberately falls back during load/migration,
@@ -710,7 +753,7 @@ class CustomTagLibrary {
     const source = containedAsset(this.customTagsDir, card.legacyAsset); const bytes = fs.readFileSync(source);
     return this.storePreview(presetId, bytes, card.mime, card.originalName, 'drift:asset');
   }
-  copyPreview(fromPresetId, toPresetId, preview) {
+  copyPreview(fromPresetId, toPresetId, preview, captureCreation = false) {
     const retained = this.runtimeCanonical;
     if (retained?.previewFacts?.has(`${fromPresetId}\u0000${preview.file}`)) this.resolveRetainedPreview(retained, fromPresetId, preview);
     const source = containedAsset(path.join(this.root, 'presets', fromPresetId, 'previews'), path.basename(preview.file));
@@ -723,7 +766,7 @@ class CustomTagLibrary {
     if (fs.existsSync(destination)) {
       const stat = fs.lstatSync(destination);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== preview.bytes || sha256(fs.readFileSync(destination)) !== preview.sha256) throw new Error('Immutable preview collision');
-      return destination;
+      return captureCreation ? { destination, created: false } : destination;
     }
     this.hit('transaction:asset-copy-staged');
     try {
@@ -732,7 +775,7 @@ class CustomTagLibrary {
       if (!['EXDEV', 'EPERM', 'EACCES', 'ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOSYS', 'EMLINK'].includes(error?.code)) throw error;
       atomicImmutable(destination, fs.readFileSync(source), undefined, undefined);
     }
-    return destination;
+    return captureCreation ? { destination, created: true } : destination;
   }
   cleanupDeletedPreset(presetId, deletedPreviews, manifests) {
     // Cleanup is deliberately outside the journaled commit. A failed cleanup
@@ -764,6 +807,24 @@ class CustomTagLibrary {
         if (sha256(fs.readFileSync(target)) !== hash) continue;
         fs.rmSync(target, { force: true });
       } catch { /* Conservative cleanup: never make a successful commit fail. */ }
+    }
+  }
+  cleanupDeletedCards(deleted, manifests) {
+    // Post-commit only: a failed cleanup is an orphan, never data loss.
+    const referenced = new Set(manifests.flatMap(item => item.cards.filter(card => card.preview).map(card => `${item.preset.id}\u0000${path.basename(card.preview.file)}`)));
+    const globalNames = new Set(manifests.flatMap(item => item.cards.filter(card => card.preview).map(card => path.basename(card.preview.file))));
+    for (const item of deleted) {
+      const name = path.basename(item.preview.file);
+      if (!PREVIEW_FILE.test(name) || referenced.has(`${item.presetId}\u0000${name}`)) continue;
+      try {
+        const target = containedAsset(path.join(this.root, 'presets', item.presetId, 'previews'), name);
+        const stat = fs.lstatSync(target); if (stat.isFile() && !stat.isSymbolicLink() && sha256(fs.readFileSync(target)) === name.slice(0, 64)) fs.rmSync(target, { force: true });
+      } catch {}
+      if (globalNames.has(name)) continue;
+      try {
+        const target = containedAsset(this.customTagsDir, name);
+        const stat = fs.lstatSync(target); if (stat.isFile() && !stat.isSymbolicLink() && sha256(fs.readFileSync(target)) === name.slice(0, 64)) fs.rmSync(target, { force: true });
+      } catch {}
     }
   }
   recoverFromBackups() {

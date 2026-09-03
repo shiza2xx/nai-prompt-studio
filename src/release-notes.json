@@ -1,23 +1,35 @@
 {
-  "version": "0.6.9",
-  "summary": "v0.6.9 brings faster, more stable Custom Tags previews, immediate card moves without a full-grid reload, and profile-local runtime temp, cache, and catalog work data.",
+  "version": "0.7.0",
+  "summary": "v0.7.0 connects Artist Mix and Prompt Builder, makes saved work easier to reuse, and brings clearer controls, previews, and card management across the studio.",
   "whatsNew": [
     {
-      "title": "Faster, steadier previews",
-      "copy": "Custom Tags previews load faster and stay stable as you browse."
+      "title": "Use Artist Mix in Prompt Builder",
+      "copy": "Enable Use Artist Mix to include the same mix in your prompt, keep up to 12 artists with multiple anchors, set a range, clear quickly, and tune weights with readable controls and mouse-wheel support."
     },
     {
-      "title": "Immediate card moves",
-      "copy": "Move cards between folders and see the change without reloading the full grid."
+      "title": "Save and reuse complete work",
+      "copy": "Use the universal New tile to save prompts, Artist Mixes, and characters, then Use in Builder replaces the current Base Prompt, Undesired content, and Characters with editable saved content while Frame, Scene, Render, Artist Mix, and random range remain unchanged."
     },
     {
-      "title": "Work stays with your profile",
-      "copy": "Runtime temp, cache, and catalog work stay with this profile."
+      "title": "Manage several Custom Tags at once",
+      "copy": "Use Custom Tags Select Mode to select multiple cards, move them to another folder, or delete them together."
+    },
+    {
+      "title": "Previews stay ready while browsing",
+      "copy": "Image-only hover previews adapt to each card and grid previews stay ready while you browse, filter, or change folders. Original files stay unchanged."
+    },
+    {
+      "title": "Set a comfortable interface scale",
+      "copy": "Choose 100%, 110%, or 125% and keep the setting between sessions for clearer controls, focus states, and readable text."
+    },
+    {
+      "title": "A calmer studio to work in",
+      "copy": "Use the glass header and dedicated Base Prompt with quick clear, keep hover focus stable, and get quiet success updates while warnings stay visible when attention is needed."
     }
   ],
   "cleanupNotice": {
     "title": "A note about older system temporary files",
-    "copy": "We're sorry. v0.6.9 restores installed runtime temporary files to the installed app's own profile directory at data/temp instead of the Windows system %TEMP%. Cache files stay in data/cache. Earlier builds could duplicate preview, cache, and temporary files in the system location and consume substantial system-drive space. Historical leftovers are not removed automatically.",
+    "copy": "We're sorry. v0.7.0 keeps installed runtime temporary files in the installed app's own profile directory at data/temp instead of the Windows system %TEMP%. Cache files stay in data/cache. Earlier builds could duplicate preview, cache, and temporary files in the system location and consume substantial system-drive space. Historical leftovers are not removed automatically.",
     "steps": [
       "Close NAI Prompt Studio and its installer.",
       "First, use Windows Settings > System > Storage > Temporary files and review and remove temporary files.",

@@ -21,7 +21,7 @@ if (references.length) throw new Error(`Removed card asset is still referenced b
 if (existsSync(join(projectRoot, 'public', forbiddenAsset))) throw new Error('public/card.png is an unconsumed release input and must stay removed.');
 
 const pkg = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
-if (pkg.version !== '0.6.9') throw new Error(`v0.6.9 release preflight expected version 0.6.9 (found ${pkg.version}).`);
+if (pkg.version !== '0.7.0') throw new Error(`v0.7.0 release preflight expected version 0.7.0 (found ${pkg.version}).`);
 const catalogFile = join(projectRoot, 'public', 'catalog', 'catalog.json');
 if (existsSync(catalogFile)) {
   const catalog = JSON.parse(readFileSync(catalogFile, 'utf8'));

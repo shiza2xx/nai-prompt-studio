@@ -240,8 +240,7 @@ export class MetadataArtistHighlighter {
   private highlight(text: string, card: CatalogCard): string {
     const image = escapeMetadataHtml(this.imageResolver(card));
     const previewTag = decodeCatalogEntities(card.tag);
-    const previewPrompt = `artist: ${previewTag}`;
-    return `<span class="metadata-artist-highlight" tabindex="0" aria-label="Show artist card preview for ${escapeMetadataHtml(previewTag)}" data-artist-preview-kind="known" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeMetadataHtml(previewTag)}" data-artist-preview-prompt="${escapeMetadataHtml(previewPrompt)}">${escapeMetadataHtml(text)}</span>`;
+    return `<span class="metadata-artist-highlight" tabindex="0" aria-label="Show artist card preview for ${escapeMetadataHtml(previewTag)}" data-artist-preview-kind="known" data-artist-preview-image="${image}" data-artist-preview-tag="${escapeMetadataHtml(previewTag)}">${escapeMetadataHtml(text)}</span>`;
   }
 
   private unknownHighlight(text: string): string {

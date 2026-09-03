@@ -11,10 +11,10 @@ export function serializeTag({ tag, weight }: WeightedTag): string | null {
   return `${value}::${text}${/[0-9]$/.test(text) ? ' ' : ''}::`;
 }
 
-function clean(part: string): string { return part.trim().replace(/^,|,$/g, '').trim(); }
+function clean(part: string | undefined): string { return String(part ?? '').trim().replace(/^,|,$/g, '').trim(); }
 
 export function buildBasePrompt(base: BasePrompt): string {
-  return [base.frame, ...base.artists.map(serializeTag).filter((tag): tag is string => Boolean(tag)), base.setting, base.render]
+  return [base.foundation, base.frame, ...base.artists.map(serializeTag).filter((tag): tag is string => Boolean(tag)), base.setting, base.render]
     .map(clean).filter(Boolean).join(', ');
 }
 

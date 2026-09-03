@@ -72,6 +72,11 @@ export interface PreviewCacheOptions {
   schedule?: (callback: () => void, priority: PreviewPriority) => unknown;
 }
 
+export interface PreviewCacheStats {
+  variant: string; ready: number; queued: number; loading: number; failed: number;
+  bytes: number; hits: number; misses: number; evictions: number;
+}
+
 export interface HydrateOptions {
   priority?: PreviewPriority;
   /** Optional caller token; scope validity is supplied by isCurrent. */
@@ -175,6 +180,9 @@ export class PreviewCache {
   private generation = 0;
   private disposed = false;
   private revision = '';
+  private hits = 0;
+  private misses = 0;
+  private evictions = 0;
 
   constructor(options: PreviewCacheOptions = {}) {
     this.fetchSource = options.fetch ?? nativeFetch;
@@ -202,6 +210,11 @@ export class PreviewCache {
   get maxBytes(): number { return this.maxBytesValue; }
   get currentRevision(): string { return this.revision; }
   get activeLeases(): number { return this.leases.size; }
+  stats(): PreviewCacheStats {
+    const result: PreviewCacheStats = { variant: this.variant, ready: 0, queued: 0, loading: 0, failed: 0, bytes: this.bytesUsed, hits: this.hits, misses: this.misses, evictions: this.evictions };
+    for (const entry of this.entries.values()) result[entry.state] += 1;
+    return result;
+  }
 
   /** Change the LRU ceiling immediately; this never rewrites source data. */
   setMaxBytes(value: number): void {
@@ -296,6 +309,7 @@ export class PreviewCache {
     const key = this.key(value);
     const existing = this.entries.get(key);
     if (existing) {
+      this.hits += 1;
       if (existing.state === 'queued' && this.priorityRank(priority) > this.priorityRank(existing.priority)) {
         this.enqueue(existing, priority);
         this.pump();
@@ -303,6 +317,7 @@ export class PreviewCache {
       this.touch(existing);
       return existing.promise ?? Promise.resolve(existing);
     }
+    this.misses += 1;
     const entry: InternalEntry = {
       source: value, variant: this.variant, state: 'queued', width: 0, height: 0, bytes: 0,
       consumers: new Set(), controller: new AbortController(), lastUsed: ++this.clock, sequence: ++this.sequence, key,
@@ -443,12 +458,12 @@ export class PreviewCache {
   private evict(protectedEntry?: InternalEntry): void {
     if (this.bytesUsed <= this.maxBytesValue) return;
     let entry = this.readyHead;
-    while (this.bytesUsed > this.maxBytesValue && entry) { const next = entry.readyNext; if (entry !== protectedEntry && !this.isLeased(entry)) { this.entries.delete(entry.key); this.revokeEntry(entry); } entry = next; }
+    while (this.bytesUsed > this.maxBytesValue && entry) { const next = entry.readyNext; if (entry !== protectedEntry && !this.isLeased(entry)) { this.entries.delete(entry.key); this.evictions += 1; this.revokeEntry(entry); } entry = next; }
     // A single decoded item may itself exceed a newly reduced budget. Do not
     // violate the ceiling indefinitely merely because it was just completed;
     // a lease is the only explicit reason to retain such an item.
     if (this.bytesUsed > this.maxBytesValue && protectedEntry && protectedEntry.state === 'ready' && !this.isLeased(protectedEntry)) {
-      this.entries.delete(protectedEntry.key);
+      this.entries.delete(protectedEntry.key); this.evictions += 1;
       this.revokeEntry(protectedEntry);
     }
   }

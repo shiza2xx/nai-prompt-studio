@@ -3,6 +3,7 @@ export type Subject = 'girl' | 'boy' | 'mixed' | 'other';
 export type AnimationMode = 'auto' | 'on' | 'off';
 export type StudioTheme = 'arcane-gold' | 'midnight-blue' | 'raspberry-rose' | 'noir' | 'celestial-light' | 'ember-peach' | 'gothic-ivory' | 'galaxy';
 export type PreviewCachePreset = 'large' | 'balanced';
+export type InterfaceScale = 100 | 110 | 125;
 
 export interface PreviewCacheBudgets {
   grid: number;
@@ -41,7 +42,7 @@ export interface PromptSet {
 
 /** Structured Prompt Builder state captured by a Saved Library prompt item. */
 export interface SavedPromptSnapshot {
-  version: 2;
+  version: 3;
   base: BasePrompt;
   characters: Character[];
   randomRange: { min: number; max: number };
@@ -116,6 +117,8 @@ export interface SavedCharacterItem extends SavedLibraryCommon {
 export type SavedLibraryItem = SavedPromptItem | SavedArtistMixItem | SavedCharacterItem;
 
 export interface BasePrompt {
+  /** Opaque user-authored prompt text placed before Frame. */
+  foundation: string;
   frame: string;
   artists: WeightedTag[];
   setting: string;
@@ -128,6 +131,8 @@ export interface PromptDraft {
   base: BasePrompt;
   characters: Character[];
   randomRange?: { min: number; max: number };
+  /** Link Prompt Builder output to the current Artist Mix selection. */
+  useArtistMix: boolean;
   animationMode?: AnimationMode;
 }
 
@@ -141,6 +146,8 @@ export interface AppSettings {
   lastSeenVersion: string;
   /** Runtime preview memory ceilings. Missing legacy values migrate to large. */
   previewCachePreset: PreviewCachePreset;
+  /** Persisted renderer scale, restricted to the supported allowlist. */
+  interfaceScale: InterfaceScale;
 }
 
 export interface ArtistMixDraft {

@@ -1,7 +1,7 @@
 import { DEFAULT_CUSTOM_TAG_PRESET_ID, DEFAULT_CUSTOM_TAG_PRESET_NAME } from './custom-tag-presets.ts';
 import { mixCompanionCapacity } from './artist-mix-layout.ts';
 import { MAX_PROMPT_RANDOM_ARTISTS } from './random.ts';
-import { CUSTOM_TAG_MAX_LENGTH, type AnimationMode, type AppSettings, type ArtistMixDraft, type CustomTag, type CustomTagPackResult, type CustomTagPreset, type PreviewCachePreset, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedLibraryItem, type SavedPromptData, type SavedPromptItem, type SavedPromptSnapshot, type StudioTheme, type WeightedTag } from './types.ts';
+import { CUSTOM_TAG_MAX_LENGTH, type AnimationMode, type AppSettings, type ArtistMixDraft, type CustomTag, type CustomTagPackResult, type CustomTagPreset, type InterfaceScale, type PreviewCachePreset, type PromptDraft, type PromptSet, type SavedArtistMixData, type SavedCharacterData, type SavedLibraryItem, type SavedPromptData, type SavedPromptItem, type SavedPromptSnapshot, type StudioTheme, type WeightedTag } from './types.ts';
 
 export type FavoriteKind = 'artists' | 'characters';
 
@@ -99,7 +99,7 @@ function normalizeSavedMime(value: unknown): SavedLibraryItem['mime'] | undefine
 
 export function normalizeSavedPromptSnapshot(value: unknown): SavedPromptSnapshot | undefined {
   const draft = normalizeDraft(value);
-  return draft ? cloneValue({ version: 2, base: draft.base, characters: draft.characters, randomRange: draft.randomRange ?? { min: 2, max: 5 } }) : undefined;
+  return draft ? cloneValue({ version: 3, base: draft.base, characters: draft.characters, randomRange: draft.randomRange ?? { min: 2, max: 5 } }) : undefined;
 }
 
 function normalizeSavedPromptData(value: unknown, prompt: string): SavedPromptData | undefined {
@@ -125,7 +125,7 @@ function normalizeSavedPromptData(value: unknown, prompt: string): SavedPromptDa
 
 function snapshotToPromptData(snapshot: SavedPromptSnapshot | undefined, prompt: string): SavedPromptData | undefined {
   if (!snapshot) return undefined;
-  return { positive: prompt || [snapshot.base.frame, snapshot.base.artists.map(item => item.tag).join(', '), snapshot.base.setting, snapshot.base.render].filter(Boolean).join(', '), negative: snapshot.base.undesired, characters: snapshot.characters.map(character => ({ id: character.id, label: character.label, positive: character.prompt, negative: character.undesired })) };
+  return { positive: prompt || [snapshot.base.foundation, snapshot.base.frame, snapshot.base.artists.map(item => item.tag).join(', '), snapshot.base.setting, snapshot.base.render].filter(Boolean).join(', '), negative: snapshot.base.undesired, characters: snapshot.characters.map(character => ({ id: character.id, label: character.label, positive: character.prompt, negative: character.undesired })) };
 }
 
 function normalizeSavedArtistMixData(value: unknown, prompt: string, fallback?: ArtistMixDraft): SavedArtistMixData | undefined {
@@ -316,6 +316,22 @@ export function normalizeRandomRange(value: unknown): { min: number; max: number
   return { min, max: Math.min(MAX_PROMPT_RANDOM_ARTISTS, Math.max(min, requestedMax)) };
 }
 
+/**
+ * Normalize Artist Mix totals independently from the legacy Prompt Builder
+ * replacement range. Mix totals are allowed to be 1..12 and anchor count is
+ * a floor only while anchors are present; removing anchors therefore does not
+ * silently shrink a user's saved range.
+ */
+export function normalizeArtistMixRange(value: unknown, anchorCount = 0): { min: number; max: number } {
+  const source = value && typeof value === 'object' ? value as { min?: unknown; max?: unknown } : {};
+  const floor = Math.max(1, Math.min(12, Math.floor(Number(anchorCount) || 0)));
+  const rawMin = Number(source.min);
+  const rawMax = Number(source.max);
+  const min = Math.max(floor, Math.min(12, Number.isFinite(rawMin) ? Math.round(rawMin) : floor));
+  const max = Math.max(min, Math.min(12, Number.isFinite(rawMax) ? Math.round(rawMax) : Math.max(floor, 5)));
+  return { min, max };
+}
+
 export function normalizeAnimationMode(value: unknown): AnimationMode {
   return value === 'on' || value === 'off' ? value : 'auto';
 }
@@ -329,6 +345,7 @@ export function normalizePreviewCachePreset(value: unknown): PreviewCachePreset 
 
 export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown): AppSettings {
   const source = value && typeof value === 'object' ? value as Partial<AppSettings> : {};
+  const legacy = source as Partial<AppSettings> & { scale?: unknown; uiScale?: unknown; displayScale?: unknown };
   return {
     animationMode: normalizeAnimationMode(source.animationMode ?? legacyAnimationMode),
     preloadCharacterPreviews: source.preloadCharacterPreviews === true,
@@ -337,8 +354,14 @@ export function normalizeSettings(value: unknown, legacyAnimationMode?: unknown)
     checkAppUpdatesOnStartup: source.checkAppUpdatesOnStartup !== false,
     seenGuideIds: Array.isArray(source.seenGuideIds) ? source.seenGuideIds.filter((item): item is string => typeof item === 'string').slice(0, 100) : [],
     lastSeenVersion: typeof source.lastSeenVersion === 'string' ? source.lastSeenVersion : '',
-    previewCachePreset: normalizePreviewCachePreset(source.previewCachePreset)
+    previewCachePreset: normalizePreviewCachePreset(source.previewCachePreset),
+    interfaceScale: normalizeInterfaceScale(source.interfaceScale ?? legacy.scale ?? legacy.uiScale ?? legacy.displayScale)
   };
+}
+
+export function normalizeInterfaceScale(value: unknown): InterfaceScale {
+  const parsed = typeof value === 'string' && value.trim() ? Number(value) : value;
+  return parsed === 110 || parsed === 125 ? parsed : 100;
 }
 
 export function loadSettings(legacyAnimationMode?: unknown): AppSettings {
@@ -371,23 +394,21 @@ function normalizeMixTag(value: unknown): WeightedTag | null {
 
 export function normalizeArtistMix(value: unknown): ArtistMixDraft {
   const source = value && typeof value === 'object' ? value as Partial<ArtistMixDraft> & { primary?: unknown } : {};
-  const range = normalizeRandomRange(source.randomRange);
   const rawAnchors = Array.isArray(source.anchors) ? source.anchors : source.primary ? [source.primary] : [];
   const anchors: WeightedTag[] = [];
   const seen = new Set<string>();
   for (const raw of rawAnchors) {
     const item = normalizeMixTag(raw); const key = item?.catalogId;
-    if (item && key && !seen.has(key) && anchors.length < 4) { seen.add(key); anchors.push(item); }
+    if (item && key && !seen.has(key) && anchors.length < 12) { seen.add(key); anchors.push(item); }
   }
   const companions: WeightedTag[] = [];
-  const companionLimit = anchors.length ? mixCompanionCapacity(anchors.length) : 12;
+  const companionLimit = mixCompanionCapacity(anchors.length);
   if (Array.isArray(source.companions)) for (const raw of source.companions) {
     const item = normalizeMixTag(raw);
     const key = item?.catalogId;
     if (item && key && !seen.has(key) && companions.length < companionLimit) { seen.add(key); companions.push(item); }
   }
-  if (!anchors.length && companions.length) anchors.push(companions.shift()!);
-  return { version: 2, anchors, companions, randomRange: { min: Math.min(12, range.min), max: Math.min(12, range.max) }, favoritesOnly: source.favoritesOnly === true, anchorWeightsLocked: source.anchorWeightsLocked !== false };
+  return { version: 2, anchors, companions, randomRange: normalizeArtistMixRange(source.randomRange, anchors.length), favoritesOnly: source.favoritesOnly === true, anchorWeightsLocked: source.anchorWeightsLocked !== false };
 }
 
 export function loadArtistMix(): ArtistMixDraft {
@@ -410,7 +431,10 @@ export function normalizeDraft(value: unknown): PromptDraft | null {
     ? (base.artists as WeightedTag[]).filter(item => {
       if (!item || typeof item !== 'object') return false;
       const stableId = typeof item.catalogId === 'string' ? item.catalogId : item.id;
-      return typeof stableId === 'string' && /^artist-v5-/.test(stableId);
+      // Preserve legacy Prompt Builder artist rows even when their catalog no
+      // longer exists. They remain readable in the draft and are deliberately
+      // excluded from output unless the user enables the Artist Mix link.
+      return typeof stableId === 'string' && Boolean(stableId.trim());
     }).map(item => {
       const stableId = (typeof item.catalogId === 'string' ? item.catalogId : item.id) as string;
       return {
@@ -423,10 +447,11 @@ export function normalizeDraft(value: unknown): PromptDraft | null {
   })) : [];
   const randomRange = candidate.randomRange && typeof candidate.randomRange === 'object' ? candidate.randomRange : localValue(RANDOM_RANGE_KEY, { min: 2, max: 5 });
   return {
-    version: 2,
-    base: { frame: String(base.frame || ''), artists, setting: String(base.setting || ''), render: String(base.render || ''), undesired: String(base.undesired || '') },
+    version: 4,
+    base: { foundation: String(base.foundation || ''), frame: String(base.frame || ''), artists, setting: String(base.setting || ''), render: String(base.render || ''), undesired: String(base.undesired || '') },
     characters,
     randomRange: normalizeRandomRange(randomRange),
+    useArtistMix: candidate.useArtistMix === true,
     animationMode: normalizeAnimationMode(candidate.animationMode)
   };
 }
@@ -583,7 +608,7 @@ export function saveCustomTags(tags: CustomTag[]): void {
   void normalized;
 }
 
-export async function transactCustomTags(operation: 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder', payload: object, bytes?: Uint8Array): Promise<{ version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } | null> {
+export async function transactCustomTags(operation: 'preset:create' | 'preset:update' | 'preset:delete' | 'card:upsert' | 'card:delete' | 'card:move' | 'card:reorder' | 'card:bulk-move' | 'card:bulk-delete', payload: object, bytes?: Uint8Array): Promise<{ version: 1; presets: CustomTagPreset[]; tags: CustomTag[]; warning?: string } | null> {
   const storage = bridge();
   if (!storage?.transactCustomTags) return null;
   return storage.transactCustomTags(operation, payload, bytes);
